@@ -1,0 +1,1014 @@
+#include "Bundle.hpp"
+#include "Log.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <fstream>
+#include <nlohmann/json.hpp>
+#include <set>
+#include <sstream>
+
+using json = nlohmann::json;
+namespace fs = std::filesystem;
+
+namespace hxc {
+
+    bool CDiagnostics::hasErrors() const {
+        return errorCount() > 0;
+    }
+
+    size_t CDiagnostics::errorCount() const {
+        return static_cast<size_t>(std::count_if(m_diags.begin(), m_diags.end(), [](const SDiag& d) { return d.error; }));
+    }
+
+    size_t CDiagnostics::warningCount() const {
+        return m_diags.size() - errorCount();
+    }
+
+    void CDiagnostics::print() const {
+        for (const auto& D : m_diags)
+            logf(D.error ? eLogLevel::ERR : eLogLevel::WARN, "{}: {}", D.where, D.message);
+    }
+
+    SPose STelemetryFrame::headPose() const {
+        if (head)
+            return *head;
+        if (eyes.empty())
+            return {};
+        if (eyes.size() == 1)
+            return eyes[0].pose;
+
+        SPose midpoint;
+        midpoint.pos = (eyes[0].pose.pos + eyes[1].pose.pos) * 0.5;
+        midpoint.rot = slerp(eyes[0].pose.rot, eyes[1].pose.rot, 0.5);
+        return midpoint;
+    }
+
+    int64_t SBundle::medianTelemetryIntervalNs() const {
+        if (telemetryHostNs.size() < 2)
+            return 0;
+        std::vector<int64_t> deltas;
+        deltas.reserve(telemetryHostNs.size() - 1);
+        for (size_t i = 1; i < telemetryHostNs.size(); ++i)
+            deltas.push_back(telemetryHostNs[i] - telemetryHostNs[i - 1]);
+        std::nth_element(deltas.begin(), deltas.begin() + static_cast<long>(deltas.size() / 2), deltas.end());
+        return deltas[deltas.size() / 2];
+    }
+
+    const SCamera* SBundle::cameraForEye(int eye) const {
+        for (const auto& CAM : cameras) {
+            if (CAM.eye == eye)
+                return &CAM;
+        }
+        return nullptr;
+    }
+
+    namespace {
+
+        // Keeps a repeated per-record complaint from burying the one-line problems.
+        struct SCap {
+            size_t emitted    = 0;
+            size_t suppressed = 0;
+            size_t limit      = 5;
+
+            bool   allow() {
+                if (emitted < limit) {
+                    ++emitted;
+                    return true;
+                }
+                ++suppressed;
+                return false;
+            }
+            void flush(CDiagnostics& diags, const std::string& where, const std::string& what) {
+                if (suppressed > 0)
+                    diags.warn(where, "... and {} more record(s) with {}", suppressed, what);
+            }
+        };
+
+        bool readWholeFile(const fs::path& path, std::string& out, std::string& error) {
+            std::ifstream stream(path, std::ios::binary);
+            if (!stream) {
+                error = "cannot be opened";
+                return false;
+            }
+            std::ostringstream buffer;
+            buffer << stream.rdbuf();
+            out = buffer.str();
+            return true;
+        }
+
+        struct SJsonLine {
+            int         number = 0;
+            std::string text;
+        };
+
+        bool readJsonLines(const fs::path& path, std::vector<SJsonLine>& out, std::string& error) {
+            std::ifstream stream(path);
+            if (!stream) {
+                error = "cannot be opened";
+                return false;
+            }
+            std::string line;
+            int         number = 0;
+            while (std::getline(stream, line)) {
+                ++number;
+                // Trailing whitespace and blank lines are tolerated: a producer that
+                // flushes line-at-a-time will sometimes leave a partial final line,
+                // and that is a warning at worst, not a parse failure.
+                const size_t END = line.find_last_not_of(" \t\r");
+                if (END == std::string::npos)
+                    continue;
+                out.push_back({number, line.substr(0, END + 1)});
+            }
+            return true;
+        }
+
+        const json* member(const json& node, const char* key) {
+            if (!node.is_object())
+                return nullptr;
+            const auto IT = node.find(key);
+            return IT == node.end() ? nullptr : &(*IT);
+        }
+
+        std::string typeName(const json& node) {
+            return node.type_name();
+        }
+
+        bool wantNumber(const json& node, const char* key, const std::string& where, CDiagnostics& diags, double& out, bool required = true) {
+            const json* FOUND = member(node, key);
+            if (!FOUND) {
+                if (required)
+                    diags.error(where, "missing required number `{}`", key);
+                return false;
+            }
+            if (!FOUND->is_number()) {
+                diags.error(where, "`{}` must be a number, found {}", key, typeName(*FOUND));
+                return false;
+            }
+            out = FOUND->get<double>();
+            if (!std::isfinite(out)) {
+                diags.error(where, "`{}` is not finite", key);
+                return false;
+            }
+            return true;
+        }
+
+        bool wantInt(const json& node, const char* key, const std::string& where, CDiagnostics& diags, int64_t& out, bool required = true) {
+            const json* FOUND = member(node, key);
+            if (!FOUND) {
+                if (required)
+                    diags.error(where, "missing required integer `{}`", key);
+                return false;
+            }
+            if (!FOUND->is_number_integer()) {
+                if (FOUND->is_number()) {
+                    diags.error(where, "`{}` must be an integer, found the fractional value {}", key, FOUND->get<double>());
+                    return false;
+                }
+                diags.error(where, "`{}` must be an integer, found {}", key, typeName(*FOUND));
+                return false;
+            }
+            out = FOUND->get<int64_t>();
+            return true;
+        }
+
+        bool wantString(const json& node, const char* key, const std::string& where, CDiagnostics& diags, std::string& out, bool required = true) {
+            const json* FOUND = member(node, key);
+            if (!FOUND) {
+                if (required)
+                    diags.error(where, "missing required string `{}`", key);
+                return false;
+            }
+            if (!FOUND->is_string()) {
+                diags.error(where, "`{}` must be a string, found {}", key, typeName(*FOUND));
+                return false;
+            }
+            out = FOUND->get<std::string>();
+            return true;
+        }
+
+        bool wantBool(const json& node, const char* key, const std::string& where, CDiagnostics& diags, bool& out, bool required = true) {
+            const json* FOUND = member(node, key);
+            if (!FOUND) {
+                if (required)
+                    diags.error(where, "missing required boolean `{}`", key);
+                return false;
+            }
+            if (!FOUND->is_boolean()) {
+                diags.error(where, "`{}` must be a boolean, found {}", key, typeName(*FOUND));
+                return false;
+            }
+            out = FOUND->get<bool>();
+            return true;
+        }
+
+        bool wantDoubleArray(const json& node, const char* key, size_t count, const std::string& where, CDiagnostics& diags, std::vector<double>& out) {
+            const json* FOUND = member(node, key);
+            if (!FOUND) {
+                diags.error(where, "missing required array `{}`", key);
+                return false;
+            }
+            if (!FOUND->is_array()) {
+                diags.error(where, "`{}` must be an array, found {}", key, typeName(*FOUND));
+                return false;
+            }
+            if (count != 0 && FOUND->size() != count) {
+                diags.error(where, "`{}` must hold {} numbers, found {}", key, count, FOUND->size());
+                return false;
+            }
+            out.clear();
+            for (size_t i = 0; i < FOUND->size(); ++i) {
+                const json& ELEMENT = (*FOUND)[i];
+                if (!ELEMENT.is_number() || !std::isfinite(ELEMENT.get<double>())) {
+                    diags.error(where, "`{}`[{}] must be a finite number", key, i);
+                    return false;
+                }
+                out.push_back(ELEMENT.get<double>());
+            }
+            return true;
+        }
+
+        std::optional<SPose> parsePose(const json& node, const std::string& where, CDiagnostics& diags) {
+            if (!node.is_object()) {
+                diags.error(where, "a pose must be an object with `pos` and `quat`, found {}", typeName(node));
+                return std::nullopt;
+            }
+
+            std::vector<double> pos, quat;
+            if (!wantDoubleArray(node, "pos", 3, where, diags, pos))
+                return std::nullopt;
+            if (!wantDoubleArray(node, "quat", 4, where, diags, quat))
+                return std::nullopt;
+
+            SPose pose;
+            pose.pos = {pos[0], pos[1], pos[2]};
+            pose.rot = {quat[0], quat[1], quat[2], quat[3]};
+
+            const double NORM = pose.rot.norm();
+            if (!(NORM > 0.0)) {
+                diags.error(where, "`quat` is the zero quaternion");
+                return std::nullopt;
+            }
+            if (std::abs(NORM - 1.0) > 1e-3) {
+                diags.error(where, "`quat` has norm {:.6f}; unit quaternions are required (xyzw order)", NORM);
+                return std::nullopt;
+            }
+            pose.rot = pose.rot.normalized();
+            return pose;
+        }
+
+        std::optional<SFov> parseFov(const json& node, const std::string& where, CDiagnostics& diags) {
+            if (!node.is_object()) {
+                diags.error(where, "an fov must be an object with `l`,`r`,`u`,`d`, found {}", typeName(node));
+                return std::nullopt;
+            }
+            SFov fov;
+            if (!wantNumber(node, "l", where, diags, fov.l) || !wantNumber(node, "r", where, diags, fov.r) || !wantNumber(node, "u", where, diags, fov.u) ||
+                !wantNumber(node, "d", where, diags, fov.d))
+                return std::nullopt;
+            if (!fov.sane()) {
+                diags.error(where, "fov (l={:.4f} r={:.4f} u={:.4f} d={:.4f}) is not a usable frustum; angles are radians with l<r, d<u, and |angle| < 1.55", fov.l, fov.r, fov.u, fov.d);
+                return std::nullopt;
+            }
+            return fov;
+        }
+
+        // INTERPRETATION: the contract names camera files `-camL`/`-camR` but does
+        // not say what the per-frame `cam` field holds. Everything plausible is
+        // accepted and normalized to "L"/"R" with eye 0/1.
+        std::optional<std::pair<std::string, int>> normalizeCameraKey(const json& value) {
+            if (value.is_number_integer()) {
+                const int64_t INDEX = value.get<int64_t>();
+                if (INDEX == 0)
+                    return std::pair<std::string, int>{"L", 0};
+                if (INDEX == 1)
+                    return std::pair<std::string, int>{"R", 1};
+                return std::nullopt;
+            }
+            if (!value.is_string())
+                return std::nullopt;
+
+            std::string text = value.get<std::string>();
+            std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (text == "l" || text == "left" || text == "cam0" || text == "caml" || text == "0" || text == "eye0")
+                return std::pair<std::string, int>{"L", 0};
+            if (text == "r" || text == "right" || text == "cam1" || text == "camr" || text == "1" || text == "eye1")
+                return std::pair<std::string, int>{"R", 1};
+            return std::nullopt;
+        }
+
+        std::vector<fs::path> globSuffix(const fs::path& directory, std::string_view suffix) {
+            std::vector<fs::path> found;
+            std::error_code       ec;
+            if (!fs::is_directory(directory, ec))
+                return found;
+            for (const auto& ENTRY : fs::directory_iterator(directory, ec)) {
+                if (!ENTRY.is_regular_file())
+                    continue;
+                const std::string NAME = ENTRY.path().filename().string();
+                if (NAME.size() >= suffix.size() && NAME.compare(NAME.size() - suffix.size(), suffix.size(), suffix) == 0)
+                    found.push_back(ENTRY.path());
+            }
+            std::sort(found.begin(), found.end());
+            return found;
+        }
+
+        bool containsCaseInsensitive(const std::string& haystack, std::string_view needle) {
+            std::string lower = haystack;
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            std::string want{needle};
+            std::transform(want.begin(), want.end(), want.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return lower.find(want) != std::string::npos;
+        }
+
+    }
+
+    std::optional<SBundle> SBundle::load(const fs::path& root, CDiagnostics& diags, const SLoadOptions& options) {
+        std::error_code ec;
+        if (!fs::is_directory(root, ec)) {
+            diags.error(root.string(), "not a directory; a .hypxrtake bundle is a directory of files");
+            return std::nullopt;
+        }
+
+        SBundle bundle;
+        bundle.root = root;
+
+        // ---- manifest.json ------------------------------------------------------
+        const fs::path MANIFEST_PATH = root / "manifest.json";
+        std::string    manifestText, readError;
+        if (!readWholeFile(MANIFEST_PATH, manifestText, readError)) {
+            diags.error("manifest.json", "{}", readError);
+            return std::nullopt;
+        }
+        bundle.manifestText = manifestText;
+
+        json manifest;
+        try {
+            manifest = json::parse(manifestText);
+        } catch (const std::exception& e) {
+            diags.error("manifest.json", "is not valid JSON: {}", e.what());
+            return std::nullopt;
+        }
+        if (!manifest.is_object()) {
+            diags.error("manifest.json", "the top level must be an object, found {}", typeName(manifest));
+            return std::nullopt;
+        }
+
+        wantString(manifest, "take_id", "manifest.json", diags, bundle.takeId);
+
+        if (const json* HOST = member(manifest, "host"); !HOST)
+            diags.error("manifest.json", "missing required object `host`");
+        else if (!HOST->is_object())
+            diags.error("manifest.json /host", "must be an object, found {}", typeName(*HOST));
+
+        if (const json* NOTES = member(manifest, "notes")) {
+            if (!NOTES->is_array())
+                diags.error("manifest.json /notes", "must be an array, found {}", typeName(*NOTES));
+            else {
+                for (const auto& NOTE : *NOTES)
+                    bundle.notes.push_back(NOTE.is_string() ? NOTE.get<std::string>() : NOTE.dump());
+            }
+        } else
+            diags.warn("manifest.json", "no `notes` array; the contract lists it as always present (may be empty)");
+
+        if (const json* SOURCES = member(manifest, "sources"); !SOURCES || !SOURCES->is_object())
+            diags.error("manifest.json", "missing required object `sources` with the four booleans overlay/app_audio/cameras/mic");
+        else {
+            wantBool(*SOURCES, "overlay", "manifest.json /sources", diags, bundle.sources.overlay);
+            wantBool(*SOURCES, "app_audio", "manifest.json /sources", diags, bundle.sources.appAudio);
+            wantBool(*SOURCES, "cameras", "manifest.json /sources", diags, bundle.sources.cameras);
+            wantBool(*SOURCES, "mic", "manifest.json /sources", diags, bundle.sources.mic);
+        }
+
+        if (const json* OVERLAY = member(manifest, "overlay"); !OVERLAY || !OVERLAY->is_object()) {
+            if (bundle.sources.overlay)
+                diags.error("manifest.json", "`sources.overlay` is true but there is no `overlay` block");
+        } else {
+            const std::string WHERE = "manifest.json /overlay";
+            int64_t           value = 0;
+            if (wantInt(*OVERLAY, "width", WHERE, diags, value))
+                bundle.overlay.width = static_cast<int>(value);
+            if (wantInt(*OVERLAY, "height", WHERE, diags, value))
+                bundle.overlay.height = static_cast<int>(value);
+            wantString(*OVERLAY, "format", WHERE, diags, bundle.overlay.format);
+            wantString(*OVERLAY, "encoder", WHERE, diags, bundle.overlay.encoder);
+            double hz = 0.0;
+            if (wantNumber(*OVERLAY, "target_hz", WHERE, diags, hz))
+                bundle.overlay.targetHz = hz;
+            if (wantInt(*OVERLAY, "eye_count", WHERE, diags, value))
+                bundle.overlay.eyeCount = static_cast<int>(value);
+
+            if (bundle.overlay.width <= 0 || bundle.overlay.height <= 0)
+                diags.error(WHERE, "width/height must be positive, found {}x{}", bundle.overlay.width, bundle.overlay.height);
+            if (bundle.overlay.format != "rgba")
+                diags.warn(WHERE, "`format` is \"{}\"; v1 composes RGBA and treats anything else as RGBA anyway", bundle.overlay.format);
+            if (bundle.overlay.eyeCount != 2)
+                diags.warn(WHERE, "`eye_count` is {}; v1 composes eye 0 as left and eye 1 as right and ignores any others", bundle.overlay.eyeCount);
+            if (!(bundle.overlay.targetHz > 0.0))
+                diags.error(WHERE, "`target_hz` must be positive, found {}", bundle.overlay.targetHz);
+
+            // INTERPRETATION (not in the contract): alpha association.
+            if (const json* ALPHA = member(*OVERLAY, "alpha"); ALPHA && ALPHA->is_string())
+                bundle.overlay.alpha = ALPHA->get<std::string>();
+            if (bundle.overlay.alpha != "straight" && bundle.overlay.alpha != "premultiplied")
+                diags.error(WHERE, "`alpha` must be \"straight\" or \"premultiplied\", found \"{}\"", bundle.overlay.alpha);
+
+            if (const json* EPOCH = member(*OVERLAY, "pts_epoch_ns"); EPOCH && EPOCH->is_number_integer())
+                bundle.overlay.ptsEpochNs = EPOCH->get<int64_t>();
+        }
+
+        // ---- telemetry.jsonl ----------------------------------------------------
+        std::vector<SJsonLine> lines;
+        if (!readJsonLines(root / "telemetry.jsonl", lines, readError))
+            diags.error("telemetry.jsonl", "{}", readError);
+        else if (lines.empty())
+            diags.error("telemetry.jsonl", "holds no records; a take without telemetry cannot be composed");
+
+        {
+            SCap    parseCap, orderCap, eyeCap, blendCap;
+            int64_t previousHost  = 0;
+            int64_t previousFrame = 0;
+            bool    first         = true;
+            for (const auto& LINE : lines) {
+                const std::string WHERE = std::format("telemetry.jsonl:{}", LINE.number);
+                json              record;
+                try {
+                    record = json::parse(LINE.text);
+                } catch (const std::exception& e) {
+                    if (parseCap.allow())
+                        diags.error(WHERE, "is not valid JSON: {}", e.what());
+                    continue;
+                }
+                if (!record.is_object()) {
+                    if (parseCap.allow())
+                        diags.error(WHERE, "each line must be a JSON object, found {}", typeName(record));
+                    continue;
+                }
+
+                STelemetryFrame frame;
+                if (!wantInt(record, "t_host_ns", WHERE, diags, frame.tHostNs))
+                    continue;
+                if (!wantInt(record, "frame", WHERE, diags, frame.frame))
+                    continue;
+
+                const json* EYES = member(record, "eyes");
+                if (!EYES || !EYES->is_array()) {
+                    if (eyeCap.allow())
+                        diags.error(WHERE, "missing required array `eyes`");
+                    continue;
+                }
+                if (bundle.overlay.eyeCount > 0 && static_cast<int>(EYES->size()) != bundle.overlay.eyeCount) {
+                    if (eyeCap.allow())
+                        diags.error(WHERE, "`eyes` holds {} entries but manifest.overlay.eye_count is {}", EYES->size(), bundle.overlay.eyeCount);
+                    continue;
+                }
+
+                bool eyesOk = true;
+                for (size_t e = 0; e < EYES->size(); ++e) {
+                    const std::string EYE_WHERE = std::format("{} /eyes/{}", WHERE, e);
+                    const json&       EYE       = (*EYES)[e];
+                    const json*       POSE      = member(EYE, "pose");
+                    const json*       FOV       = member(EYE, "fov");
+                    if (!POSE || !FOV) {
+                        if (eyeCap.allow())
+                            diags.error(EYE_WHERE, "each eye needs both `pose` and `fov`");
+                        eyesOk = false;
+                        break;
+                    }
+                    const auto PARSED_POSE = parsePose(*POSE, EYE_WHERE + " /pose", diags);
+                    const auto PARSED_FOV  = parseFov(*FOV, EYE_WHERE + " /fov", diags);
+                    if (!PARSED_POSE || !PARSED_FOV) {
+                        eyesOk = false;
+                        break;
+                    }
+                    frame.eyes.push_back({*PARSED_POSE, *PARSED_FOV});
+                }
+                if (!eyesOk)
+                    continue;
+
+                if (const json* HEAD = member(record, "head"); HEAD && !HEAD->is_null()) {
+                    // Optional, and the producers do not emit it yet; when they do,
+                    // it removes the eye-midpoint assumption from the camera chain.
+                    const json* POSE = member(*HEAD, "pose");
+                    frame.head       = parsePose(POSE ? *POSE : *HEAD, WHERE + " /head", diags);
+                }
+
+                if (const json* CORRECTION = member(record, "stage_correction"); CORRECTION && !CORRECTION->is_null()) {
+                    // The contract writes this as `{...}|null` without fixing the
+                    // shape. A pose is the reading research 27 footnote 2 implies;
+                    // anything else is carried as "present but unread".
+                    if (member(*CORRECTION, "pos") && member(*CORRECTION, "quat")) {
+                        CDiagnostics quiet;
+                        frame.stageCorrection = parsePose(*CORRECTION, WHERE + " /stage_correction", quiet);
+                        if (!frame.stageCorrection && parseCap.allow())
+                            diags.error(WHERE + " /stage_correction", "looks like a pose but does not parse as one");
+                    } else if (blendCap.allow())
+                        diags.warn(WHERE, "`stage_correction` is an object without pos/quat; v1 records it but cannot interpret it");
+                }
+
+                wantString(record, "blend_mode", WHERE, diags, frame.blendMode);
+                if (!frame.blendMode.empty() && frame.blendMode != "alpha" && frame.blendMode != "alpha_blend" && frame.blendMode != "additive" && frame.blendMode != "opaque") {
+                    if (blendCap.allow())
+                        diags.warn(WHERE, "unrecognized `blend_mode` \"{}\"", frame.blendMode);
+                }
+
+                if (!first) {
+                    if (frame.tHostNs <= previousHost && orderCap.allow())
+                        diags.error(WHERE, "`t_host_ns` {} does not advance past the previous record's {}", frame.tHostNs, previousHost);
+                    if (frame.frame <= previousFrame && orderCap.allow())
+                        diags.error(WHERE, "`frame` {} does not advance past the previous record's {}", frame.frame, previousFrame);
+                }
+                first         = false;
+                previousHost  = frame.tHostNs;
+                previousFrame = frame.frame;
+
+                bundle.telemetryHostNs.push_back(frame.tHostNs);
+                bundle.telemetry.push_back(std::move(frame));
+            }
+            parseCap.flush(diags, "telemetry.jsonl", "a JSON parse failure");
+            orderCap.flush(diags, "telemetry.jsonl", "an out-of-order timestamp or frame number");
+            eyeCap.flush(diags, "telemetry.jsonl", "a malformed `eyes` array");
+            blendCap.flush(diags, "telemetry.jsonl", "an unrecognized field value");
+        }
+
+        if (!bundle.telemetry.empty() && bundle.telemetry.front().eyes.size() < 2)
+            diags.warn("telemetry.jsonl", "only {} eye(s) per record; stereo output needs two", bundle.telemetry.front().eyes.size());
+
+        // ---- clock.jsonl --------------------------------------------------------
+        {
+            std::vector<SJsonLine> clockLines;
+            const fs::path         CLOCK_PATH = root / "clock.jsonl";
+            if (!fs::exists(CLOCK_PATH)) {
+                // A host-only take genuinely has no device clock to reconcile.
+                if (bundle.sources.cameras || bundle.sources.mic)
+                    diags.error("clock.jsonl", "missing, but the manifest declares device-side sources; device timestamps cannot be placed on the host timeline without it");
+                else
+                    diags.warn("clock.jsonl", "missing; host and device time will be treated as the same clock");
+            } else if (!readJsonLines(CLOCK_PATH, clockLines, readError))
+                diags.error("clock.jsonl", "{}", readError);
+
+            std::vector<SClockSample> samples;
+            SCap                      cap;
+            int64_t                   previous = 0;
+            bool                      first    = true;
+            for (const auto& LINE : clockLines) {
+                const std::string WHERE = std::format("clock.jsonl:{}", LINE.number);
+                json              record;
+                try {
+                    record = json::parse(LINE.text);
+                } catch (const std::exception& e) {
+                    if (cap.allow())
+                        diags.error(WHERE, "is not valid JSON: {}", e.what());
+                    continue;
+                }
+                SClockSample sample;
+                if (!wantInt(record, "t_host_ns", WHERE, diags, sample.tHostNs))
+                    continue;
+                if (!wantInt(record, "offset_ns", WHERE, diags, sample.offsetNs))
+                    continue;
+                double rtt = 0.0;
+                if (wantNumber(record, "rtt_us", WHERE, diags, rtt, false)) {
+                    if (rtt < 0.0 && cap.allow())
+                        diags.error(WHERE, "`rtt_us` is negative ({})", rtt);
+                    sample.rttUs = rtt;
+                }
+                if (!first && sample.tHostNs < previous && cap.allow())
+                    diags.error(WHERE, "`t_host_ns` {} goes backwards from {}", sample.tHostNs, previous);
+                first    = false;
+                previous = sample.tHostNs;
+                samples.push_back(sample);
+            }
+            cap.flush(diags, "clock.jsonl", "a malformed sample");
+            bundle.clock = CClockMap(std::move(samples));
+
+            if (!bundle.clock.empty() && !bundle.telemetryHostNs.empty()) {
+                if (bundle.clock.firstHostNs() > bundle.firstHostNs() || bundle.clock.lastHostNs() < bundle.lastHostNs())
+                    diags.warn("clock.jsonl", "samples span [{}, {}] but telemetry spans [{}, {}]; the offset is held constant outside the sampled span", bundle.clock.firstHostNs(),
+                               bundle.clock.lastHostNs(), bundle.firstHostNs(), bundle.lastHostNs());
+            }
+        }
+
+        // ---- overlay videos -----------------------------------------------------
+        if (bundle.sources.overlay) {
+            const fs::path OVERLAY_DIR = root / "overlay";
+            const int      EYES        = std::max(1, bundle.overlay.eyeCount);
+            for (int eye = 0; eye < EYES; ++eye) {
+                // The prompt's contract says overlay/eye{0,1}.mkv; research 27 wrote
+                // overlay/{left,right}.mkv. Both are accepted, the former preferred.
+                const std::vector<fs::path> CANDIDATES = {
+                    OVERLAY_DIR / std::format("eye{}.mkv", eye),
+                    OVERLAY_DIR / (eye == 0 ? "left.mkv" : "right.mkv"),
+                };
+                fs::path chosen;
+                for (const auto& CANDIDATE : CANDIDATES) {
+                    if (fs::exists(CANDIDATE)) {
+                        chosen = CANDIDATE;
+                        break;
+                    }
+                }
+                if (chosen.empty()) {
+                    diags.error(std::format("overlay/eye{}.mkv", eye), "missing, but manifest.sources.overlay is true");
+                    bundle.overlay.videoPaths.emplace_back();
+                    bundle.overlay.videoInfo.emplace_back();
+                    bundle.overlay.hostNs.emplace_back();
+                    continue;
+                }
+                if (chosen.filename().string() != std::format("eye{}.mkv", eye))
+                    diags.warn(chosen.filename().string(), "the contract names this file eye{}.mkv; accepting the research-27 spelling", eye);
+
+                bundle.overlay.videoPaths.push_back(chosen.string());
+                bundle.overlay.videoInfo.emplace_back();
+                bundle.overlay.hostNs.emplace_back();
+
+                if (!options.probeMedia)
+                    continue;
+
+                std::string probeError;
+                if (!probeVideo(chosen.string(), bundle.overlay.videoInfo.back(), probeError)) {
+                    diags.error(chosen.filename().string(), "{}", probeError);
+                    continue;
+                }
+                const auto& INFO = bundle.overlay.videoInfo.back();
+                if (bundle.overlay.width > 0 && (INFO.width != bundle.overlay.width || INFO.height != bundle.overlay.height))
+                    diags.error(chosen.filename().string(), "is {}x{} but manifest.overlay says {}x{}", INFO.width, INFO.height, bundle.overlay.width, bundle.overlay.height);
+                if (INFO.pixelFormat.find('a') == std::string::npos)
+                    diags.warn(chosen.filename().string(), "pixel format `{}` carries no alpha channel; the overlay matte is the whole point of this source", INFO.pixelFormat);
+                if (INFO.ptsNs.empty())
+                    diags.error(chosen.filename().string(), "ffprobe reported no frames");
+            }
+
+            // Resolve the pts epoch once, from eye 0, and apply it to every eye so
+            // the two eyes cannot drift apart through different guesses.
+            if (!bundle.telemetryHostNs.empty() && !bundle.overlay.videoInfo.empty() && !bundle.overlay.videoInfo[0].ptsNs.empty()) {
+                const int64_t FIRST_PTS  = bundle.overlay.videoInfo[0].ptsNs.front();
+                const int64_t FIRST_HOST = bundle.firstHostNs();
+                if (options.overlayEpochNsOverride)
+                    bundle.overlay.ptsEpochNs = *options.overlayEpochNsOverride;
+                else if (bundle.overlay.ptsEpochNs == 0) {
+                    // INTERPRETATION: "container pts = t_host_ns" is only literally
+                    // achievable if the producer offsets the muxer's timestamps.
+                    // When the first pts is nowhere near the first telemetry stamp,
+                    // the pts are read as take-relative and anchored to it.
+                    const int64_t MINUTE = 60LL * 1000000000LL;
+                    if (std::abs(FIRST_PTS - FIRST_HOST) > MINUTE) {
+                        bundle.overlay.ptsEpochNs     = FIRST_HOST - FIRST_PTS;
+                        bundle.overlay.ptsWereRelative = true;
+                        diags.warn("overlay/eye0.mkv", "first pts is {} ns but telemetry starts at {} ns; reading the pts as take-relative and anchoring the first overlay frame to the "
+                                                       "first telemetry record. Set manifest.overlay.pts_epoch_ns to make this explicit.",
+                                   FIRST_PTS, FIRST_HOST);
+                    }
+                }
+            }
+
+            for (size_t eye = 0; eye < bundle.overlay.videoInfo.size(); ++eye) {
+                auto& HOSTS = bundle.overlay.hostNs[eye];
+                for (int64_t pts : bundle.overlay.videoInfo[eye].ptsNs)
+                    HOSTS.push_back(pts + bundle.overlay.ptsEpochNs);
+            }
+
+            if (!bundle.telemetry.empty() && !bundle.overlay.hostNs.empty() && !bundle.overlay.hostNs[0].empty()) {
+                const size_t OVERLAY_FRAMES = bundle.overlay.hostNs[0].size();
+                if (OVERLAY_FRAMES > bundle.telemetry.size())
+                    diags.error("overlay/eye0.mkv", "holds {} frames but telemetry holds only {} records; every overlay frame needs a stamped pose", OVERLAY_FRAMES, bundle.telemetry.size());
+                else if (OVERLAY_FRAMES * 2 < bundle.telemetry.size())
+                    diags.warn("overlay/eye0.mkv", "holds {} frames against {} telemetry records; the overlay was captured at a lower rate than the session ran, which v1 handles by "
+                                                   "nearest-in-time matching",
+                               OVERLAY_FRAMES, bundle.telemetry.size());
+
+                // Referential check: every overlay frame must land near a stamped pose.
+                SCap   cap;
+                size_t worst = 0;
+                for (size_t i = 0; i < OVERLAY_FRAMES; ++i) {
+                    const auto NEAREST = nearestIndex(bundle.telemetryHostNs, bundle.overlay.hostNs[0][i]);
+                    if (!NEAREST)
+                        break;
+                    const int64_t DELTA = std::abs(bundle.telemetryHostNs[*NEAREST] - bundle.overlay.hostNs[0][i]);
+                    worst               = std::max(worst, static_cast<size_t>(DELTA));
+                    // Matroska quantizes pts to 1 ms; anything past a full frame
+                    // interval is a real mismatch, not container rounding.
+                    const int64_t TOLERANCE = std::max<int64_t>(2000000, bundle.medianTelemetryIntervalNs());
+                    if (DELTA > TOLERANCE && cap.allow())
+                        diags.error(std::format("overlay/eye0.mkv frame {}", i), "sits {} ns from the nearest telemetry record; no stamped pose describes it", DELTA);
+                }
+                cap.flush(diags, "overlay/eye0.mkv", "no nearby telemetry record");
+                HXC_DEBUG("overlay pts to telemetry: worst gap {} ns", worst);
+            }
+        }
+
+        // ---- cameras ------------------------------------------------------------
+        if (bundle.sources.cameras) {
+            const fs::path CAMERA_DIR = root / "cameras";
+            auto           headers    = globSuffix(CAMERA_DIR, "cameras.jsonl");
+            if (headers.empty())
+                headers = globSuffix(CAMERA_DIR, ".jsonl");
+
+            if (headers.empty())
+                diags.error("cameras/", "manifest.sources.cameras is true but no `*-cameras.jsonl` is present");
+            else {
+                if (headers.size() > 1)
+                    diags.warn("cameras/", "{} camera sidecars present; using {}", headers.size(), headers.front().filename().string());
+
+                const fs::path         SIDECAR = headers.front();
+                std::vector<SJsonLine> camLines;
+                if (!readJsonLines(SIDECAR, camLines, readError))
+                    diags.error(SIDECAR.filename().string(), "{}", readError);
+                else if (camLines.empty())
+                    diags.error(SIDECAR.filename().string(), "is empty; the first line must be the calibration header");
+                else {
+                    const std::string HEADER_WHERE = std::format("{}:1", SIDECAR.filename().string());
+                    json              header;
+                    try {
+                        header = json::parse(camLines.front().text);
+                    } catch (const std::exception& e) {
+                        diags.error(HEADER_WHERE, "the calibration header is not valid JSON: {}", e.what());
+                        header = json::object();
+                    }
+
+                    std::string headerTimestampSource;
+                    wantString(header, "timestamp_source", HEADER_WHERE, diags, headerTimestampSource, false);
+
+                    // INTERPRETATION: the contract says the header carries intrinsics
+                    // and extrinsics "per cam" without fixing the container. All three
+                    // plausible shapes are read: a `cameras` array of entries, a
+                    // `cameras` object keyed by cam, or the cam keys at the top level.
+                    std::vector<std::pair<std::string, const json*>> entries;
+                    if (const json* CAMS = member(header, "cameras")) {
+                        if (CAMS->is_array()) {
+                            for (const auto& ENTRY : *CAMS) {
+                                const json* KEY = member(ENTRY, "cam");
+                                entries.emplace_back(KEY ? (KEY->is_string() ? KEY->get<std::string>() : KEY->dump()) : std::string{}, &ENTRY);
+                            }
+                        } else if (CAMS->is_object()) {
+                            for (auto it = CAMS->begin(); it != CAMS->end(); ++it)
+                                entries.emplace_back(it.key(), &it.value());
+                        }
+                    }
+                    if (entries.empty()) {
+                        for (auto it = header.begin(); it != header.end(); ++it) {
+                            if (it.value().is_object() && member(it.value(), "intrinsics"))
+                                entries.emplace_back(it.key(), &it.value());
+                        }
+                    }
+                    if (entries.empty())
+                        diags.error(HEADER_WHERE, "no camera calibration entries found; expected either a `cameras` array/object or per-cam objects each holding `intrinsics` and "
+                                                  "`extrinsics_head_to_camera`");
+
+                    for (const auto& [RAW_KEY, ENTRY] : entries) {
+                        const auto NORMALIZED = normalizeCameraKey(json(RAW_KEY));
+                        if (!NORMALIZED) {
+                            diags.error(HEADER_WHERE, "camera key \"{}\" is not one of L/R (or left/right, cam0/cam1, 0/1)", RAW_KEY);
+                            continue;
+                        }
+
+                        SCamera camera;
+                        camera.key             = NORMALIZED->first;
+                        camera.eye             = NORMALIZED->second;
+                        camera.timestampSource = headerTimestampSource;
+
+                        const std::string ENTRY_WHERE = std::format("{} /{}", HEADER_WHERE, RAW_KEY);
+                        wantString(*ENTRY, "timestamp_source", ENTRY_WHERE, diags, camera.timestampSource, false);
+                        if (camera.timestampSource.empty())
+                            diags.warn(ENTRY_WHERE, "no `timestamp_source`; research 27 open question 5 exists precisely because REALTIME and UNKNOWN cannot be told apart after the fact");
+
+                        const json* INTRINSICS = member(*ENTRY, "intrinsics");
+                        if (!INTRINSICS || !INTRINSICS->is_object())
+                            diags.error(ENTRY_WHERE, "missing required object `intrinsics` {{fx,fy,cx,cy,distortion[]}}");
+                        else {
+                            const std::string INTR_WHERE = ENTRY_WHERE + " /intrinsics";
+                            wantNumber(*INTRINSICS, "fx", INTR_WHERE, diags, camera.intrinsics.fx);
+                            wantNumber(*INTRINSICS, "fy", INTR_WHERE, diags, camera.intrinsics.fy);
+                            wantNumber(*INTRINSICS, "cx", INTR_WHERE, diags, camera.intrinsics.cx);
+                            wantNumber(*INTRINSICS, "cy", INTR_WHERE, diags, camera.intrinsics.cy);
+                            if (!(camera.intrinsics.fx > 0.0) || !(camera.intrinsics.fy > 0.0))
+                                diags.error(INTR_WHERE, "fx/fy must be positive pixel focal lengths, found {}/{}", camera.intrinsics.fx, camera.intrinsics.fy);
+                            std::vector<double> distortion;
+                            if (wantDoubleArray(*INTRINSICS, "distortion", 0, INTR_WHERE, diags, distortion)) {
+                                if (distortion.size() > 5)
+                                    diags.warn(INTR_WHERE, "`distortion` holds {} coefficients; v1 reads the first five as OpenCV's k1,k2,p1,p2,k3", distortion.size());
+                                camera.intrinsics.distortion = distortion;
+                            }
+                        }
+
+                        const json* EXTRINSICS = member(*ENTRY, "extrinsics_head_to_camera");
+                        if (!EXTRINSICS)
+                            diags.error(ENTRY_WHERE, "missing required object `extrinsics_head_to_camera` {{pos,quat}}");
+                        else if (const auto PARSED = parsePose(*EXTRINSICS, ENTRY_WHERE + " /extrinsics_head_to_camera", diags))
+                            camera.headToCamera = *PARSED;
+
+                        int64_t dimension = 0;
+                        if (wantInt(*ENTRY, "width", ENTRY_WHERE, diags, dimension, false))
+                            camera.video.width = static_cast<int>(dimension);
+                        if (wantInt(*ENTRY, "height", ENTRY_WHERE, diags, dimension, false))
+                            camera.video.height = static_cast<int>(dimension);
+
+                        bundle.cameras.push_back(std::move(camera));
+                    }
+
+                    // Per-frame records.
+                    SCap cap;
+                    for (size_t i = 1; i < camLines.size(); ++i) {
+                        const std::string WHERE = std::format("{}:{}", SIDECAR.filename().string(), camLines[i].number);
+                        json              record;
+                        try {
+                            record = json::parse(camLines[i].text);
+                        } catch (const std::exception& e) {
+                            if (cap.allow())
+                                diags.error(WHERE, "is not valid JSON: {}", e.what());
+                            continue;
+                        }
+                        const json* KEY = member(record, "cam");
+                        if (!KEY) {
+                            if (cap.allow())
+                                diags.error(WHERE, "missing required `cam`");
+                            continue;
+                        }
+                        const auto NORMALIZED = normalizeCameraKey(*KEY);
+                        if (!NORMALIZED) {
+                            if (cap.allow())
+                                diags.error(WHERE, "`cam` value {} is not one of L/R", KEY->dump());
+                            continue;
+                        }
+                        auto target = std::find_if(bundle.cameras.begin(), bundle.cameras.end(), [&](const SCamera& c) { return c.key == NORMALIZED->first; });
+                        if (target == bundle.cameras.end()) {
+                            if (cap.allow())
+                                diags.error(WHERE, "references camera \"{}\", which the calibration header does not declare", NORMALIZED->first);
+                            continue;
+                        }
+
+                        SCameraFrame frame;
+                        if (!wantInt(record, "t_device_ns", WHERE, diags, frame.tDeviceNs))
+                            continue;
+                        wantInt(record, "exposure_ns", WHERE, diags, frame.exposureNs, false);
+                        wantInt(record, "frame", WHERE, diags, frame.frame, false);
+                        if (frame.exposureNs < 0 && cap.allow())
+                            diags.error(WHERE, "`exposure_ns` is negative ({})", frame.exposureNs);
+                        if (!target->frames.empty() && frame.tDeviceNs <= target->frames.back().tDeviceNs && cap.allow())
+                            diags.error(WHERE, "`t_device_ns` {} does not advance past camera {}'s previous {}", frame.tDeviceNs, target->key, target->frames.back().tDeviceNs);
+                        target->frames.push_back(frame);
+                    }
+                    cap.flush(diags, SIDECAR.filename().string(), "a malformed per-frame record");
+                }
+            }
+
+            // Match each camera to its video, then map its timestamps to host time.
+            const auto VIDEOS = globSuffix(CAMERA_DIR, ".mp4");
+            for (auto& camera : bundle.cameras) {
+                for (const auto& VIDEO : VIDEOS) {
+                    const std::string NAME = VIDEO.stem().string();
+                    if (containsCaseInsensitive(NAME, "cam" + camera.key) || containsCaseInsensitive(NAME, camera.eye == 0 ? "left" : "right")) {
+                        camera.videoPath = VIDEO.string();
+                        break;
+                    }
+                }
+                if (camera.videoPath.empty()) {
+                    diags.error("cameras/", "no video matching `*-cam{}.mp4` for the camera the sidecar declares", camera.key);
+                    continue;
+                }
+
+                if (options.probeMedia) {
+                    const int   DECLARED_W = camera.video.width;
+                    const int   DECLARED_H = camera.video.height;
+                    std::string probeError;
+                    if (!probeVideo(camera.videoPath, camera.video, probeError)) {
+                        diags.error(fs::path(camera.videoPath).filename().string(), "{}", probeError);
+                        continue;
+                    }
+                    if (DECLARED_W > 0 && (DECLARED_W != camera.video.width || DECLARED_H != camera.video.height))
+                        diags.error(fs::path(camera.videoPath).filename().string(), "is {}x{} but the sidecar declares {}x{}", camera.video.width, camera.video.height, DECLARED_W, DECLARED_H);
+                    if (camera.video.ptsNs.size() != camera.frames.size())
+                        diags.error(fs::path(camera.videoPath).filename().string(), "holds {} frames but the sidecar lists {} records for camera {}; the sidecar is authoritative for "
+                                                                                    "timestamps, so the two must correspond one-for-one in decode order",
+                                    camera.video.ptsNs.size(), camera.frames.size(), camera.key);
+                }
+
+                if (camera.intrinsics.cx <= 0.0 || camera.intrinsics.cy <= 0.0)
+                    diags.warn(fs::path(camera.videoPath).filename().string(), "principal point ({:.1f}, {:.1f}) is at or outside the top-left corner", camera.intrinsics.cx, camera.intrinsics.cy);
+
+                // Mid-exposure sampling, per research 27 section 3 footnote 1: the
+                // sensor timestamp is the start of exposure, so the pose that
+                // belongs to the frame is the one half an exposure later.
+                camera.hostNs.reserve(camera.frames.size());
+                for (const auto& FRAME : camera.frames)
+                    camera.hostNs.push_back(bundle.clock.hostFromDevice(FRAME.tDeviceNs + FRAME.exposureNs / 2));
+
+                if (!camera.hostNs.empty() && !bundle.telemetryHostNs.empty()) {
+                    const bool DISJOINT = camera.hostNs.back() < bundle.firstHostNs() || camera.hostNs.front() > bundle.lastHostNs();
+                    if (DISJOINT)
+                        diags.error(fs::path(camera.videoPath).filename().string(), "maps to host times [{}, {}], which does not overlap the telemetry span [{}, {}]; check the clock "
+                                                                                    "offset sign (device = host + offset)",
+                                    camera.hostNs.front(), camera.hostNs.back(), bundle.firstHostNs(), bundle.lastHostNs());
+                }
+            }
+
+            if (bundle.cameras.empty())
+                diags.error("cameras/", "manifest.sources.cameras is true but no usable camera was loaded");
+        }
+
+        // ---- audio --------------------------------------------------------------
+        const auto loadAudio = [&](const std::string& role, const fs::path& media, const fs::path& sidecar) -> std::optional<SAudioTrack> {
+            SAudioTrack track;
+            track.role        = role;
+            track.path        = media.string();
+            track.sidecarPath = sidecar.string();
+
+            std::string text;
+            if (!readWholeFile(sidecar, text, readError)) {
+                diags.error(sidecar.filename().string(), "{}", readError);
+                return std::nullopt;
+            }
+            json record;
+            try {
+                record = json::parse(text);
+            } catch (const std::exception& e) {
+                diags.error(sidecar.filename().string(), "is not valid JSON: {}", e.what());
+                return std::nullopt;
+            }
+
+            const std::string WHERE     = sidecar.filename().string();
+            const bool        HAS_HOST  = member(record, "start_t_host_ns") != nullptr;
+            const bool        HAS_DEVICE = member(record, "start_t_device_ns") != nullptr;
+            if (HAS_HOST && HAS_DEVICE) {
+                diags.error(WHERE, "carries both `start_t_host_ns` and `start_t_device_ns`; a track has one clock domain");
+                return std::nullopt;
+            }
+            if (!HAS_HOST && !HAS_DEVICE) {
+                diags.error(WHERE, "needs `start_t_host_ns` (host-side track) or `start_t_device_ns` (device-side track)");
+                return std::nullopt;
+            }
+            track.deviceClock = HAS_DEVICE;
+            if (!wantInt(record, HAS_DEVICE ? "start_t_device_ns" : "start_t_host_ns", WHERE, diags, track.startNs))
+                return std::nullopt;
+
+            int64_t value = 0;
+            if (wantInt(record, "sample_rate_hz", WHERE, diags, value))
+                track.sampleRate = static_cast<int>(value);
+            if (wantInt(record, "channels", WHERE, diags, value))
+                track.channels = static_cast<int>(value);
+
+            track.startHostNs = track.deviceClock ? bundle.clock.hostFromDevice(track.startNs) : track.startNs;
+
+            if (options.probeMedia) {
+                SAudioInfo  info;
+                std::string probeError;
+                if (!probeAudio(track.path, info, probeError)) {
+                    diags.error(media.filename().string(), "{}", probeError);
+                    return std::nullopt;
+                }
+                if (track.sampleRate > 0 && info.sampleRate != track.sampleRate)
+                    diags.error(media.filename().string(), "decodes at {} Hz but {} says {} Hz", info.sampleRate, sidecar.filename().string(), track.sampleRate);
+                if (track.channels > 0 && info.channels != track.channels)
+                    diags.error(media.filename().string(), "has {} channel(s) but {} says {}", info.channels, sidecar.filename().string(), track.channels);
+                track.sampleRate = info.sampleRate;
+                track.channels   = info.channels;
+                track.durationNs = info.durationNs;
+            }
+
+            if (!bundle.telemetryHostNs.empty()) {
+                const int64_t END = track.startHostNs + track.durationNs;
+                if (END < bundle.firstHostNs() || track.startHostNs > bundle.lastHostNs())
+                    diags.error(media.filename().string(), "covers host times [{}, {}], which does not overlap the telemetry span [{}, {}]", track.startHostNs, END, bundle.firstHostNs(),
+                                bundle.lastHostNs());
+            }
+            return track;
+        };
+
+        if (bundle.sources.appAudio) {
+            const fs::path MEDIA   = root / "audio" / "app.flac";
+            const fs::path SIDECAR = root / "audio" / "app.json";
+            if (!fs::exists(MEDIA))
+                diags.error("audio/app.flac", "missing, but manifest.sources.app_audio is true");
+            else if (!fs::exists(SIDECAR))
+                diags.error("audio/app.json", "missing; the start stamp lives there, and without it the track cannot be placed on the timeline");
+            else
+                bundle.appAudio = loadAudio("app", MEDIA, SIDECAR);
+        }
+
+        if (bundle.sources.mic) {
+            // INTERPRETATION: the contract writes `...-mic.flac` with an unstated
+            // prefix. Both the prefixed and the bare spelling are accepted, under
+            // audio/ (where app.flac lives) or under the take root.
+            std::vector<fs::path> candidates;
+            for (const auto& DIRECTORY : {root / "audio", root}) {
+                for (const auto& FOUND : globSuffix(DIRECTORY, "mic.flac"))
+                    candidates.push_back(FOUND);
+            }
+            if (candidates.empty())
+                diags.error("audio/*-mic.flac", "missing, but manifest.sources.mic is true");
+            else {
+                if (candidates.size() > 1)
+                    diags.warn("audio/", "{} mic tracks present; using {}", candidates.size(), candidates.front().filename().string());
+                fs::path media   = candidates.front();
+                fs::path sidecar = media;
+                sidecar.replace_extension(".json");
+                if (!fs::exists(sidecar))
+                    diags.error(sidecar.filename().string(), "missing; a mic track needs its `start_t_device_ns` sidecar");
+                else
+                    bundle.mic = loadAudio("mic", media, sidecar);
+            }
+        }
+
+        return bundle;
+    }
+
+}

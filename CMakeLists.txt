@@ -30,6 +30,11 @@ add_library(hypxrcompose_core STATIC
     src/Stabilize.cpp
     src/Process.cpp
     src/Ffmpeg.cpp
+    src/Bundle.cpp
+    src/Validate.cpp
+    src/ComposeGL.cpp
+    src/Render.cpp
+    src/Synth.cpp
 )
 target_include_directories(hypxrcompose_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(hypxrcompose_core PUBLIC PkgConfig::deps)
