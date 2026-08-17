@@ -261,3 +261,13 @@ telemetry-derived expectation: distant-feature shift from the per-eye frustum as
 from the quad records. First real measurement: 381–384 px measured vs ~377 px predicted
 (349 frustum + 28 parallax at 1.48 m), dy = 0 in all bands. Ship as
 `hypxrcompose stereo-check <take> <render>` and run it in the synth end-to-end suite too.
+
+## Stereo output container: prefer MKV for auto-detection (field finding 2026-08-17)
+The H.264 frame-packing SEI written into MP4 stereo outputs is NOT promoted into mpv's
+`video-params/stereo-in` on the field mpv build — only container-level signaling is
+(Matroska StereoMode; verified live: the SEI-only MP4 failed to auto-tag, a stream-copy
+remux with `-metadata:s:v stereo_mode=left_right` into .mkv tags instantly). Change:
+when --eye stereo-sbs and --out ends in .mp4, print a one-line notice recommending .mkv;
+consider defaulting stereo output to .mkv when the user gives no extension. Keep writing
+the SEI for MP4 (other players read it); MKV StereoMode stays the reliable path for the
+HypXRland auto-tag flow.
