@@ -80,6 +80,41 @@ namespace hxc {
         SFov  fov;
     };
 
+    // One composition layer as the session submitted it, recorded for grade-B
+    // replay. v1 does not consume these - it composites the recorded matte, not
+    // re-rendered quads - but validate checks them, because telemetry not recorded
+    // correctly today is telemetry v2 cannot use.
+    //
+    // TWO LOAD-BEARING SEMANTICS, both from the producer:
+    //
+    //   1. `pose` is HEAD-RELATIVE. The layer's pose in STAGE space at time t is
+    //      head(t) composed with it. Reading it as a world pose puts every quad in
+    //      the wrong place the moment the wearer moves.
+    //   2. `viewSpace` distinguishes what that means over time. true = head-locked:
+    //      the layer stays at this head-relative pose always. false = room-anchored:
+    //      the layer had a fixed pose in STAGE, and what was recorded is that pose
+    //      expressed relative to the head at t. A replay must re-anchor it, not
+    //      carry it along with the head.
+    struct SQuadRecord {
+        int64_t                    index = 0; // composition order, back to front
+        std::optional<std::string> name;      // currently always null from the producer
+        SPose                      pose;      // head-relative, see above
+        double                     width      = 0.0; // metres
+        double                     height     = 0.0;
+        double                     visibility = 1.0;
+        bool                       viewSpace  = false;
+        int64_t                    swapchain  = -1; // stable within a session only
+        int64_t                    image      = -1;
+        int64_t                    arrayLayer = 0;
+        std::array<double, 4>      rect{};   // x, y, w, h in swapchain image pixels
+        bool                       hasRect = false;
+
+        // The layer's pose in STAGE space, given the head pose at the same instant.
+        SPose                      worldPose(const SPose& head) const {
+            return head.compose(pose);
+        }
+    };
+
     struct STelemetryFrame {
         int64_t                    tHostNs = 0;
         int64_t                    frame   = 0;
@@ -90,11 +125,13 @@ namespace hxc {
         // overlay.target_hz or lost to the readback queue. The records *without* it
         // are what the video's frames correspond to, in order.
         bool                       dropped = false;
-        // INTERPRETATION: the contract carries per-eye poses only, but a camera
-        // extrinsic is head-relative, so a head pose is needed. An optional `head`
-        // pose is read when the producer supplies one; otherwise head() returns the
-        // midpoint of the eyes, which is where OpenXR's VIEW space sits.
+        // The producer records this per record, at the same instant as the eyes and
+        // in the same (STAGE) space. It is what camera extrinsics and quad poses are
+        // relative to. Absent only in bundles written before it existed, where
+        // headPose() falls back to the midpoint of the eyes.
         std::optional<SPose>       head;
+        std::vector<SQuadRecord>   quads;
+        bool                       hasQuadsArray = false;
 
         SPose                      headPose() const;
     };

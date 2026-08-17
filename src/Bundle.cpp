@@ -274,6 +274,124 @@ namespace hxc {
             return fov;
         }
 
+        // Reads one composition-layer record. The fields the producer named are
+        // required; the shapes it did not pin down are accepted in every plausible
+        // spelling and flagged in README.
+        std::optional<SQuadRecord> parseQuad(const json& node, const std::string& where, CDiagnostics& diags) {
+            if (!node.is_object()) {
+                diags.error(where, "a quad record must be an object, found {}", typeName(node));
+                return std::nullopt;
+            }
+
+            SQuadRecord quad;
+            if (!wantInt(node, "index", where, diags, quad.index))
+                return std::nullopt;
+
+            if (const json* NAME = member(node, "name")) {
+                if (NAME->is_string())
+                    quad.name = NAME->get<std::string>();
+                else if (!NAME->is_null()) {
+                    diags.error(where, "`name` must be a string or null, found {}", typeName(*NAME));
+                    return std::nullopt;
+                }
+            }
+
+            const json* POSE = member(node, "pose");
+            if (!POSE) {
+                diags.error(where, "missing required `pose` (head-relative: the layer's STAGE pose is head * pose)");
+                return std::nullopt;
+            }
+            const auto PARSED = parsePose(*POSE, where + " /pose", diags);
+            if (!PARSED)
+                return std::nullopt;
+            quad.pose = *PARSED;
+
+            // INTERPRETATION: `size` is in metres, but its shape is unstated. Both a
+            // two-number array and an object are read.
+            const json* SIZE = member(node, "size");
+            if (!SIZE) {
+                diags.error(where, "missing required `size` (quad extent in metres)");
+                return std::nullopt;
+            }
+            if (SIZE->is_array()) {
+                std::vector<double> extent;
+                if (!wantDoubleArray(node, "size", 2, where, diags, extent))
+                    return std::nullopt;
+                quad.width  = extent[0];
+                quad.height = extent[1];
+            } else if (SIZE->is_object()) {
+                const bool WIDE = member(*SIZE, "width") != nullptr;
+                if (!wantNumber(*SIZE, WIDE ? "width" : "w", where + " /size", diags, quad.width) || !wantNumber(*SIZE, WIDE ? "height" : "h", where + " /size", diags, quad.height))
+                    return std::nullopt;
+            } else {
+                diags.error(where, "`size` must be [width, height] in metres or an object with width/height, found {}", typeName(*SIZE));
+                return std::nullopt;
+            }
+            if (!(quad.width > 0.0) || !(quad.height > 0.0)) {
+                diags.error(where, "`size` must be positive in both axes, found {} x {} m", quad.width, quad.height);
+                return std::nullopt;
+            }
+
+            // INTERPRETATION: `visibility` reads as either a flag or a 0..1 opacity.
+            if (const json* VISIBILITY = member(node, "visibility")) {
+                if (VISIBILITY->is_boolean())
+                    quad.visibility = VISIBILITY->get<bool>() ? 1.0 : 0.0;
+                else if (VISIBILITY->is_number()) {
+                    quad.visibility = VISIBILITY->get<double>();
+                    if (!(quad.visibility >= 0.0 && quad.visibility <= 1.0)) {
+                        diags.error(where, "`visibility` is {}; a numeric visibility is an opacity in 0..1", quad.visibility);
+                        return std::nullopt;
+                    }
+                } else {
+                    diags.error(where, "`visibility` must be a boolean or a number in 0..1, found {}", typeName(*VISIBILITY));
+                    return std::nullopt;
+                }
+            } else {
+                diags.error(where, "missing required `visibility`");
+                return std::nullopt;
+            }
+
+            if (!wantBool(node, "view_space", where, diags, quad.viewSpace))
+                return std::nullopt;
+
+            wantInt(node, "swapchain", where, diags, quad.swapchain);
+            wantInt(node, "image", where, diags, quad.image);
+            wantInt(node, "array_layer", where, diags, quad.arrayLayer, false);
+            if (quad.arrayLayer < 0) {
+                diags.error(where, "`array_layer` is negative ({})", quad.arrayLayer);
+                return std::nullopt;
+            }
+
+            // INTERPRETATION: `rect` is the sub-image the layer samples, in swapchain
+            // pixels. Array and object spellings are both read.
+            if (const json* RECT = member(node, "rect"); RECT && !RECT->is_null()) {
+                if (RECT->is_array()) {
+                    std::vector<double> values;
+                    if (!wantDoubleArray(node, "rect", 4, where, diags, values))
+                        return std::nullopt;
+                    quad.rect    = {values[0], values[1], values[2], values[3]};
+                    quad.hasRect = true;
+                } else if (RECT->is_object()) {
+                    const bool WIDE = member(*RECT, "width") != nullptr;
+                    double     x = 0.0, y = 0.0, w = 0.0, h = 0.0;
+                    if (!wantNumber(*RECT, "x", where + " /rect", diags, x) || !wantNumber(*RECT, "y", where + " /rect", diags, y) ||
+                        !wantNumber(*RECT, WIDE ? "width" : "w", where + " /rect", diags, w) || !wantNumber(*RECT, WIDE ? "height" : "h", where + " /rect", diags, h))
+                        return std::nullopt;
+                    quad.rect    = {x, y, w, h};
+                    quad.hasRect = true;
+                } else {
+                    diags.error(where, "`rect` must be [x, y, w, h] in swapchain pixels or an object, found {}", typeName(*RECT));
+                    return std::nullopt;
+                }
+                if (!(quad.rect[2] > 0.0) || !(quad.rect[3] > 0.0)) {
+                    diags.error(where, "`rect` has a non-positive extent ({} x {})", quad.rect[2], quad.rect[3]);
+                    return std::nullopt;
+                }
+            }
+
+            return quad;
+        }
+
         // INTERPRETATION: the contract names camera files `-camL`/`-camR` but does
         // not say what the per-frame `cam` field holds. Everything plausible is
         // accepted and normalized to "L"/"R" with eye 0/1.
@@ -426,7 +544,7 @@ namespace hxc {
             diags.error("telemetry.jsonl", "holds no records; a take without telemetry cannot be composed");
 
         {
-            SCap    parseCap, orderCap, eyeCap, blendCap;
+            SCap    parseCap, orderCap, eyeCap, blendCap, quadCap;
             int64_t previousHost  = 0;
             int64_t previousFrame = 0;
             bool    first         = true;
@@ -488,10 +606,35 @@ namespace hxc {
                     continue;
 
                 if (const json* HEAD = member(record, "head"); HEAD && !HEAD->is_null()) {
-                    // Optional, and the producers do not emit it yet; when they do,
-                    // it removes the eye-midpoint assumption from the camera chain.
+                    // The producer records this at the same instant as the eyes, in
+                    // STAGE space. It is what quad poses and camera extrinsics are
+                    // relative to, so when it is present nothing derives a head from
+                    // the eyes any more.
                     const json* POSE = member(*HEAD, "pose");
                     frame.head       = parsePose(POSE ? *POSE : *HEAD, WHERE + " /head", diags);
+                }
+
+                if (const json* QUADS = member(record, "quads"); QUADS && !QUADS->is_null()) {
+                    if (!QUADS->is_array()) {
+                        if (quadCap.allow())
+                            diags.error(WHERE, "`quads` must be an array of composition layers, found {}", typeName(*QUADS));
+                    } else {
+                        frame.hasQuadsArray = true;
+                        for (size_t q = 0; q < QUADS->size(); ++q) {
+                            const auto PARSED = parseQuad((*QUADS)[q], std::format("{} /quads/{}", WHERE, q), diags);
+                            if (!PARSED)
+                                break;
+                            frame.quads.push_back(*PARSED);
+                        }
+                        // The array is in composition order, back to front, and
+                        // `index` names that order. A disagreement means one of the
+                        // two is not what the consumer will think it is.
+                        for (size_t q = 0; q < frame.quads.size(); ++q) {
+                            if (frame.quads[q].index != static_cast<int64_t>(q) && quadCap.allow())
+                                diags.error(std::format("{} /quads/{}", WHERE, q), "`index` is {} at array position {}; the array is composition order back-to-front and `index` must agree",
+                                            frame.quads[q].index, q);
+                        }
+                    }
                 }
 
                 if (const json* CORRECTION = member(record, "stage_correction"); CORRECTION && !CORRECTION->is_null()) {
@@ -535,6 +678,7 @@ namespace hxc {
                 bundle.telemetry.push_back(std::move(frame));
             }
             parseCap.flush(diags, "telemetry.jsonl", "a JSON parse failure");
+            quadCap.flush(diags, "telemetry.jsonl", "a malformed `quads` entry");
             orderCap.flush(diags, "telemetry.jsonl", "an out-of-order timestamp or frame number");
             eyeCap.flush(diags, "telemetry.jsonl", "a malformed `eyes` array");
             blendCap.flush(diags, "telemetry.jsonl", "an unrecognized field value");
@@ -542,6 +686,25 @@ namespace hxc {
 
         if (!bundle.telemetry.empty() && bundle.telemetry.front().eyes.size() < 2)
             diags.warn("telemetry.jsonl", "only {} eye(s) per record; stereo output needs two", bundle.telemetry.front().eyes.size());
+
+        if (!bundle.telemetry.empty()) {
+            const size_t WITH_HEAD = static_cast<size_t>(std::count_if(bundle.telemetry.begin(), bundle.telemetry.end(), [](const STelemetryFrame& f) { return f.head.has_value(); }));
+            if (WITH_HEAD == 0)
+                diags.warn("telemetry.jsonl", "no record carries a `head` pose; falling back to the midpoint of the eyes, which is where OpenXR's VIEW space sits but is not what "
+                                              "the producer recorded");
+            else if (WITH_HEAD != bundle.telemetry.size())
+                diags.error("telemetry.jsonl", "{} of {} records carry a `head` pose; it must be present on all of them or none", WITH_HEAD, bundle.telemetry.size());
+
+            // Quad records are v2's input, not v1's, but a take recorded without
+            // them can never be replayed - so their absence is worth saying out
+            // loud, and a half-present array is a producer bug.
+            const size_t WITH_QUADS = static_cast<size_t>(std::count_if(bundle.telemetry.begin(), bundle.telemetry.end(), [](const STelemetryFrame& f) { return f.hasQuadsArray; }));
+            if (WITH_QUADS == 0)
+                diags.warn("telemetry.jsonl", "no record carries a `quads` array; the take composes fine, but grade-B replay (re-rendering the layers rather than reusing the matte) "
+                                              "will never be possible from it");
+            else if (WITH_QUADS != bundle.telemetry.size())
+                diags.error("telemetry.jsonl", "{} of {} records carry a `quads` array; it must be present on all of them or none", WITH_QUADS, bundle.telemetry.size());
+        }
 
         // ---- clock.jsonl --------------------------------------------------------
         {
