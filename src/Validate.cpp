@@ -34,7 +34,9 @@ namespace hxc {
             for (size_t eye = 0; eye < bundle.overlay.videoInfo.size(); ++eye) {
                 if (bundle.overlay.videoPaths[eye].empty())
                     continue;
-                out += std::format("              eye{}: {} frames, pix_fmt {}\n", eye, bundle.overlay.videoInfo[eye].ptsNs.size(), bundle.overlay.videoInfo[eye].pixelFormat);
+                const auto& INFO = bundle.overlay.videoInfo[eye];
+                out += std::format("              eye{}: {} frames ({}), pix_fmt {}\n", eye, INFO.ptsNs.size(),
+                                   INFO.depth == eProbeDepth::DEEP ? "decoded" : "counted from the container index", INFO.pixelFormat);
             }
         }
 
@@ -86,6 +88,8 @@ namespace hxc {
         CDiagnostics diags;
         SLoadOptions load;
         load.probeMedia = !options.skipMedia;
+        load.checksum   = options.checksum;
+        load.probeDepth = (options.deep || options.checksum) ? eProbeDepth::DEEP : eProbeDepth::INDEX;
 
         const auto BUNDLE = SBundle::load(options.root, diags, load);
 

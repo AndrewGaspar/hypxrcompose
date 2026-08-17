@@ -223,7 +223,16 @@ namespace hxc {
     struct SLoadOptions {
         // Probing runs ffprobe over every media file; render needs it, a purely
         // structural check can skip it.
-        bool probeMedia = true;
+        bool        probeMedia = true;
+        // INDEX counts the container's packets, DEEP decodes every frame. The
+        // alignment rule is enforced identically either way - what changes is
+        // only how the frame count on its left-hand side was arrived at, and
+        // whether the run takes seconds or a quarter of an hour. See
+        // eProbeDepth.
+        eProbeDepth probeDepth = eProbeDepth::INDEX;
+        // Hash every decoded frame. Implies a full decode, so it is only ever
+        // asked for alongside DEEP.
+        bool        checksum   = false;
     };
 
     struct SBundle {

@@ -2,10 +2,12 @@
 #include "Log.hpp"
 #include "Process.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <set>
 #include <sstream>
 
 namespace hxc {
@@ -55,8 +57,54 @@ namespace hxc {
 
     }
 
-    bool probeVideo(const std::string& path, SVideoInfo& out, std::string& error) {
-        out = {};
+    bool isIntraOnlyCodec(const std::string& codecName) {
+        // Everything a `.hypxrtake` writes for its overlay, plus the still-image
+        // codecs the tests round-trip through. Deliberately not "anything without
+        // a known GOP": an unrecognized codec falls through to the safe answer.
+        static const std::set<std::string> INTRA_ONLY = {
+            "ffv1", "utvideo", "huffyuv", "ffvhuff", "rawvideo", "png", "apng", "mjpeg", "qtrle", "v210", "r210", "dpx", "tiff", "bmp", "magicyuv", "prores", "dnxhd", "cfhd", "jpeg2000", "libopenjpeg",
+        };
+        return INTRA_ONLY.count(codecName) > 0;
+    }
+
+    std::optional<double> seekSecondsForFrame(const SVideoInfo& info, size_t index) {
+        if (!info.intraOnly || index == 0 || index >= info.ptsNs.size())
+            return std::nullopt;
+        const int64_t PREVIOUS = info.ptsNs[index - 1];
+        const int64_t TARGET   = info.ptsNs[index];
+        if (TARGET <= PREVIOUS)
+            return std::nullopt; // duplicate or non-monotonic stamps: refuse rather than guess
+        return static_cast<double>(PREVIOUS + (TARGET - PREVIOUS) / 2) * 1e-9;
+    }
+
+    bool checksumVideo(const std::string& path, int threads, std::string& digest, std::string& error) {
+        digest.clear();
+
+        std::vector<std::string> argv{"ffmpeg", "-hide_banner", "-v", "error"};
+        if (threads > 0) {
+            argv.push_back("-threads");
+            argv.push_back(std::to_string(threads));
+        }
+        argv.insert(argv.end(), {"-i", path, "-map", "0:v:0", "-f", "hash", "-hash", "md5", "-"});
+
+        std::string text;
+        if (!runCapture(argv, text, error))
+            return false;
+        for (const auto& LINE : splitLines(text)) {
+            const size_t EQUALS = LINE.find('=');
+            if (EQUALS != std::string::npos)
+                digest = LINE.substr(EQUALS + 1);
+        }
+        if (digest.empty()) {
+            error = std::format("{}: the frame hash came back empty", path);
+            return false;
+        }
+        return true;
+    }
+
+    bool probeVideo(const std::string& path, SVideoInfo& out, std::string& error, eProbeDepth depth) {
+        out       = {};
+        out.depth = depth;
 
         std::string text;
         if (!runCapture({"ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,avg_frame_rate,codec_name,pix_fmt", "-of", "default=noprint_wrappers=1", path},
@@ -85,8 +133,13 @@ namespace hxc {
             error = std::format("{}: ffprobe reported no video stream dimensions", path);
             return false;
         }
+        out.intraOnly = isIntraOnlyCodec(out.codecName);
 
-        if (!runCapture({"ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "frame=pts_time", "-of", "csv=p=0", path}, text, error))
+        // `frame=` makes ffprobe decode; `packet=` makes it demux. On a 2.3 GB
+        // ffv1 take that is fourteen minutes against a fraction of a second, and
+        // the two produce the same list.
+        const char* ENTRIES = depth == eProbeDepth::DEEP ? "frame=pts_time" : "packet=pts_time";
+        if (!runCapture({"ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", ENTRIES, "-of", "csv=p=0", path}, text, error))
             return false;
 
         for (const auto& LINE : splitLines(text)) {
@@ -96,6 +149,10 @@ namespace hxc {
             if (VALUE)
                 out.ptsNs.push_back(secondsToNs(*VALUE));
         }
+        // Packets arrive in decode order, which for an inter-coded stream with B
+        // frames is not presentation order. Nothing downstream wants decode order
+        // - the uses are "how many" and "how long" - so sort and be done.
+        std::sort(out.ptsNs.begin(), out.ptsNs.end());
         return true;
     }
 
@@ -132,16 +189,29 @@ namespace hxc {
 
     CVideoReader::~CVideoReader() = default;
 
-    std::unique_ptr<CVideoReader> CVideoReader::open(const std::string& path, int width, int height, std::string& error) {
+    std::unique_ptr<CVideoReader> CVideoReader::open(const std::string& path, int width, int height, std::string& error, const SReaderOptions& options) {
         if (width <= 0 || height <= 0) {
             error = std::format("{}: refusing to decode at {}x{}", path, width, height);
             return nullptr;
         }
 
-        CSubprocess::SOptions options;
-        options.pipeStdout = true;
+        std::vector<std::string> argv{"ffmpeg", "-hide_banner", "-v", "error"};
+        if (options.threads > 0) {
+            argv.push_back("-threads");
+            argv.push_back(std::to_string(options.threads));
+        }
+        // Before -i, so this is an input seek: ffmpeg jumps in the container
+        // rather than decoding and discarding from the start.
+        if (options.seekSeconds >= 0.0) {
+            argv.push_back("-ss");
+            argv.push_back(std::format("{:.6f}", options.seekSeconds));
+        }
+        argv.insert(argv.end(), {"-i", path, "-f", "rawvideo", "-pix_fmt", "rgba", "-"});
 
-        auto process = CSubprocess::spawn({"ffmpeg", "-hide_banner", "-v", "error", "-i", path, "-f", "rawvideo", "-pix_fmt", "rgba", "-"}, options, error);
+        CSubprocess::SOptions spawnOptions;
+        spawnOptions.pipeStdout = true;
+
+        auto process = CSubprocess::spawn(argv, spawnOptions, error);
         if (!process)
             return nullptr;
 
@@ -150,6 +220,10 @@ namespace hxc {
         reader->m_path     = path;
         reader->m_width    = width;
         reader->m_height   = height;
+        // The first frame out of a seeked decoder is `startFrame`, not zero.
+        // advanceTo()'s first read leaves m_current alone, so seeding it here is
+        // all the whole-file numbering costs.
+        reader->m_current  = options.startFrame;
         reader->m_frame.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
         return reader;
     }
@@ -273,6 +347,10 @@ namespace hxc {
             argv.push_back("0:v");
         }
 
+        if (spec.threads > 0) {
+            argv.push_back("-threads");
+            argv.push_back(std::to_string(spec.threads));
+        }
         argv.push_back("-c:v");
         argv.push_back(spec.videoCodec);
         if (spec.videoCodec == "libx264" || spec.videoCodec == "libx265") {

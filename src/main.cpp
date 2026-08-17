@@ -25,7 +25,7 @@ namespace {
         std::puts(R"(hypxrcompose - compose a .hypxrtake bundle into finished video
 
 usage:
-  hypxrcompose validate <take> [--strict] [--json] [--no-media]
+  hypxrcompose validate <take> [--strict] [--json] [--no-media] [--deep]
   hypxrcompose synth <out-take> [options]
   hypxrcompose render <take> --out <file> [options]
 
@@ -38,6 +38,10 @@ validate:
       --strict             treat warnings as failures
       --json               machine-readable report on stdout
       --no-media           structure only; skip ffprobe
+      --deep               count frames by decoding them, not from the container
+                           index. Same answer, minutes instead of seconds; for
+                           when a file is suspected of being truncated
+      --checksum           md5 every decoded frame (implies --deep)
 
 synth:
       --frames N           telemetry records to generate (default 60)
@@ -159,6 +163,10 @@ int main(int argc, char** argv) {
                 options.jsonOutput = true;
             else if (ARG == "--no-media")
                 options.skipMedia = true;
+            else if (ARG == "--deep")
+                options.deep = true;
+            else if (ARG == "--checksum")
+                options.checksum = true;
             else if (ARG.starts_with("-")) {
                 HXC_ERR("unknown flag {}", ARG);
                 return 2;

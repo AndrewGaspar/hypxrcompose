@@ -872,7 +872,7 @@ namespace hxc {
 
                 const std::string NAME = chosen.filename().string();
                 std::string       probeError;
-                if (!probeVideo(chosen.string(), bundle.overlay.videoInfo.back(), probeError)) {
+                if (!probeVideo(chosen.string(), bundle.overlay.videoInfo.back(), probeError, options.probeDepth)) {
                     diags.error(NAME, "{}", probeError);
                     continue;
                 }
@@ -881,6 +881,24 @@ namespace hxc {
                     diags.error(NAME, "is {}x{} but manifest.overlay says {}x{}", INFO.width, INFO.height, bundle.overlay.width, bundle.overlay.height);
                 if (INFO.ptsNs.empty())
                     diags.error(NAME, "ffprobe reported no frames");
+
+                // A packet count is a frame count only where a packet is a frame.
+                // For the overlay that is guaranteed - the contract's encoders are
+                // all intra-only - and an encoder that breaks the guarantee has to
+                // say so out loud, because the alignment check below is about to
+                // trust the number.
+                if (options.probeDepth == eProbeDepth::INDEX && !INFO.intraOnly && !INFO.codecName.empty())
+                    diags.warn(NAME, "codec `{}` is not one of the known intra-only overlay encoders, so its frame count was counted from the container index rather than decoded; "
+                                     "run `validate --deep` to count by decoding",
+                               INFO.codecName);
+
+                if (options.checksum) {
+                    std::string digest;
+                    if (!checksumVideo(chosen.string(), 0, digest, probeError))
+                        diags.error(NAME, "{}", probeError);
+                    else
+                        HXC_INFO("{}: {} frames decode clean, md5 {}", NAME, INFO.ptsNs.size(), digest);
+                }
 
                 // The decoded pixel format is a property of the encoder the producer
                 // chose, and every accepted one must carry alpha - a matte is the
@@ -1100,9 +1118,16 @@ namespace hxc {
                     const int   DECLARED_W = camera.video.width;
                     const int   DECLARED_H = camera.video.height;
                     std::string probeError;
-                    if (!probeVideo(camera.videoPath, camera.video, probeError)) {
+                    if (!probeVideo(camera.videoPath, camera.video, probeError, options.probeDepth)) {
                         diags.error(fs::path(camera.videoPath).filename().string(), "{}", probeError);
                         continue;
+                    }
+                    if (options.checksum) {
+                        std::string digest;
+                        if (!checksumVideo(camera.videoPath, 0, digest, probeError))
+                            diags.error(fs::path(camera.videoPath).filename().string(), "{}", probeError);
+                        else
+                            HXC_INFO("{}: {} frames decode clean, md5 {}", fs::path(camera.videoPath).filename().string(), camera.video.ptsNs.size(), digest);
                     }
                     if (DECLARED_W > 0 && (DECLARED_W != camera.video.width || DECLARED_H != camera.video.height))
                         diags.error(fs::path(camera.videoPath).filename().string(), "is {}x{} but the sidecar declares {}x{}", camera.video.width, camera.video.height, DECLARED_W, DECLARED_H);

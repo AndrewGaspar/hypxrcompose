@@ -20,6 +20,14 @@ namespace hxc {
         bool                  jsonOutput = false;
         // Skips ffprobe. Structure only, for a quick syntax check.
         bool                  skipMedia  = false;
+        // Count frames by decoding them rather than by counting the container's
+        // packets. The two agree for every codec a `.hypxrtake` holds - the
+        // suite asserts that they do - and the default is the fast one, because
+        // a full decode of a 51-second take is a quarter of an hour. `--deep`
+        // is for when a file is suspected of being truncated or corrupt.
+        bool                  deep       = false;
+        // md5 every decoded frame. Implies --deep.
+        bool                  checksum   = false;
     };
 
     // 0 = clean (or warnings only, unless --strict), 1 = errors, 2 = the bundle
