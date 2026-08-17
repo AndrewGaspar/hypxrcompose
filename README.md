@@ -279,14 +279,22 @@ hypxrcompose render <take> --out film.mp4
 `--size` is the size of **one eye's pane**; stereo SBS output is therefore `2W x H`, which keeps each
 eye's geometry undistorted rather than squeezing two eyes into one frame.
 
-The output camera's frustum is **derived from the recorded eye frusta, not copied from them**. A
-recorded frustum is asymmetric — on the first real take the optical axis sits at 62.1% of the eye
-buffer's width — and its angular aspect (0.9255 there) is whatever the runtime chose, which is not
-the aspect of any pane you would ask for. Mapping one onto the other stretches the picture; at
-1920x1080 that came to 1.92x. So the recorded frustum is instead *padded* — never cropped — until it
-fills the pane at one tangent-per-pixel scale, shared across both eyes so a stereo pair stays a pair.
-Squares render square, nothing recorded is lost, and the optical axis stays where the eye was
-pointing; the cost is that the pane shows some field the eye never saw, at the edges. The frustum
+The output camera's frustum is **derived from the recorded eye frusta, not copied from them**, and
+`--frustum` picks which derivation:
+
+- **`presentation`** (default) — **one** symmetric frustum shared by both eyes, cropped to the pane,
+  with each eye rendering through it from its own position but a common orientation. A feature at
+  infinity therefore lands at the same pane coordinate in both eyes, vertical disparity is zero, and
+  the stereo is carried entirely by the content. This is what a flat side-by-side viewer needs — and
+  what a person fusing two panes needs, which is not the same as what is geometrically truest.
+- **`recorded`** — each eye keeps its own asymmetric frustum, padded to the pane at a shared scale.
+  Truer to what each eye saw, and the right input for analysis or for a headset-native player that
+  re-projects per eye. On a flat viewer the two frames sit at different visual angles: on the
+  reference take a feature at infinity lands 349 px apart at 1440 per eye, which breaks fusion.
+
+Either way the recorded frustum is asymmetric (on the first real take the optical axis sits at 62.1%
+of the eye buffer's width) and its angular aspect, 0.9255 there, is not the aspect of any pane you
+would ask for — mapping one onto the other stretched the picture by 1.92x at 1920x1080. The frustum
 actually used is published per pane in `--report` as `pane_fov`, and any pixels-per-radian figure
 should be read off that rather than off the telemetry.
 

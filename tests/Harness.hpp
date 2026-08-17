@@ -6,6 +6,7 @@
 #include "Bundle.hpp"
 #include "Math.hpp"
 #include "SynthScene.hpp"
+#include "Render.hpp"
 #include "Synth.hpp"
 
 #include <array>
@@ -54,6 +55,13 @@ namespace hxctest {
 
         // Eye pose at a telemetry frame, straight from the scene's motion model.
         SPose                 eyePose(int frame, int eye) const;
+        // The camera the renderer composes that eye's pane from - which is not
+        // the same thing. Under the default presentation frustum the panes are a
+        // parallel rig: each eye keeps its own position, because that is what
+        // carries the stereo parallax, but both look along the head's
+        // orientation, so a feature at infinity lands identically in both. Under
+        // `recorded` the eye's own pose is used unchanged.
+        SPose                 outputCamera(int frame, int eye, eFrustumMode mode = eFrustumMode::PRESENTATION) const;
         SPose                 headPose(int frame) const;
         const SSynthCamera&   camera(int eye) const;
         // Where the generator put camera frame `index` on the host timeline.

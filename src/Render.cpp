@@ -209,10 +209,81 @@ namespace hxc {
         // Derived once rather than per frame: the fov is a property of the
         // headset, and rebuilding it from each record's stamp would make the
         // framing breathe if a producer ever varied it.
-        void deriveOutputFrusta(const SBundle& BUNDLE, SRenderPlan& plan) {
+        void deriveOutputFrusta(const SRenderOptions& options, const SBundle& BUNDLE, SRenderPlan& plan) {
             const size_t PANES = plan.paneEyes.size();
             plan.paneFov.assign(PANES, SFov{});
 
+            if (options.frustum == eFrustumMode::PRESENTATION) {
+                // ONE frustum, symmetric about forward, shared by every pane.
+                //
+                // A flat side-by-side viewer - or a person fusing two panes on a
+                // desktop - needs both frames to subtend the same angles. Give
+                // each eye its own asymmetric frustum and they do not: on the
+                // reference take the optical axes sit at 62.1% and 37.9% of the
+                // width, so a feature at infinity lands 242 px apart at 1440
+                // wide. That is a constant disparity the wearer cannot fuse, and
+                // the frame edges land at different visual angles, which reads as
+                // the two images floating apart in opposite directions. Reported
+                // from an in-headset viewing, which is the only place it shows.
+                //
+                // So: intersect what the eyes recorded, symmetrize about forward,
+                // and crop to the pane. Every pane then shares one frustum and
+                // one scale, and stereo parallax is carried entirely by the eye
+                // positions - by the content - and never by frame placement.
+                // Periphery outside the shared frustum is dropped, which is the
+                // price of a fusable picture.
+                //
+                // Derived from every eye the take holds, not just the panes being
+                // rendered, so a mono render frames identically to one pane of
+                // the stereo pair.
+                //
+                // Per edge this takes the MEDIAN across records, not the
+                // intersection. The reference take's stamped fov is not constant
+                // - eye 0's `u` runs from 0.3964 to 0.7679 - and a strict
+                // intersection would let the single narrowest frame of a
+                // 92-second take decide the framing for all of it, cropping the
+                // other 4600 records to a keyhole. The median lands on the value
+                // the take actually holds nearly all the time; the few narrower
+                // records simply run out of overlay near the edge, which the
+                // sampler already handles by falling through to the background.
+                const auto medianEdge = [&](auto pick) {
+                    std::vector<double> values;
+                    values.reserve(BUNDLE.telemetry.size());
+                    for (const auto& RECORD : BUNDLE.telemetry) {
+                        for (const auto& EYE : RECORD.eyes)
+                            values.push_back(pick(EYE.fov));
+                    }
+                    if (values.empty())
+                        return 0.0;
+                    std::nth_element(values.begin(), values.begin() + static_cast<long>(values.size() / 2), values.end());
+                    return values[values.size() / 2];
+                };
+
+                // Intersecting the two eyes is the same as taking the inner edge
+                // on each side, which for a mirrored pair the median already is;
+                // symmetrizeFov below makes that explicit and exact.
+                std::optional<SFov> shared;
+                if (!BUNDLE.telemetry.empty() && !BUNDLE.telemetry.front().eyes.empty()) {
+                    shared = SFov{medianEdge([](const SFov& f) { return f.l; }), medianEdge([](const SFov& f) { return f.r; }), medianEdge([](const SFov& f) { return f.u; }),
+                                  medianEdge([](const SFov& f) { return f.d; })};
+                }
+                if (!shared) {
+                    plan.paneFov.assign(PANES, SFov{});
+                    return;
+                }
+
+                const SFov SYMMETRIC = symmetrizeFov(*shared);
+                const SFov FITTED    = cropFovToPane(SYMMETRIC, plan.paneWidth, plan.paneHeight);
+                plan.paneFov.assign(PANES, FITTED);
+
+                HXC_INFO("output frustum (presentation): both eyes share l={:.4f} r={:.4f} u={:.4f} d={:.4f} - symmetric about forward, aspect {:.4f} matching the {}x{} pane, optical axis at "
+                         "the pane centre. Kept {:.0f}% of the horizontal field the eyes recorded and {:.0f}% of the vertical; parallax is carried by the content, not by frame placement",
+                         FITTED.l, FITTED.r, FITTED.u, FITTED.d, FITTED.angularAspect(), plan.paneWidth, plan.paneHeight, 100.0 * FITTED.tanWidth() / shared->tanWidth(),
+                         100.0 * FITTED.tanHeight() / shared->tanHeight());
+                return;
+            }
+
+            // ---- eFrustumMode::RECORDED ------------------------------------------
             // The union of every frustum this eye recorded, so nothing any record
             // saw is cropped away.
             std::vector<SFov> recorded(PANES);
@@ -314,7 +385,7 @@ namespace hxc {
                 out.background = eBackgroundChoice::CHECKER;
             }
 
-            deriveOutputFrusta(BUNDLE, out);
+            deriveOutputFrusta(options, BUNDLE, out);
             return true;
         }
 
@@ -556,6 +627,17 @@ namespace hxc {
                 } else
                     draw.outputCamera = eyePoses[EYE][*TELEMETRY_INDEX];
 
+                if (options.frustum == eFrustumMode::PRESENTATION) {
+                    // A parallel rig: both panes look the same way, and the only
+                    // thing that differs between them is where they look *from*.
+                    // Keeping each eye's own orientation would toe the cameras in
+                    // by whatever the runtime stamped and reintroduce a disparity
+                    // at infinity - the very thing the shared frustum removes.
+                    // The position is left alone, because that is what carries
+                    // the parallax.
+                    draw.outputCamera.rot = (options.framing == eFraming::STABILIZED && !smoothedHeads.empty()) ? smoothedHeads[*TELEMETRY_INDEX].rot : headPoses[*TELEMETRY_INDEX].rot;
+                }
+
                 // Overlay. The video's n-th frame is the n-th telemetry record
                 // without `dropped`, so the frame is chosen among *those* records'
                 // times, and the pose it is reprojected from is that record's - not
@@ -748,6 +830,8 @@ namespace hxc {
                 EYE_NAME,
                 "--framing",
                 options.framing == eFraming::STABILIZED ? "stabilized" : "asis",
+                "--frustum",
+                options.frustum == eFrustumMode::RECORDED ? "recorded" : "presentation",
                 "--background",
                 BACKGROUND_NAME,
                 "--size",

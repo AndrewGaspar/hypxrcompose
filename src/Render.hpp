@@ -37,6 +37,26 @@ namespace hxc {
         STABILIZED, // the zero-phase Gaussian smoothing described in Stabilize.hpp
     };
 
+    // How the output camera's frustum is chosen. The two answers serve two
+    // different consumers and there is no single right one.
+    enum class eFrustumMode {
+        // One symmetric frustum, shared by both eyes, derived from the
+        // intersection of what the eyes recorded and symmetrized about forward.
+        // Each eye is then rendered through that same frustum from its own
+        // position, so stereo parallax is carried entirely by the content and
+        // never by where the frame sits. This is what a flat side-by-side viewer
+        // - or a person fusing two panes on a desktop - requires: the two frames
+        // must subtend the same angles, or the edges fight the content and
+        // fusion breaks. Periphery outside the shared frustum is cropped.
+        PRESENTATION,
+        // Each eye keeps its own recorded asymmetric frustum, padded to the pane.
+        // Geometrically the truest record of what each eye saw, and the right
+        // input for analysis or for a headset-native player that re-projects per
+        // eye - but on a flat viewer the two frames land at different visual
+        // angles and the picture reads as floating apart.
+        RECORDED,
+    };
+
     enum class eBackgroundChoice {
         AUTO,    // camera when the take has one, checker when it does not
         CAMERA,
@@ -50,6 +70,7 @@ namespace hxc {
 
         eEyeSelection         eye     = eEyeSelection::LEFT;
         eFraming              framing = eFraming::ASIS;
+        eFrustumMode          frustum = eFrustumMode::PRESENTATION;
         eBackgroundChoice     background = eBackgroundChoice::AUTO;
 
         // Per-eye pane size. Stereo SBS output is therefore 2*width x height, which

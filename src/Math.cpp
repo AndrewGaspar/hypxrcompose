@@ -137,6 +137,33 @@ namespace hxc {
         return out;
     }
 
+    SFov symmetrizeFov(const SFov& fov) {
+        const auto   T    = fov.tangents();
+        // The smaller half-extent on each axis wins, so the result is contained
+        // in the original on all four sides.
+        const double HALF_X = std::min(std::abs(T[0]), std::abs(T[1]));
+        const double HALF_Y = std::min(std::abs(T[2]), std::abs(T[3]));
+        return {-std::atan(HALF_X), std::atan(HALF_X), std::atan(HALF_Y), -std::atan(HALF_Y)};
+    }
+
+    SFov intersectFov(const SFov& a, const SFov& b) {
+        return {std::max(a.l, b.l), std::min(a.r, b.r), std::min(a.u, b.u), std::max(a.d, b.d)};
+    }
+
+    SFov cropFovToPane(const SFov& fov, int width, int height) {
+        if (width <= 0 || height <= 0)
+            return fov;
+        // The *smaller* demand wins here, which is what makes this a crop: the
+        // axis with field to spare gives some up rather than the other axis
+        // gaining any.
+        const double PIXEL = std::min(fov.tanWidth() / static_cast<double>(width), fov.tanHeight() / static_cast<double>(height));
+        if (!(PIXEL > 0.0))
+            return fov;
+        const double HALF_X = PIXEL * static_cast<double>(width) * 0.5;
+        const double HALF_Y = PIXEL * static_cast<double>(height) * 0.5;
+        return {-std::atan(HALF_X), std::atan(HALF_X), std::atan(HALF_Y), -std::atan(HALF_Y)};
+    }
+
     SVec3 fovRay(const SFov& fov, double px, double py, int width, int height) {
         const auto   T = fov.tangents();
         const double U = (px + 0.5) / static_cast<double>(width);

@@ -67,6 +67,14 @@ render:
       --out FILE           output video (required)
       --eye left|right|stereo-sbs      (default left)
       --framing asis|stabilized        (default asis)
+      --frustum presentation|recorded  (default presentation)
+                           presentation: one symmetric frustum shared by both
+                             eyes, cropped to the pane. Frames line up, stereo
+                             fuses, recorded periphery outside it is dropped
+                           recorded: each eye keeps its own asymmetric frustum,
+                             padded. Truer to what each eye saw, and right for
+                             analysis or a headset-native player - but on a flat
+                             viewer the two frames sit at different angles
       --size WxH           per-eye pane size; stereo SBS output is 2W x H
       --fps N              output rate (default: the take's target_hz)
       --background auto|camera|checker|solid
@@ -307,6 +315,16 @@ int main(int argc, char** argv) {
                     options.framing = eFraming::STABILIZED;
                 else {
                     HXC_ERR("--framing takes asis or stabilized");
+                    return 2;
+                }
+            } else if (ARG == "--frustum") {
+                const std::string CHOICE = value(COUNT, REST, i) ?: "";
+                if (CHOICE == "presentation")
+                    options.frustum = eFrustumMode::PRESENTATION;
+                else if (CHOICE == "recorded")
+                    options.frustum = eFrustumMode::RECORDED;
+                else {
+                    HXC_ERR("--frustum takes presentation or recorded");
                     return 2;
                 }
             } else if (ARG == "--background") {

@@ -94,6 +94,13 @@ namespace hxctest {
         return static_cast<size_t>(scene.overlayFrames[ORDINAL]);
     }
 
+    SPose SFixture::outputCamera(int frame, int eye, eFrustumMode mode) const {
+        SPose camera = eyePose(frame, eye);
+        if (mode == eFrustumMode::PRESENTATION)
+            camera.rot = headPose(frame).rot;
+        return camera;
+    }
+
     namespace {
 
         SFixture buildFixture(const std::string& name, double clockOffsetMs, const std::string& alpha = "premultiplied", const std::optional<SFov>& eyeFov = std::nullopt,

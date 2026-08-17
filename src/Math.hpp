@@ -192,6 +192,20 @@ namespace hxc {
     // stereo pair. 0 derives it from this frustum alone.
     SFov   fitFovToPane(const SFov& fov, int width, int height, double angularPixel = 0.0);
 
+    // The largest frustum symmetric about forward that fits inside `fov`. Every
+    // direction it covers, `fov` covered too - so symmetrizing only ever throws
+    // periphery away, never invents any.
+    SFov   symmetrizeFov(const SFov& fov);
+
+    // The part both frusta see.
+    SFov   intersectFov(const SFov& a, const SFov& b);
+
+    // `fov` cropped - never padded - to exactly fill a `width` x `height` pane
+    // with angularly square pixels, keeping it centred on forward. The opposite
+    // trade to fitFovToPane: that one keeps all the field and pads the frame,
+    // this one fills the frame and drops the periphery that does not fit.
+    SFov   cropFovToPane(const SFov& fov, int width, int height);
+
     // A direction in eye space (z negative, unnormalized) for the centre of pixel
     // (px, py) of a `width` x `height` image rendered with this frustum.
     SVec3 fovRay(const SFov& fov, double px, double py, int width, int height);

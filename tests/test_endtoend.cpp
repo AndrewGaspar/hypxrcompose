@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <format>
 #include <limits>
 #include <set>
 #include <tuple>
@@ -174,9 +175,12 @@ TEST(EndToEnd, OverlayMarkersLandWherePredicted) {
 
         EXPECT_EQ(RENDERED.report.frames[k].overlayTelemetryIndex[0], static_cast<int64_t>(SOURCE_RECORD)) << "output frame " << k;
 
-        const SPose OUTPUT_EYE = FIX.eyePose(static_cast<int>(OUTPUT_RECORD), 0);
+        // The camera the renderer used, and the frustum it published - not the
+        // recorded eye pose and fov, which since the presentation framing landed
+        // are the *source's* geometry rather than the output's.
+        const SPose OUTPUT_EYE = FIX.outputCamera(static_cast<int>(OUTPUT_RECORD), 0);
         const SPose SOURCE_EYE = FIX.eyePose(static_cast<int>(SOURCE_RECORD), 0);
-        const SFov& FOV        = FIX.scene.eyeFov[0];
+        const SFov& FOV        = RENDERED.report.paneFov.at(0);
 
         for (const auto& MARKER : FIX.scene.overlayMarkers) {
             // Partially transparent markers sit over the panel's own gradient, so
@@ -224,8 +228,8 @@ TEST(EndToEnd, BackgroundMarkersLandWherePredicted) {
 
     for (size_t k : {size_t{10}, size_t{25}, size_t{40}}) {
         const SImage IMAGE = RENDERED.frame(k);
-        const SPose  EYE   = FIX.eyePose(static_cast<int>(FIX.outputRecord(k, FPS)), 0);
-        const SFov&  FOV   = FIX.scene.eyeFov[0];
+        const SPose  EYE   = FIX.outputCamera(static_cast<int>(FIX.outputRecord(k, FPS)), 0);
+        const SFov&  FOV   = RENDERED.report.paneFov.at(0);
 
         const size_t CAMERA_FRAME = predictCameraFrame(FIX, 0, k, FPS);
         ASSERT_EQ(RENDERED.report.frames[k].cameraFrame[0], static_cast<int64_t>(CAMERA_FRAME)) << "output frame " << k;
@@ -315,9 +319,9 @@ TEST(EndToEnd, TheClockOffsetSelectsTheRightCameraFrame) {
         // And the pixels agree: the frame-identity patch encodes which camera frame
         // was sampled, so this reads the answer out of the composite itself.
         const SImage IMAGE       = RENDERED.frame(k);
-        const SPose  EYE         = FIX.eyePose(static_cast<int>(FIX.outputRecord(k, FPS)), 0);
+        const SPose  EYE         = FIX.outputCamera(static_cast<int>(FIX.outputRecord(k, FPS)), 0);
         const SPose  CAMERA_POSE = FIX.scene.headAt(FIX.cameraHostNs(0, CHOSEN)).compose(FIX.camera(0).headToCamera);
-        const auto   PATCH       = predictBackgroundPixel(EYE, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, CAMERA_POSE, FIX.scene.codeCentre, 2.0);
+        const auto   PATCH       = predictBackgroundPixel(EYE, RENDERED.report.paneFov.at(0), PANE_WIDTH, PANE_HEIGHT, CAMERA_POSE, FIX.scene.codeCentre, 2.0);
         ASSERT_TRUE(PATCH.has_value());
 
         const auto   COLOR   = blockColor(IMAGE, (*PATCH)[0], (*PATCH)[1], 3);
@@ -334,29 +338,45 @@ TEST(EndToEnd, TheClockOffsetSelectsTheRightCameraFrame) {
 // its own (mirrored, asymmetric) frustum say, and the difference between them
 // carries the synthetic IPD's parallax with the right sign.
 // ---------------------------------------------------------------------------
-TEST(EndToEnd, StereoPanesDifferByTheSyntheticIpdParallax) {
+// Under the default presentation frustum the two panes share one symmetric
+// camera frustum and a common orientation, so ALL of the disparity is content
+// parallax. That is the property a flat side-by-side viewer needs: frames that
+// subtend the same angles, with the stereo carried by the picture inside them.
+TEST(EndToEnd, StereoPanesCarryTheIpdParallaxAndNothingElse) {
     const auto& FIX      = fixture();
     const auto  RENDERED = renderCase("stereo", [](SRenderOptions& o) { o.eye = eEyeSelection::STEREO_SBS; });
 
     ASSERT_EQ(RENDERED.report.paneCount, 2);
+    ASSERT_EQ(RENDERED.report.paneFov.size(), 2u);
+
+    // One frustum, symmetric about forward, for both eyes.
+    const SFov& L = RENDERED.report.paneFov[0];
+    const SFov& R = RENDERED.report.paneFov[1];
+    EXPECT_NEAR(L.l, R.l, 1e-12) << "the panes must share one frustum, or their frames sit at different visual angles";
+    EXPECT_NEAR(L.r, R.r, 1e-12);
+    EXPECT_NEAR(L.u, R.u, 1e-12);
+    EXPECT_NEAR(L.d, R.d, 1e-12);
+    EXPECT_NEAR(L.l, -L.r, 1e-12) << "and it must be symmetric, so the optical axis lands at the pane centre";
+    EXPECT_NEAR(L.u, -L.d, 1e-12);
+    EXPECT_NEAR(L.opticalCentreU(), 0.5, 1e-9);
+    EXPECT_NEAR(L.opticalCentreV(), 0.5, 1e-9);
 
     const size_t K     = 25;
     const SImage IMAGE = RENDERED.frame(K);
     ASSERT_EQ(IMAGE.width, PANE_WIDTH * 2);
 
-    const double FPS            = RENDERED.report.fps;
-    const size_t OUTPUT_RECORD  = FIX.outputRecord(K, FPS);
-    const size_t SOURCE_RECORD  = FIX.overlaySourceRecord(K, FPS);
+    const double FPS           = RENDERED.report.fps;
+    const size_t OUTPUT_RECORD = FIX.outputRecord(K, FPS);
+    const size_t SOURCE_RECORD = FIX.overlaySourceRecord(K, FPS);
 
     const SVec3 MARKER   = overlayMarkerWorld(FIX.scene, "centre");
-    const SPose HEAD     = FIX.headPose(static_cast<int>(OUTPUT_RECORD));
-    const SPose EYE_L    = FIX.eyePose(static_cast<int>(OUTPUT_RECORD), 0);
-    const SPose EYE_R    = FIX.eyePose(static_cast<int>(OUTPUT_RECORD), 1);
+    const SPose EYE_L    = FIX.outputCamera(static_cast<int>(OUTPUT_RECORD), 0);
+    const SPose EYE_R    = FIX.outputCamera(static_cast<int>(OUTPUT_RECORD), 1);
     const SPose SOURCE_L = FIX.eyePose(static_cast<int>(SOURCE_RECORD), 0);
     const SPose SOURCE_R = FIX.eyePose(static_cast<int>(SOURCE_RECORD), 1);
 
-    const auto PREDICTED_L = predictOverlayPixel(EYE_L, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, SOURCE_L, MARKER);
-    const auto PREDICTED_R = predictOverlayPixel(EYE_R, FIX.scene.eyeFov[1], PANE_WIDTH, PANE_HEIGHT, SOURCE_R, MARKER);
+    const auto PREDICTED_L = predictOverlayPixel(EYE_L, L, PANE_WIDTH, PANE_HEIGHT, SOURCE_L, MARKER);
+    const auto PREDICTED_R = predictOverlayPixel(EYE_R, R, PANE_WIDTH, PANE_HEIGHT, SOURCE_R, MARKER);
     ASSERT_TRUE(PREDICTED_L.has_value());
     ASSERT_TRUE(PREDICTED_R.has_value());
 
@@ -370,26 +390,91 @@ TEST(EndToEnd, StereoPanesDifferByTheSyntheticIpdParallax) {
     EXPECT_NEAR(MEASURED_R->x - PANE_WIDTH, (*PREDICTED_R)[0], 1.5);
     EXPECT_NEAR(MEASURED_R->y, (*PREDICTED_R)[1], 1.5);
 
-    // Now isolate the parallax from the frustum asymmetry: predict again with both
-    // eyes collapsed onto the head, and take the difference of differences.
-    const SPose SOURCE_HEAD = FIX.headPose(static_cast<int>(SOURCE_RECORD));
-    const auto  NO_IPD_L    = predictOverlayPixel(HEAD, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, SOURCE_HEAD, MARKER);
-    const auto  NO_IPD_R    = predictOverlayPixel(HEAD, FIX.scene.eyeFov[1], PANE_WIDTH, PANE_HEIGHT, SOURCE_HEAD, MARKER);
-    ASSERT_TRUE(NO_IPD_L.has_value());
-    ASSERT_TRUE(NO_IPD_R.has_value());
+    // A parallel rig with a shared frustum: vertical disparity must be zero, and
+    // a vertical offset is the thing that makes a stereo pair unfusable.
+    EXPECT_NEAR(MEASURED_L->y, MEASURED_R->y, 1.5) << "the two panes disagree vertically; nothing can fuse that";
 
-    const double MEASURED_DISPARITY  = MEASURED_L->x - (MEASURED_R->x - PANE_WIDTH);
-    const double PREDICTED_DISPARITY = (*PREDICTED_L)[0] - (*PREDICTED_R)[0];
-    const double ASYMMETRY_ONLY      = (*NO_IPD_L)[0] - (*NO_IPD_R)[0];
-    const double PARALLAX            = PREDICTED_DISPARITY - ASYMMETRY_ONLY;
+    // The horizontal disparity is the IPD parallax at the marker's depth, and
+    // nothing else: baseline over distance, in tangent, times the pane scale.
+    const double DEPTH     = (MARKER - FIX.headPose(static_cast<int>(OUTPUT_RECORD)).pos).length();
+    const double BASELINE  = (EYE_L.pos - EYE_R.pos).length();
+    const double SCALE     = PANE_WIDTH / L.tanWidth();
+    const double PREDICTED = BASELINE / DEPTH * SCALE;
 
-    std::cout << "[measured] stereo disparity " << MEASURED_DISPARITY << " px (predicted " << PREDICTED_DISPARITY << "), of which " << PARALLAX << " px is IPD parallax\n";
+    const double MEASURED_DISPARITY = MEASURED_L->x - (MEASURED_R->x - PANE_WIDTH);
+    std::cout << "[measured] presentation stereo: disparity " << MEASURED_DISPARITY << " px, IPD parallax at " << DEPTH << " m predicts " << PREDICTED << " px; frustum term 0 by construction\n";
 
-    EXPECT_NEAR(MEASURED_DISPARITY, PREDICTED_DISPARITY, 2.0);
-    // A point in front of the viewer sits further right in the left eye's image, so
-    // the parallax term must be positive and big enough to be a real signal.
-    EXPECT_GT(PARALLAX, 4.0);
-    EXPECT_LT(std::abs(MEASURED_DISPARITY - PREDICTED_DISPARITY), std::abs(PARALLAX) * 0.5) << "the measurement must be nearer the with-IPD prediction than the without-IPD one";
+    EXPECT_GT(MEASURED_DISPARITY, 0.0) << "a point in front of the viewer sits further right in the left eye";
+    EXPECT_NEAR(MEASURED_DISPARITY, PREDICTED, std::max(2.0, PREDICTED * 0.1));
+}
+
+// A feature at infinity has no parallax, so under the shared frustum it must
+// land at the SAME pane coordinate in both eyes. This is the frame-alignment
+// property the in-headset viewing found missing: with per-eye recorded frusta
+// the same feature sits hundreds of pixels apart, which is a constant disparity
+// nobody can fuse and which reads as the two images floating apart.
+TEST(EndToEnd, AFeatureAtInfinityLandsAtTheSamePaneCoordinateInBothEyes) {
+    const auto& FIX = realFrustumFixture();
+
+    // The checker background draws a world-locked forward mark - a vertical
+    // stripe at yaw 0 - in direction space, which is to say at infinity.
+    const auto stripeX = [](const SImage& image, int x0, int x1) -> std::optional<double> {
+        // vec3(0.34, 0.26, 0.22) written as it looks, i.e. sRGB bytes.
+        const auto MARK = findColor(image, {87, 66, 56}, 30, x0, x1);
+        if (!MARK || MARK->count < 40)
+            return std::nullopt;
+        return MARK->x - x0;
+    };
+
+    for (const auto& [MODE, NAME] : std::vector<std::pair<eFrustumMode, const char*>>{{eFrustumMode::PRESENTATION, "presentation"}, {eFrustumMode::RECORDED, "recorded"}}) {
+        const auto RENDERED = renderCase(
+            std::string("infinity-") + NAME,
+            [m = MODE](SRenderOptions& o) {
+                o.eye        = eEyeSelection::STEREO_SBS;
+                o.frustum    = m;
+                o.background = eBackgroundChoice::CHECKER;
+            },
+            FIX, true);
+
+        std::optional<double> worst;
+        size_t                frames = 0;
+        for (size_t k = 0; k < std::min<size_t>(8, RENDERED.report.frames.size()); ++k) {
+            const SImage IMAGE = RENDERED.frame(k);
+            const auto   LX    = stripeX(IMAGE, 0, PANE_WIDTH);
+            const auto   RX    = stripeX(IMAGE, PANE_WIDTH, PANE_WIDTH * 2);
+            if (!LX || !RX)
+                continue;
+            const double DIFF = std::abs(*LX - *RX);
+            worst             = worst ? std::max(*worst, DIFF) : DIFF;
+            ++frames;
+        }
+        // What the two panes' frusta say a feature at infinity must do, which is
+        // exact and does not depend on the mark being framed in both panes: with
+        // a common orientation, the only thing left is where each frustum starts.
+        ASSERT_EQ(RENDERED.report.paneFov.size(), 2u);
+        const SFov&  PL       = RENDERED.report.paneFov[0];
+        const SFov&  PR       = RENDERED.report.paneFov[1];
+        const double ANALYTIC = std::abs(std::tan(PR.l) - std::tan(PL.l)) * (PANE_WIDTH / PL.tanWidth());
+
+        if (MODE == eFrustumMode::PRESENTATION) {
+            ASSERT_GT(frames, 0u) << "presentation: the forward mark was never visible in both panes";
+            EXPECT_LT(ANALYTIC, 1e-9) << "presentation: the shared frustum must put infinity at the same coordinate by construction";
+            EXPECT_LT(*worst, 2.0) << "presentation: a feature at infinity must land at the same pane coordinate in both eyes, but it is " << *worst << " px apart";
+            std::cout << "[measured] presentation: infinity lands within " << *worst << " px in both panes (" << frames << " frames)\n";
+        } else {
+            // The mode this exists to contrast with: the same feature, hundreds
+            // of pixels apart, which is exactly what broke fusion in the headset.
+            // Measured where the mark is framed in both panes, and always
+            // asserted from the frusta - under `recorded` the panes are padded so
+            // wide that the mark often falls outside one of them, which is itself
+            // a symptom of the frames not agreeing.
+            EXPECT_GT(ANALYTIC, 20.0) << "recorded: the per-eye frusta should put infinity in visibly different places; if they do not, this test has stopped contrasting anything";
+            if (frames > 0)
+                EXPECT_NEAR(*worst, ANALYTIC, std::max(3.0, ANALYTIC * 0.05));
+            std::cout << "[measured] recorded: the panes' frusta put the same infinite feature " << ANALYTIC << " px apart" << (frames > 0 ? std::format(" (measured {:.1f})", *worst) : std::string())
+                      << " - the constant disparity that broke fusion\n";
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -410,13 +495,13 @@ TEST(EndToEnd, ChangingTheAssumedBackgroundDepthMovesTheImageByThePredictedParal
     });
 
     const size_t K            = 20;
-    const SPose  EYE          = FIX.eyePose(static_cast<int>(FIX.outputRecord(K, AT_TWO.report.fps)), 0);
+    const SPose  EYE          = FIX.outputCamera(static_cast<int>(FIX.outputRecord(K, AT_TWO.report.fps)), 0);
     const size_t CAMERA_FRAME = predictCameraFrame(FIX, 0, K, AT_TWO.report.fps);
     const SPose  CAMERA_POSE  = FIX.scene.headAt(FIX.cameraHostNs(0, CAMERA_FRAME)).compose(FIX.camera(0).headToCamera);
     const auto&  MARKER       = wallMarker(FIX.scene, "green");
 
-    const auto PREDICTED_TWO = predictBackgroundPixel(EYE, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, CAMERA_POSE, MARKER.world, 2.0);
-    const auto PREDICTED_TEN = predictBackgroundPixel(EYE, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, CAMERA_POSE, MARKER.world, 10.0);
+    const auto PREDICTED_TWO = predictBackgroundPixel(EYE, AT_TWO.report.paneFov.at(0), PANE_WIDTH, PANE_HEIGHT, CAMERA_POSE, MARKER.world, 2.0);
+    const auto PREDICTED_TEN = predictBackgroundPixel(EYE, AT_TWO.report.paneFov.at(0), PANE_WIDTH, PANE_HEIGHT, CAMERA_POSE, MARKER.world, 10.0);
     ASSERT_TRUE(PREDICTED_TWO.has_value());
     ASSERT_TRUE(PREDICTED_TEN.has_value());
 
@@ -465,13 +550,16 @@ TEST(EndToEnd, StabilizedFramingRendersFromTheSmoothedCamera) {
     const SPose  HEAD   = FIX.bundle.telemetry[OUTPUT_RECORD].headPose();
     const SPose  EYE    = FIX.bundle.telemetry[OUTPUT_RECORD].eyes[0].pose;
     const SPose  SOURCE = FIX.bundle.telemetry[SOURCE_RECORD].eyes[0].pose;
-    const SPose  OUTPUT = SMOOTHED[OUTPUT_RECORD].compose(HEAD.inverse().compose(EYE));
+    SPose        OUTPUT = SMOOTHED[OUTPUT_RECORD].compose(HEAD.inverse().compose(EYE));
+    // The presentation frustum makes the panes a parallel rig, so the output
+    // camera looks along the smoothed head rather than along the eye.
+    OUTPUT.rot          = SMOOTHED[OUTPUT_RECORD].rot;
     const SVec3  MARKER = overlayMarkerWorld(FIX.scene, "centre");
 
     // Infinite foreground depth means the warp preserves directions from the
     // recording eye, so the prediction uses the recorded eye for the direction and
     // the smoothed camera for the frustum.
-    const auto PREDICTED = predictOverlayPixel(OUTPUT, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, SOURCE, MARKER);
+    const auto PREDICTED = predictOverlayPixel(OUTPUT, RENDERED.report.paneFov.at(0), PANE_WIDTH, PANE_HEIGHT, SOURCE, MARKER);
     ASSERT_TRUE(PREDICTED.has_value());
 
     const auto MEASURED = findColor(RENDERED.frame(K), {255, 0, 255}, 30, 0, PANE_WIDTH);
@@ -640,18 +728,18 @@ namespace {
         std::array<double, 3> color{};
     };
 
-    SHudExpectation expectHud(const SFixture& fix, size_t k, double fps, const std::array<float, 4>& solidSrgb, bool encodedSpaceInstead) {
+    SHudExpectation expectHud(const SFixture& fix, size_t k, double fps, const SFov& outputFov, const std::array<float, 4>& solidSrgb, bool encodedSpaceInstead) {
         const size_t OUTPUT_RECORD = fix.outputRecord(k, fps);
         const size_t SOURCE_RECORD = fix.overlaySourceRecord(k, fps);
 
-        const SPose OUTPUT_EYE = fix.eyePose(static_cast<int>(OUTPUT_RECORD), 0);
+        const SPose OUTPUT_EYE = fix.outputCamera(static_cast<int>(OUTPUT_RECORD), 0);
         const SPose SOURCE_EYE = fix.eyePose(static_cast<int>(SOURCE_RECORD), 0);
         // Head-locked: the layer's world pose follows the head, so its centre at the
         // instant the overlay frame was rendered is head(source) * hudQuad.
         const SVec3 CENTRE     = fix.headPose(static_cast<int>(SOURCE_RECORD)).compose(fix.scene.hudQuad).pos;
 
         SHudExpectation expectation;
-        const auto      PIXEL = predictOverlayPixel(OUTPUT_EYE, fix.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, SOURCE_EYE, CENTRE);
+        const auto      PIXEL = predictOverlayPixel(OUTPUT_EYE, outputFov, PANE_WIDTH, PANE_HEIGHT, SOURCE_EYE, CENTRE);
         expectation.pixel     = PIXEL.value_or(std::array<double, 2>{-1.0, -1.0});
 
         // Alpha survives as a byte, so the prediction uses the quantized value the
@@ -682,8 +770,8 @@ TEST(EndToEnd, PartialAlphaCompositesInLinearLightFromAPremultipliedSource) {
 
     const SPaneDraw DEFAULTS; // the solid colour the SOLID background paints
     const size_t    K        = 20;
-    const auto      EXPECTED = expectHud(FIX, K, RENDERED.report.fps, DEFAULTS.solidColor, false);
-    const auto      WRONG    = expectHud(FIX, K, RENDERED.report.fps, DEFAULTS.solidColor, true);
+    const auto      EXPECTED = expectHud(FIX, K, RENDERED.report.fps, RENDERED.report.paneFov.at(0), DEFAULTS.solidColor, false);
+    const auto      WRONG    = expectHud(FIX, K, RENDERED.report.fps, RENDERED.report.paneFov.at(0), DEFAULTS.solidColor, true);
 
     const SImage IMAGE    = RENDERED.frame(K);
     const auto   MEASURED = blockColor(IMAGE, EXPECTED.pixel[0], EXPECTED.pixel[1], 4);
@@ -722,7 +810,7 @@ TEST(EndToEnd, StraightAndPremultipliedBundlesComposeToTheSamePixels) {
 
     const SPaneDraw DEFAULTS;
     const size_t    K        = 20;
-    const auto      EXPECTED = expectHud(PREMULTIPLIED, K, FROM_PREMULTIPLIED.report.fps, DEFAULTS.solidColor, false);
+    const auto      EXPECTED = expectHud(PREMULTIPLIED, K, FROM_PREMULTIPLIED.report.fps, FROM_PREMULTIPLIED.report.paneFov.at(0), DEFAULTS.solidColor, false);
 
     const auto A = blockColor(FROM_PREMULTIPLIED.frame(K), EXPECTED.pixel[0], EXPECTED.pixel[1], 4);
     const auto B = blockColor(FROM_STRAIGHT.frame(K), EXPECTED.pixel[0], EXPECTED.pixel[1], 4);

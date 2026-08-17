@@ -138,29 +138,49 @@ gap 2 (both are "the pose/depth for a sample is not constant across the frame").
 
 ---
 
-## Output framing: the pane's aspect, the recorded frustum's asymmetry (fixed 2026-08-17)
+## Output framing: two frusta, two consumers (fixed 2026-08-17, corrected after a headset viewing)
 
 A recorded eye frustum is asymmetric and its angular aspect is whatever the runtime picked. On the
 reference take, eye 0 is `l=-0.9425 r=0.6981 u=0.7679 d=-0.9599`: an angular aspect of 0.9255 and an
-optical axis at **62.1%** of the width, not at half. v1 handed that fov straight to the shader, which
-maps it linearly onto whatever pane was asked for — so the picture was stretched by the ratio of the
-two aspects, and the optical axis landed wherever that mapping put it.
+optical axis at **62.1%** of the width (eye 1 mirrors it at 37.9%). v1 handed that fov straight to
+the shader, which maps it linearly onto whatever pane was asked for — so the picture was stretched by
+the ratio of the two aspects: **3.1%** at the take's own buffer size, **1.92x** at 1920x1080.
 
-Measured: **3.1% horizontal stretch** at the take's own buffer size (2064x2162), and **1.92x** — near
-double-width — at the documented 1920x1080 reference render.
+The first fix built each eye's output camera from its own recorded frustum, padded to the pane. That
+is geometrically the truest record and it is **wrong for viewing**, which only showed up in a
+headset: with the optical axes preserved at 62.1% and 37.9%, a feature at infinity lands **349 px
+apart** at 1440 per eye. The wearer reported each eye's content sitting to one side, the frames
+disagreeing at the edges, and fusion breaking. A constant disparity at infinity is not something a
+viewer can fuse, and frame edges at different visual angles fight the content.
 
-The fix is `deriveOutputFrusta` + `fitFovToPane`: keep the recorded frustum, pad it (never crop)
-until it fills the pane at one tan-units-per-pixel scale, and share that scale across both eyes of a
-stereo pair. The result has angularly square pixels, keeps every recorded pixel, and leaves the
-optical axis pointing exactly where the eye was pointing. Verified end to end on a fixture carrying
-the real take's frustum: worst aspect error **0.49%**, against the 44% the old mapping introduces on
-the same pane; markers land within 0.58 px of prediction where a frustum ignoring the asymmetry would
-move them 17.8 px.
+So there are two modes, because there are two consumers:
 
-Two consequences worth knowing. The output frustum is *wider* than the recorded one, so content is
-smaller than it used to be and the edges show background the eye never saw — that is the honest
-trade for not cropping. And any px-per-tangent figure must be read off the report's `pane_fov`, not
-off the telemetry; the stereo-check expectation above is recomputed for exactly that reason.
+| `--frustum` | What it does | For |
+|---|---|---|
+| **`presentation`** (default) | **One** frustum for both eyes: the per-edge median across records, intersected across eyes, symmetrized about forward, cropped to the pane. Each eye renders through it from its **own position** but a **common orientation** (a parallel rig). | Flat SBS viewing, any player, a person fusing two panes. Parallax is carried by the content and never by frame placement. |
+| `recorded` | Each eye keeps its own asymmetric frustum, padded to the pane, both at one scale. | Analysis, and a headset-native player that re-projects per eye. |
+
+Measured on the reference take at 1440x1080 per eye, presentation mode: shared frustum
+`l=-0.6981 r=0.6981 u=0.5617 d=-0.5617`, 858.1 px per tangent, optical axis at the pane centre,
+**disparity at infinity 0.0 px** (was 349), and content parallax of 39.8 px at 1.48 m, 29.4 px at
+2 m, 11.8 px at 5 m. Vertical disparity is zero by construction. It keeps 100% of the horizontal
+field the eyes recorded and 53% of the vertical — filling a 4:3 frame from a nearly-square field
+costs that, and it is a crop rather than a stretch.
+
+Two details worth knowing. The per-edge **median** matters: the take's stamped fov is not constant
+(eye 0's `u` runs from 0.3964 to 0.7679), and a strict intersection would let the single narrowest
+frame decide the framing for all 4604 records. And the **common orientation** matters as much as the
+shared frustum: keeping each eye's stamped orientation would toe the cameras in and reintroduce a
+disparity at infinity, which is the thing the shared frustum exists to remove.
+
+Verified end to end on a fixture carrying the real take's frustum: a feature at infinity lands within
+**0.029 px** in both panes; stereo disparity is the IPD parallax and nothing else (11.96 px measured
+against 11.39 predicted); squares stay square to **0.43%**, against the 44% the old mapping
+introduced on the same pane. The `recorded` arm of the same test asserts the contrast — 80.8 px of
+constant disparity on the synthetic frustum — so the mode that broke fusion cannot quietly become
+the default again.
+
+---
 
 ---
 
