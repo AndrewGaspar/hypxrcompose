@@ -8,6 +8,7 @@
 #include <cmath>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <thread>
 
 using json = nlohmann::json;
@@ -165,6 +166,40 @@ namespace hxc {
         scene.eyeFov[0] = {-0.95, 0.86, 0.75, -0.78};
         scene.eyeFov[1] = {-0.86, 0.95, 0.75, -0.78};
 
+        // Which telemetry records carry overlay pixels. Two causes, both expressed
+        // the same way in the bundle - a `"dropped": true` on the record:
+        //   - decimation, because the overlay is captured at target_hz while the
+        //     session runs faster;
+        //   - readback-queue losses, which are irregular by nature.
+        // A bundle that never exercises either would let an ordinal-alignment bug
+        // pass unnoticed, so the generator always produces some of both.
+        size_t decimated = 0, readbackDropped = 0;
+        {
+            std::vector<int> captured;
+            for (int k = 0; k < options.frames; ++k) {
+                const int THIS_TICK = static_cast<int>(std::floor(static_cast<double>(k) * scene.overlayHz / scene.hz));
+                const int LAST_TICK = k == 0 ? -1 : static_cast<int>(std::floor(static_cast<double>(k - 1) * scene.overlayHz / scene.hz));
+                if (k == 0 || THIS_TICK > LAST_TICK)
+                    captured.push_back(k);
+                else
+                    ++decimated;
+            }
+
+            // Two irregular losses at fixed fractions of the take, so the drop
+            // pattern is not a clean stride and the tests can target a frame whose
+            // nearest overlay record is not its own.
+            std::vector<size_t> lose;
+            if (captured.size() >= 12) {
+                lose = {captured.size() / 3, (2 * captured.size()) / 3};
+                for (auto it = lose.rbegin(); it != lose.rend(); ++it) {
+                    captured.erase(captured.begin() + static_cast<long>(*it));
+                    ++readbackDropped;
+                }
+            }
+            scene.overlayFrames = std::move(captured);
+        }
+        const std::set<int> CAPTURED_RECORDS(scene.overlayFrames.begin(), scene.overlayFrames.end());
+
         // ---- the clock ------------------------------------------------------------
         const int64_t T0       = scene.t0HostNs;
         const int64_t DURATION = static_cast<int64_t>(std::llround(static_cast<double>(options.frames - 1) * 1e9 / options.hz));
@@ -283,6 +318,8 @@ namespace hxc {
                 "synthetic bundle from `hypxrcompose synth`; the scene is described exactly in synth/ground-truth.json",
                 std::format("host<->device offset starts at {:.3f} ms and drifts {:.1f} ppm", options.clockOffsetMs, options.clockDriftPpm),
                 "camera extrinsics deliberately differ from the eye poses (wider baseline, forward offset, outward splay)",
+                std::format("overlay: {} of {} records carry pixels; dropped {} to decimation ({:.0f} Hz session -> {:.0f} Hz overlay) and {} to the readback queue",
+                            scene.overlayFrames.size(), options.frames, decimated, scene.hz, scene.overlayHz, readbackDropped),
             });
 
             std::ofstream stream(options.out / "manifest.json");
@@ -310,8 +347,9 @@ namespace hxc {
                     eyes += std::format(R"({{"pose":{},"fov":{}}})", poseJson(EYE_POSE), fovJson(scene.eyeFov[static_cast<size_t>(eye)]));
                 }
 
-                telemetry << std::format(R"({{"t_host_ns":{},"frame":{},"eyes":[{}],"head":{},"stage_correction":{},"blend_mode":"alpha"}})", T_HOST, k, eyes, poseJson(HEAD),
-                                         poseJson(STAGE_CORRECTION))
+                const bool CAPTURED = CAPTURED_RECORDS.count(k) > 0;
+                telemetry << std::format(R"({{"t_host_ns":{},"frame":{},"eyes":[{}],"head":{},"stage_correction":{},"blend_mode":"alpha","dropped":{}}})", T_HOST, k, eyes, poseJson(HEAD),
+                                         poseJson(STAGE_CORRECTION), CAPTURED ? "false" : "true")
                           << "\n";
             }
 
@@ -330,21 +368,29 @@ namespace hxc {
 
         // ---- overlay videos -------------------------------------------------------
         {
-            const int    WIDTH  = scene.overlayWidth;
-            const int    HEIGHT = scene.overlayHeight;
-            const int    COUNT  = static_cast<int>(std::llround(static_cast<double>(options.frames) * scene.overlayHz / scene.hz));
+            const int WIDTH  = scene.overlayWidth;
+            const int HEIGHT = scene.overlayHeight;
+            const int COUNT  = static_cast<int>(scene.overlayFrames.size());
 
             for (int eye = 0; eye < 2; ++eye) {
+                // A uniform nominal timeline at target_hz starting at zero: the
+                // container's pts say nothing about host time and nothing consumes
+                // them for alignment. `-fps_mode passthrough` is what keeps ffmpeg
+                // from duplicating or dropping a frame to hit that nominal rate,
+                // which would break the ordinal correspondence the bundle promises.
                 auto encoder = CSimpleEncoder::open((options.out / "overlay" / std::format("eye{}.mkv", eye)).string(), WIDTH, HEIGHT, scene.overlayHz,
-                                                    {"-c:v", "ffv1", "-pix_fmt", "rgba"}, static_cast<double>(T0) * 1e-9, error);
+                                                    {"-fps_mode", "passthrough", "-c:v", "ffv1", "-pix_fmt", "rgba"}, 0.0, error);
                 if (!encoder) {
                     HXC_ERR("{}", error);
                     return 1;
                 }
 
                 std::vector<uint8_t> frame(static_cast<size_t>(WIDTH) * HEIGHT * 4);
-                for (int k = 0; k < COUNT; ++k) {
-                    const int64_t T_HOST   = T0 + static_cast<int64_t>(std::llround(static_cast<double>(k) * 1e9 / scene.overlayHz));
+                // One video frame per undropped telemetry record, in order, rendered
+                // from *that record's* pose. This is the ordinal alignment rule the
+                // compositor consumes, produced here rather than assumed there.
+                for (int record : scene.overlayFrames) {
+                    const int64_t T_HOST   = scene.frameHostNs(record);
                     const SPose   HEAD     = scene.headAt(T_HOST);
                     const SPose   EYE_POSE = HEAD.compose({{(eye == 0 ? -0.5 : 0.5) * scene.ipd, 0.0, 0.0}, SQuat::identity()});
                     const SFov&   FOV      = scene.eyeFov[static_cast<size_t>(eye)];

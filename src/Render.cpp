@@ -81,6 +81,7 @@ namespace hxc {
                 {"t_host_ns", FRAME.tHostNs},
                 {"telemetry_index", FRAME.telemetryIndex},
                 {"overlay_frame", {FRAME.overlayFrame[0], FRAME.overlayFrame[1]}},
+                {"overlay_telemetry_index", {FRAME.overlayTelemetryIndex[0], FRAME.overlayTelemetryIndex[1]}},
                 {"camera_frame", {FRAME.cameraFrame[0], FRAME.cameraFrame[1]}},
                 {"camera_t_host_ns", {FRAME.cameraHostNs[0], FRAME.cameraHostNs[1]}},
             });
@@ -325,10 +326,15 @@ namespace hxc {
                 } else
                     draw.outputCamera = eyePoses[EYE][*TELEMETRY_INDEX];
 
-                // Overlay.
+                // Overlay. The video's n-th frame is the n-th telemetry record
+                // without `dropped`, so the frame is chosen among *those* records'
+                // times, and the pose it is reprojected from is that record's - not
+                // the output instant's. When frames were dropped the two differ, and
+                // using the output instant's pose would warp the overlay from a
+                // viewpoint it was never rendered at.
                 const auto DECODE_START = SClock::now();
-                if (sources.overlay && EYE < BUNDLE.overlay.hostNs.size() && !BUNDLE.overlay.hostNs[EYE].empty()) {
-                    const auto FRAME = nearestIndex(BUNDLE.overlay.hostNs[EYE], T_HOST);
+                if (sources.overlay && !BUNDLE.overlay.frameHostNs.empty()) {
+                    const auto FRAME = nearestIndex(BUNDLE.overlay.frameHostNs, T_HOST);
                     if (FRAME) {
                         if (!sources.overlay->advanceTo(*FRAME, error)) {
                             HXC_ERR("{}", error);
@@ -339,12 +345,15 @@ namespace hxc {
                             gl->uploadOverlay(pane, sources.overlay->rgba().data(), BUNDLE.overlay.width, BUNDLE.overlay.height);
                             sources.overlayFrame = static_cast<int64_t>(*CURRENT);
                         }
-                        record.overlayFrame[EYE < 2 ? EYE : 0] = sources.overlayFrame;
-                        draw.hasOverlay                        = true;
-                        draw.overlayPose                       = eyePoses[EYE][*TELEMETRY_INDEX];
-                        draw.overlayFov                        = STAMPED.eyes[std::min(EYE, STAMPED.eyes.size() - 1)].fov;
-                        draw.overlayDepth                      = options.overlayDepth;
-                        draw.premultipliedAlpha                = BUNDLE.overlay.alpha == "premultiplied";
+
+                        const size_t SOURCE_RECORD = BUNDLE.overlay.frameTelemetryIndex[*FRAME];
+                        record.overlayFrame[EYE < 2 ? EYE : 0]          = sources.overlayFrame;
+                        record.overlayTelemetryIndex[EYE < 2 ? EYE : 0] = static_cast<int64_t>(SOURCE_RECORD);
+                        draw.hasOverlay                                 = true;
+                        draw.overlayPose                                = eyePoses[EYE][SOURCE_RECORD];
+                        draw.overlayFov                                 = BUNDLE.telemetry[SOURCE_RECORD].eyes[std::min(EYE, BUNDLE.telemetry[SOURCE_RECORD].eyes.size() - 1)].fov;
+                        draw.overlayDepth                               = options.overlayDepth;
+                        draw.premultipliedAlpha                         = BUNDLE.overlay.alpha == "premultiplied";
                     }
                 }
 

@@ -72,6 +72,27 @@ namespace hxctest {
         return bundle.clock.hostFromDevice(CAMERA.deviceNs.at(index) + CAMERA.exposureNs / 2);
     }
 
+    int64_t SFixture::outputHostNs(size_t k, double fps) const {
+        return bundle.firstHostNs() + static_cast<int64_t>(std::llround(static_cast<double>(k) * 1e9 / fps));
+    }
+
+    size_t SFixture::outputRecord(size_t k, double fps) const {
+        return nearestIndex(bundle.telemetryHostNs, outputHostNs(k, fps)).value();
+    }
+
+    size_t SFixture::overlaySourceRecord(size_t k, double fps) const {
+        // The ordinal rule from the outside: the video's frames are the undropped
+        // records in order, so the frame nearest an output instant is found among
+        // *those* records' times, and the record it names is the pose the frame was
+        // rendered from.
+        std::vector<int64_t> times;
+        times.reserve(scene.overlayFrames.size());
+        for (int record : scene.overlayFrames)
+            times.push_back(scene.frameHostNs(record));
+        const size_t ORDINAL = nearestIndex(times, outputHostNs(k, fps)).value();
+        return static_cast<size_t>(scene.overlayFrames[ORDINAL]);
+    }
+
     namespace {
 
         SFixture buildFixture(const std::string& name, double clockOffsetMs) {
@@ -80,11 +101,13 @@ namespace hxctest {
 
             fixture.options              = {};
             fixture.options.out          = fixture.take;
-            // 60 Hz telemetry against 30 Hz cameras, so the camera index is never
-            // accidentally equal to the output frame index and a source-selection bug
-            // cannot hide behind a 1:1 map.
-            fixture.options.frames       = 60;
-            fixture.options.hz           = 60.0;
+            // A 90 Hz session with the overlay at 45 and the cameras at 30: no two
+            // of the three rates line up, so no source-selection bug can hide behind
+            // an accidental 1:1 index map, and the overlay's `dropped` records are
+            // exercised on every run.
+            fixture.options.frames       = 90;
+            fixture.options.hz           = 90.0;
+            fixture.options.overlayHz    = 45.0;
             // 200 ms at 30 camera Hz is exactly six camera frames, which makes the
             // "what would a compositor that ignored the clock have picked?"
             // assertion an exact integer rather than a rounding argument.

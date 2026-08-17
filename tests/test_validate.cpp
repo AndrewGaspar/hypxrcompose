@@ -6,6 +6,7 @@
 #include "Log.hpp"
 #include "Validate.hpp"
 
+#include <cstring>
 #include <fstream>
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -303,6 +304,71 @@ TEST(Validate, AnUnknownAlphaAssociationIsRejected) {
 
     const auto DIAGS = loadAndCollect(ROOT);
     EXPECT_TRUE(hasDiagnostic(DIAGS, true, "straight")) << describe(DIAGS);
+}
+
+TEST(Validate, TheOrdinalAlignmentCountIsEnforced) {
+    // The rule: the n-th frame of each eye's video is the n-th telemetry record
+    // without "dropped". Flip one record's flag and the counts no longer agree.
+    const fs::path ROOT = scratchRoot() / "validate-ordinal";
+    std::error_code ec;
+    fs::remove_all(ROOT, ec);
+    fs::copy(fixture().take, ROOT, fs::copy_options::recursive, ec);
+    ASSERT_FALSE(ec) << ec.message();
+
+    std::vector<std::string> lines;
+    {
+        std::ifstream stream(ROOT / "telemetry.jsonl");
+        std::string   line;
+        while (std::getline(stream, line))
+            lines.push_back(line);
+    }
+    ASSERT_GT(lines.size(), 4u);
+
+    bool flipped = false;
+    for (auto& line : lines) {
+        const size_t AT = line.find("\"dropped\":false");
+        if (AT == std::string::npos)
+            continue;
+        line.replace(AT, std::strlen("\"dropped\":false"), "\"dropped\":true");
+        flipped = true;
+        break;
+    }
+    ASSERT_TRUE(flipped) << "the fixture should carry explicit dropped flags";
+    {
+        std::ofstream stream(ROOT / "telemetry.jsonl");
+        for (const auto& LINE : lines)
+            stream << LINE << "\n";
+    }
+
+    const auto DIAGS = loadAndCollect(ROOT);
+    EXPECT_TRUE(hasDiagnostic(DIAGS, true, "the n-th frame is the n-th undropped record")) << describe(DIAGS);
+}
+
+TEST(Validate, ANonBooleanDroppedFlagIsRejected) {
+    auto telemetry = goodTelemetry();
+    telemetry[1]   = std::format(R"({{"t_host_ns":1016666666,"frame":1,"eyes":[{{{},"fov":{{"l":-0.9,"r":0.9,"u":0.8,"d":-0.8}}}},{{{},"fov":{{"l":-0.9,"r":0.9,"u":0.8,"d":-0.8}}}}],"dropped":"yes","blend_mode":"alpha"}})",
+                                 poseLine(1.0), poseLine(1.0));
+    const auto DIAGS = loadAndCollect(writeTake("droppedtype", minimalManifest(), telemetry, goodClock()));
+    EXPECT_TRUE(hasDiagnostic(DIAGS, true, "`dropped` must be a boolean")) << describe(DIAGS);
+}
+
+TEST(Validate, AnObsoletePtsEpochIsCalledOut) {
+    const fs::path ROOT = scratchRoot() / "validate-ptsepoch";
+    std::error_code ec;
+    fs::remove_all(ROOT, ec);
+    fs::copy(fixture().take, ROOT, fs::copy_options::recursive, ec);
+    ASSERT_FALSE(ec) << ec.message();
+
+    std::ifstream in(ROOT / "manifest.json");
+    json          manifest;
+    in >> manifest;
+    in.close();
+    manifest["overlay"]["pts_epoch_ns"] = 14400000000000LL;
+    std::ofstream(ROOT / "manifest.json") << manifest.dump(2);
+
+    const auto DIAGS = loadAndCollect(ROOT);
+    EXPECT_FALSE(DIAGS.hasErrors()) << describe(DIAGS);
+    EXPECT_TRUE(hasDiagnostic(DIAGS, false, "obsolete")) << describe(DIAGS);
 }
 
 TEST(Validate, StrictTurnsWarningsIntoAFailure) {

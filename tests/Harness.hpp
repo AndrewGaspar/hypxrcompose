@@ -58,6 +58,14 @@ namespace hxctest {
         const SSynthCamera&   camera(int eye) const;
         // Where the generator put camera frame `index` on the host timeline.
         int64_t               cameraHostNs(int eye, size_t index) const;
+
+        // The output timeline, and what each output frame is made of - derived from
+        // the ground truth rather than read out of the tool's own report.
+        int64_t               outputHostNs(size_t k, double fps) const;
+        size_t                outputRecord(size_t k, double fps) const;
+        // The telemetry record whose pixels the overlay frame for output frame `k`
+        // carries. Differs from outputRecord() wherever a record was dropped.
+        size_t                overlaySourceRecord(size_t k, double fps) const;
     };
 
     const SFixture& fixture();

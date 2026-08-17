@@ -54,9 +54,10 @@ This is the format `validate` arbitrates and `render` consumes. Where this docum
                          {"t_host_ns", "frame",
                           "eyes":[{"pose":{"pos":[3],"quat":[4]},
                                    "fov":{"l","r","u","d"}} x eye_count],
-                          "stage_correction":{...}|null, "blend_mode"}
+                          "stage_correction":{...}|null, "blend_mode",
+                          "dropped": true|false (optional, default false)}
   clock.jsonl            {"t_host_ns", "offset_ns", "rtt_us"}   (device = host + offset)
-  overlay/eye0.mkv       RGBA lossless-class, eye 0 = left; container pts = t_host_ns
+  overlay/eye0.mkv       RGBA lossless-class, eye 0 = left
   overlay/eye1.mkv       eye 1 = right
   audio/app.flac         host application audio
   audio/app.json         {"start_t_host_ns", "sample_rate_hz", "channels", ...}
@@ -91,6 +92,44 @@ Conventions, fixed once and depended on everywhere:
 - **Camera timestamps** are the *start* of exposure; the pose that belongs to a frame is the one at
   `t_device_ns + exposure_ns/2` (research 27 §3 footnote 1).
 
+### The overlay alignment rule
+
+**The n-th frame of each eye's overlay video is the n-th `telemetry.jsonl` record that does not carry
+`"dropped": true`, and that record's `t_host_ns` is the frame's true time.** Ordinal, not temporal.
+
+The container's presentation timestamps carry a *uniform nominal timeline* at `overlay.target_hz` and
+say nothing about host time — Matroska's timestamp scale is fixed at 1 ms, so it could not carry
+`t_host_ns` even if a producer wanted it to. `hypxrcompose` reads the pts only to sanity-check that
+nominal cadence against the manifest, and never to align. Producers must run ffmpeg with
+`-fps_mode passthrough` so nothing downstream duplicates or drops a frame and breaks the
+correspondence.
+
+`"dropped": true` means "this record has no pixels in the overlay video". It covers both causes at
+once: decimation, because the overlay is captured at `target_hz` (typically 45) while the session runs
+faster, and readback-queue losses, which are irregular. Per-cause counts belong in `manifest.notes`.
+
+`validate` enforces the invariant directly: **per eye, the video's frame count must equal the number
+of telemetry records without `dropped`.**
+
+The consequence for composition is worth stating, because getting it wrong is invisible in a still
+frame: an overlay frame is reprojected from *its own* record's pose and field of view, not from the
+output instant's. Where a record was dropped, the two differ, and using the output instant's pose
+would warp the overlay from a viewpoint it was never rendered at.
+
+### Overlay pixel formats
+
+The overlay must carry alpha; a matte is the entire reason the source exists. The accepted encoders
+and the pixel format each decodes as:
+
+| `manifest.overlay.encoder` | decodes as |
+|----------------------------|------------|
+| `ffv1`                     | `bgra`     |
+| `png`                      | `rgba`     |
+| `utvideo`                  | `gbrap`    |
+
+`x264rgb` is deliberately absent: it cannot carry alpha. A pixel format with no alpha component is an
+error, not a warning.
+
 ## Interpretations
 
 Every place the contract does not pin something down and this implementation had to choose. Capture-
@@ -99,7 +138,7 @@ side producers need to converge on these, or change them here.
 | # | Question | What v1 does |
 |---|----------|--------------|
 | 1 | **Overlay alpha association.** `"format": "rgba"` does not say whether colour is premultiplied. OpenXR composition layers default to premultiplied. | Straight (unassociated) alpha by default. An optional `manifest.overlay.alpha` of `"straight"` or `"premultiplied"` overrides it; anything else is an error. **Producers should emit this key explicitly.** |
-| 2 | **`container pts = t_host_ns` is not literally achievable in Matroska.** ffmpeg's matroska muxer fixes the timecode scale at 1 ms and exposes no knob, so ns pts are quantized. | Container pts are treated as approximate and each overlay frame is matched to the nearest telemetry record; a match further than one frame interval away is an error. Absolute pts (via `-output_ts_offset`) are used when the first pts is within a minute of the first telemetry stamp; otherwise the pts are read as take-relative and anchored to the first telemetry record, with a warning. An optional `manifest.overlay.pts_epoch_ns` makes it explicit. |
+| 2 | ~~**`container pts = t_host_ns`**~~ — **settled by the producers, not an interpretation any more.** | Overlay frames align to telemetry by ordinal (see "The overlay alignment rule"). Container pts are nominal and unused. `manifest.overlay.pts_epoch_ns`, which an earlier reading of the contract used, is now warned about as obsolete. |
 | 3 | **A head pose is needed but not recorded.** Camera extrinsics are head-relative; the contract carries per-eye poses only. | The head is the midpoint of the two eye poses (position mean, rotation slerped halfway), which is where OpenXR's VIEW space sits. An optional per-record `"head"` pose is used when present. **Producers are encouraged to emit it.** |
 | 4 | **Camera calibration header shape.** "intrinsics and extrinsics per cam" does not fix the container. | Three shapes are read: a `cameras` array of entries each with a `cam` key, a `cameras` object keyed by camera, or the camera keys at the top level. `timestamp_source` is read from the header or from each entry. |
 | 5 | **Camera keys.** The filenames say `camL`/`camR`; the per-frame `cam` field's domain is unstated. | `"L"`, `"left"`, `"cam0"`, `"caml"`, `"0"`, `"eye0"` and integer `0` all normalize to left/eye 0; the `R` forms to right/eye 1. Anything else is an error. |
@@ -146,8 +185,9 @@ The generator deliberately makes the easy things hard:
   45 mm forward offset, a 12 mm drop, and a 2° outward splay;
 - asymmetric, per-eye-mirrored fields of view;
 - a principal point off centre and real Brown-Conrady distortion;
-- cameras on their own cadence and phase, so nearest-in-time selection is exercised rather than an
-  accidental 1:1 index map;
+- cameras on their own cadence and phase, and an overlay decimated from the session rate with two
+  extra irregular "readback" drops on top, so neither the ordinal alignment rule nor nearest-in-time
+  selection can hide behind an accidental 1:1 index map;
 - head motion with high-frequency jitter riding on a slow sweep, so stabilization has both something
   to remove and something to keep;
 - audio clicks at known instants, one stamped on each clock domain.
@@ -270,7 +310,7 @@ synthetic scene's geometry is closed-form. What each one proves:
 
 | Test | Proves |
 |------|--------|
-| `OverlayMarkersLandWherePredicted` | Stamped poses survive the write/parse round trip; the GLSL frustum maths agrees with the CPU model; the right overlay frame is chosen; resampling to a pane size that is not the capture size lands content correctly. |
+| `OverlayMarkersLandWherePredicted` | Stamped poses survive the write/parse round trip; the GLSL frustum maths agrees with the CPU model; the ordinal rule picks the right overlay frame and reprojects it from *its own* record's pose; resampling to a pane size that is not the capture size lands content correctly. The test asserts that at least one sampled frame is one whose overlay pixels come from a different record, so the dropped-frame path is genuinely covered. |
 | `BackgroundMarkersLandWherePredicted` | The whole camera chain closes — intrinsics, distortion, extrinsics, mid-exposure pose interpolation, assumed-depth model. The prediction never touches the distortion model, so a disagreement between the generator's inverse distortion and the shader's forward distortion shows up as a miss. |
 | `TheAcceptedParallaxErrorIsSmallAndMeasurable` | Quantifies research 27 §5.1's accepted error for this rig instead of asserting it away. |
 | `TheClockOffsetSelectsTheRightCameraFrame` | Device time is mapped into host time before frames are chosen: the selection matches the clock series, is exactly `offset × camera rate` away from what a clock-blind compositor would pick, and the frame-identity patch in the *pixels* decodes to the same answer. |
@@ -278,6 +318,7 @@ synthetic scene's geometry is closed-form. What each one proves:
 | `ChangingTheAssumedBackgroundDepthMovesTheImageByThePredictedParallax` | `--bg-depth` moves the image by exactly the predicted amount. |
 | `StabilizedFramingRendersFromTheSmoothedCamera` | The render path uses the smoothed camera, keeps the eye's offset from the head, and warps by direction only at infinite foreground depth. |
 | `AudioClicksLandOnTheOutputTimeline` | Both clock domains place correctly: a host-stamped click and a device-stamped click both land within two samples of their predicted output positions. |
+| `TheOrdinalAlignmentCountIsEnforced` | Flipping one record's `dropped` flag makes the counts disagree, and validate says so. The rule the whole overlay path rests on is not taken on trust. |
 | `AHostOnlyTakeComposesOverTheCheckerBackground` | A bundle with no device sources still composes and claims no camera frames. |
 
 Plus unit tests for the pose algebra against hand-computed cases, the pinhole model against a

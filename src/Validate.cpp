@@ -26,13 +26,14 @@ namespace hxc {
         if (!bundle.sources.overlay)
             out += "  overlay   : absent\n";
         else {
+            const size_t DROPPED = bundle.telemetry.size() - bundle.overlay.frameTelemetryIndex.size();
             out += std::format("  overlay   : {}x{} {} ({}), {} eye(s), target {:.1f} Hz, alpha {}\n", bundle.overlay.width, bundle.overlay.height, bundle.overlay.format, bundle.overlay.encoder,
                                bundle.overlay.videoPaths.size(), bundle.overlay.targetHz, bundle.overlay.alpha);
+            out += std::format("              {} record(s) carry pixels, {} marked dropped\n", bundle.overlay.frameTelemetryIndex.size(), DROPPED);
             for (size_t eye = 0; eye < bundle.overlay.videoInfo.size(); ++eye) {
                 if (bundle.overlay.videoPaths[eye].empty())
                     continue;
-                out += std::format("              eye{}: {} frames, pix_fmt {}{}\n", eye, bundle.overlay.videoInfo[eye].ptsNs.size(), bundle.overlay.videoInfo[eye].pixelFormat,
-                                   bundle.overlay.ptsWereRelative ? " (pts read as take-relative)" : "");
+                out += std::format("              eye{}: {} frames, pix_fmt {}\n", eye, bundle.overlay.videoInfo[eye].ptsNs.size(), bundle.overlay.videoInfo[eye].pixelFormat);
             }
         }
 

@@ -99,6 +99,7 @@ namespace hxc {
         scene["overlay_hz"]  = overlayHz;
         scene["overlay_width"]  = overlayWidth;
         scene["overlay_height"] = overlayHeight;
+        scene["overlay_frames"] = overlayFrames;
 
         scene["wall"] = {
             {"z", wallZ}, {"half_x", wallHalfX}, {"half_y", wallHalfY}, {"checker_cell", checkerCell}, {"markers", json::array()},
@@ -165,6 +166,7 @@ namespace hxc {
             out.overlayHz     = SCENE.at("overlay_hz").get<double>();
             out.overlayWidth  = SCENE.at("overlay_width").get<int>();
             out.overlayHeight = SCENE.at("overlay_height").get<int>();
+            out.overlayFrames = SCENE.at("overlay_frames").get<std::vector<int>>();
 
             const json& WALL = SCENE.at("wall");
             out.wallZ        = WALL.at("z").get<double>();

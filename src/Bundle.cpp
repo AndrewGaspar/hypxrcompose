@@ -414,8 +414,8 @@ namespace hxc {
             if (bundle.overlay.alpha != "straight" && bundle.overlay.alpha != "premultiplied")
                 diags.error(WHERE, "`alpha` must be \"straight\" or \"premultiplied\", found \"{}\"", bundle.overlay.alpha);
 
-            if (const json* EPOCH = member(*OVERLAY, "pts_epoch_ns"); EPOCH && EPOCH->is_number_integer())
-                bundle.overlay.ptsEpochNs = EPOCH->get<int64_t>();
+            if (member(*OVERLAY, "pts_epoch_ns"))
+                diags.warn(WHERE, "`pts_epoch_ns` is obsolete: overlay frames align to telemetry by ordinal (the n-th frame is the n-th record without `dropped`), not by container pts");
         }
 
         // ---- telemetry.jsonl ----------------------------------------------------
@@ -507,6 +507,14 @@ namespace hxc {
                         diags.warn(WHERE, "`stage_correction` is an object without pos/quat; v1 records it but cannot interpret it");
                 }
 
+                if (const json* DROPPED = member(record, "dropped")) {
+                    if (!DROPPED->is_boolean()) {
+                        if (parseCap.allow())
+                            diags.error(WHERE, "`dropped` must be a boolean, found {}", typeName(*DROPPED));
+                    } else
+                        frame.dropped = DROPPED->get<bool>();
+                }
+
                 wantString(record, "blend_mode", WHERE, diags, frame.blendMode);
                 if (!frame.blendMode.empty() && frame.blendMode != "alpha" && frame.blendMode != "alpha_blend" && frame.blendMode != "additive" && frame.blendMode != "opaque") {
                     if (blendCap.allow())
@@ -590,7 +598,22 @@ namespace hxc {
         }
 
         // ---- overlay videos -----------------------------------------------------
+        //
+        // The alignment rule is ordinal, not temporal: the n-th decoded frame of an
+        // eye's video is the n-th telemetry record that is not `dropped`. Container
+        // pts carry a uniform nominal timeline at target_hz and cannot carry
+        // t_host_ns at all - Matroska's timestamp scale is fixed at 1 ms - so they
+        // are read only to sanity-check that nominal cadence, never to align.
         if (bundle.sources.overlay) {
+            for (size_t i = 0; i < bundle.telemetry.size(); ++i) {
+                if (bundle.telemetry[i].dropped)
+                    continue;
+                bundle.overlay.frameTelemetryIndex.push_back(i);
+                bundle.overlay.frameHostNs.push_back(bundle.telemetry[i].tHostNs);
+            }
+            if (bundle.overlay.frameTelemetryIndex.empty() && !bundle.telemetry.empty())
+                diags.error("telemetry.jsonl", "every record is marked `dropped`, so no overlay frame has a stamped pose");
+
             const fs::path OVERLAY_DIR = root / "overlay";
             const int      EYES        = std::max(1, bundle.overlay.eyeCount);
             for (int eye = 0; eye < EYES; ++eye) {
@@ -611,7 +634,6 @@ namespace hxc {
                     diags.error(std::format("overlay/eye{}.mkv", eye), "missing, but manifest.sources.overlay is true");
                     bundle.overlay.videoPaths.emplace_back();
                     bundle.overlay.videoInfo.emplace_back();
-                    bundle.overlay.hostNs.emplace_back();
                     continue;
                 }
                 if (chosen.filename().string() != std::format("eye{}.mkv", eye))
@@ -619,80 +641,63 @@ namespace hxc {
 
                 bundle.overlay.videoPaths.push_back(chosen.string());
                 bundle.overlay.videoInfo.emplace_back();
-                bundle.overlay.hostNs.emplace_back();
 
                 if (!options.probeMedia)
                     continue;
 
-                std::string probeError;
+                const std::string NAME = chosen.filename().string();
+                std::string       probeError;
                 if (!probeVideo(chosen.string(), bundle.overlay.videoInfo.back(), probeError)) {
-                    diags.error(chosen.filename().string(), "{}", probeError);
+                    diags.error(NAME, "{}", probeError);
                     continue;
                 }
                 const auto& INFO = bundle.overlay.videoInfo.back();
                 if (bundle.overlay.width > 0 && (INFO.width != bundle.overlay.width || INFO.height != bundle.overlay.height))
-                    diags.error(chosen.filename().string(), "is {}x{} but manifest.overlay says {}x{}", INFO.width, INFO.height, bundle.overlay.width, bundle.overlay.height);
-                if (INFO.pixelFormat.find('a') == std::string::npos)
-                    diags.warn(chosen.filename().string(), "pixel format `{}` carries no alpha channel; the overlay matte is the whole point of this source", INFO.pixelFormat);
+                    diags.error(NAME, "is {}x{} but manifest.overlay says {}x{}", INFO.width, INFO.height, bundle.overlay.width, bundle.overlay.height);
                 if (INFO.ptsNs.empty())
-                    diags.error(chosen.filename().string(), "ffprobe reported no frames");
-            }
+                    diags.error(NAME, "ffprobe reported no frames");
 
-            // Resolve the pts epoch once, from eye 0, and apply it to every eye so
-            // the two eyes cannot drift apart through different guesses.
-            if (!bundle.telemetryHostNs.empty() && !bundle.overlay.videoInfo.empty() && !bundle.overlay.videoInfo[0].ptsNs.empty()) {
-                const int64_t FIRST_PTS  = bundle.overlay.videoInfo[0].ptsNs.front();
-                const int64_t FIRST_HOST = bundle.firstHostNs();
-                if (options.overlayEpochNsOverride)
-                    bundle.overlay.ptsEpochNs = *options.overlayEpochNsOverride;
-                else if (bundle.overlay.ptsEpochNs == 0) {
-                    // INTERPRETATION: "container pts = t_host_ns" is only literally
-                    // achievable if the producer offsets the muxer's timestamps.
-                    // When the first pts is nowhere near the first telemetry stamp,
-                    // the pts are read as take-relative and anchored to it.
-                    const int64_t MINUTE = 60LL * 1000000000LL;
-                    if (std::abs(FIRST_PTS - FIRST_HOST) > MINUTE) {
-                        bundle.overlay.ptsEpochNs     = FIRST_HOST - FIRST_PTS;
-                        bundle.overlay.ptsWereRelative = true;
-                        diags.warn("overlay/eye0.mkv", "first pts is {} ns but telemetry starts at {} ns; reading the pts as take-relative and anchoring the first overlay frame to the "
-                                                       "first telemetry record. Set manifest.overlay.pts_epoch_ns to make this explicit.",
-                                   FIRST_PTS, FIRST_HOST);
-                    }
+                // The decoded pixel format is a property of the encoder the producer
+                // chose, and every accepted one must carry alpha - a matte is the
+                // entire reason this source exists. (x264rgb is absent on purpose:
+                // it cannot carry alpha at all.)
+                static const std::map<std::string, std::string> ALPHA_FORMAT_FOR_ENCODER{
+                    {"ffv1", "bgra"},
+                    {"png", "rgba"},
+                    {"utvideo", "gbrap"},
+                };
+                const auto EXPECTED = ALPHA_FORMAT_FOR_ENCODER.find(bundle.overlay.encoder);
+                if (EXPECTED == ALPHA_FORMAT_FOR_ENCODER.end())
+                    diags.warn(NAME, "manifest.overlay.encoder is \"{}\"; the known alpha-carrying encoders are ffv1 (bgra), png (rgba), and utvideo (gbrap)", bundle.overlay.encoder);
+                else if (!INFO.pixelFormat.empty() && INFO.pixelFormat != EXPECTED->second)
+                    diags.warn(NAME, "decodes as `{}` but the {} encoder is expected to yield `{}`", INFO.pixelFormat, bundle.overlay.encoder, EXPECTED->second);
+                if (INFO.pixelFormat.find('a') == std::string::npos)
+                    diags.error(NAME, "pixel format `{}` carries no alpha channel; the overlay matte is the whole point of this source", INFO.pixelFormat);
+
+                // THE alignment check. Everything downstream trusts this count.
+                if (!bundle.telemetry.empty() && INFO.ptsNs.size() != bundle.overlay.frameTelemetryIndex.size())
+                    diags.error(NAME, "holds {} frames but telemetry holds {} record(s) without `dropped`; the n-th frame is the n-th undropped record, so the two counts must be equal",
+                                INFO.ptsNs.size(), bundle.overlay.frameTelemetryIndex.size());
+
+                // The nominal cadence is a soft check: a wrong target_hz does not
+                // break alignment, but it does mean the manifest is lying.
+                if (INFO.ptsNs.size() > 2 && bundle.overlay.targetHz > 0.0) {
+                    const int64_t SPAN     = INFO.ptsNs.back() - INFO.ptsNs.front();
+                    const double  NOMINAL  = static_cast<double>(INFO.ptsNs.size() - 1) * 1e9 / bundle.overlay.targetHz;
+                    if (NOMINAL > 0.0 && std::abs(static_cast<double>(SPAN) - NOMINAL) > 0.02 * NOMINAL)
+                        diags.warn(NAME, "container pts span {:.3f} s, but {} frames at the manifest's {:.1f} Hz would span {:.3f} s; pts are nominal and unused for alignment, so this is "
+                                         "cosmetic - but one of the two is wrong",
+                                   static_cast<double>(SPAN) * 1e-9, INFO.ptsNs.size(), bundle.overlay.targetHz, NOMINAL * 1e-9);
                 }
             }
 
-            for (size_t eye = 0; eye < bundle.overlay.videoInfo.size(); ++eye) {
-                auto& HOSTS = bundle.overlay.hostNs[eye];
-                for (int64_t pts : bundle.overlay.videoInfo[eye].ptsNs)
-                    HOSTS.push_back(pts + bundle.overlay.ptsEpochNs);
-            }
-
-            if (!bundle.telemetry.empty() && !bundle.overlay.hostNs.empty() && !bundle.overlay.hostNs[0].empty()) {
-                const size_t OVERLAY_FRAMES = bundle.overlay.hostNs[0].size();
-                if (OVERLAY_FRAMES > bundle.telemetry.size())
-                    diags.error("overlay/eye0.mkv", "holds {} frames but telemetry holds only {} records; every overlay frame needs a stamped pose", OVERLAY_FRAMES, bundle.telemetry.size());
-                else if (OVERLAY_FRAMES * 2 < bundle.telemetry.size())
-                    diags.warn("overlay/eye0.mkv", "holds {} frames against {} telemetry records; the overlay was captured at a lower rate than the session ran, which v1 handles by "
-                                                   "nearest-in-time matching",
-                               OVERLAY_FRAMES, bundle.telemetry.size());
-
-                // Referential check: every overlay frame must land near a stamped pose.
-                SCap   cap;
-                size_t worst = 0;
-                for (size_t i = 0; i < OVERLAY_FRAMES; ++i) {
-                    const auto NEAREST = nearestIndex(bundle.telemetryHostNs, bundle.overlay.hostNs[0][i]);
-                    if (!NEAREST)
-                        break;
-                    const int64_t DELTA = std::abs(bundle.telemetryHostNs[*NEAREST] - bundle.overlay.hostNs[0][i]);
-                    worst               = std::max(worst, static_cast<size_t>(DELTA));
-                    // Matroska quantizes pts to 1 ms; anything past a full frame
-                    // interval is a real mismatch, not container rounding.
-                    const int64_t TOLERANCE = std::max<int64_t>(2000000, bundle.medianTelemetryIntervalNs());
-                    if (DELTA > TOLERANCE && cap.allow())
-                        diags.error(std::format("overlay/eye0.mkv frame {}", i), "sits {} ns from the nearest telemetry record; no stamped pose describes it", DELTA);
-                }
-                cap.flush(diags, "overlay/eye0.mkv", "no nearby telemetry record");
-                HXC_DEBUG("overlay pts to telemetry: worst gap {} ns", worst);
+            // A dropped-frame budget worth surfacing: losing most of the session is
+            // legal but almost certainly not intended.
+            if (!bundle.telemetry.empty()) {
+                const size_t KEPT = bundle.overlay.frameTelemetryIndex.size();
+                if (KEPT * 4 < bundle.telemetry.size())
+                    diags.warn("telemetry.jsonl", "{} of {} records are marked `dropped`; the overlay covers under a quarter of the session", bundle.telemetry.size() - KEPT,
+                               bundle.telemetry.size());
             }
         }
 

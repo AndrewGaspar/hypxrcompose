@@ -144,19 +144,35 @@ namespace {
 TEST(EndToEnd, OverlayMarkersLandWherePredicted) {
     const auto& FIX      = fixture();
     const auto  RENDERED = renderCase("overlay-asis", [](SRenderOptions& o) { o.eye = eEyeSelection::LEFT; });
+    const double FPS     = RENDERED.report.fps;
 
-    double worst = 0.0;
-    for (size_t k : {size_t{5}, size_t{20}, size_t{40}}) {
+    double worst          = 0.0;
+    size_t reprojections  = 0;
+    // 15 and 30 are the output frames whose own telemetry record was lost to
+    // the synthetic readback queue, so their overlay pixels must come from a
+    // neighbouring record and be reprojected across the gap.
+    for (size_t k : {size_t{5}, size_t{15}, size_t{30}, size_t{40}}) {
         const SImage IMAGE = RENDERED.frame(k);
         ASSERT_EQ(IMAGE.width, PANE_WIDTH);
         ASSERT_EQ(IMAGE.height, PANE_HEIGHT);
 
-        const SPose EYE = FIX.eyePose(static_cast<int>(k), 0);
-        const SFov& FOV = FIX.scene.eyeFov[0];
+        // The output camera is the eye at the output instant's record; the overlay
+        // pixels came from whichever undropped record the ordinal rule names, which
+        // is not always the same one.
+        const size_t OUTPUT_RECORD  = FIX.outputRecord(k, FPS);
+        const size_t SOURCE_RECORD  = FIX.overlaySourceRecord(k, FPS);
+        if (SOURCE_RECORD != OUTPUT_RECORD)
+            ++reprojections;
+
+        EXPECT_EQ(RENDERED.report.frames[k].overlayTelemetryIndex[0], static_cast<int64_t>(SOURCE_RECORD)) << "output frame " << k;
+
+        const SPose OUTPUT_EYE = FIX.eyePose(static_cast<int>(OUTPUT_RECORD), 0);
+        const SPose SOURCE_EYE = FIX.eyePose(static_cast<int>(SOURCE_RECORD), 0);
+        const SFov& FOV        = FIX.scene.eyeFov[0];
 
         for (const auto& MARKER : FIX.scene.overlayMarkers) {
             const SVec3 WORLD     = MARKER.world(FIX.scene.overlayQuad);
-            const auto  PREDICTED = predictOverlayPixel(EYE, FOV, PANE_WIDTH, PANE_HEIGHT, EYE, WORLD);
+            const auto  PREDICTED = predictOverlayPixel(OUTPUT_EYE, FOV, PANE_WIDTH, PANE_HEIGHT, SOURCE_EYE, WORLD);
             ASSERT_TRUE(PREDICTED.has_value()) << MARKER.name;
 
             const auto MEASURED = findColor(IMAGE, MARKER.color, 30, 0, PANE_WIDTH);
@@ -170,7 +186,8 @@ TEST(EndToEnd, OverlayMarkersLandWherePredicted) {
             EXPECT_NEAR(MEASURED->y, (*PREDICTED)[1], 1.5) << MARKER.name << " y, frame " << k;
         }
     }
-    std::cout << "[measured] worst overlay marker error: " << worst << " px\n";
+    std::cout << "[measured] worst overlay marker error: " << worst << " px (" << reprojections << " of the sampled frames reproject a dropped-neighbour overlay frame)\n";
+    EXPECT_GT(reprojections, 0u) << "the fixture must exercise a frame whose overlay pixels come from a different record";
 }
 
 // ---------------------------------------------------------------------------
@@ -192,9 +209,9 @@ TEST(EndToEnd, BackgroundMarkersLandWherePredicted) {
     const double FPS   = RENDERED.report.fps;
     double       worst = 0.0;
 
-    for (size_t k : {size_t{10}, size_t{30}, size_t{50}}) {
+    for (size_t k : {size_t{10}, size_t{25}, size_t{40}}) {
         const SImage IMAGE = RENDERED.frame(k);
-        const SPose  EYE   = FIX.eyePose(static_cast<int>(k), 0);
+        const SPose  EYE   = FIX.eyePose(static_cast<int>(FIX.outputRecord(k, FPS)), 0);
         const SFov&  FOV   = FIX.scene.eyeFov[0];
 
         const size_t CAMERA_FRAME = predictCameraFrame(FIX, 0, k, FPS);
@@ -228,11 +245,12 @@ TEST(EndToEnd, BackgroundMarkersLandWherePredicted) {
 // the assumed-depth model puts a feature and where the feature really is.
 // ---------------------------------------------------------------------------
 TEST(EndToEnd, TheAcceptedParallaxErrorIsSmallAndMeasurable) {
-    const auto& FIX = fixture();
-    const SPose EYE = FIX.eyePose(20, 0);
-    const SFov& FOV = FIX.scene.eyeFov[0];
+    const auto&  FIX = fixture();
+    const double FPS = FIX.scene.overlayHz;
+    const SPose  EYE = FIX.eyePose(static_cast<int>(FIX.outputRecord(20, FPS)), 0);
+    const SFov&  FOV = FIX.scene.eyeFov[0];
 
-    const size_t CAMERA_FRAME = predictCameraFrame(FIX, 0, 20, 60.0);
+    const size_t CAMERA_FRAME = predictCameraFrame(FIX, 0, 20, FPS);
     const SPose  CAMERA_POSE  = FIX.scene.headAt(FIX.cameraHostNs(0, CAMERA_FRAME)).compose(FIX.camera(0).headToCamera);
 
     double worst = 0.0;
@@ -273,7 +291,7 @@ TEST(EndToEnd, TheClockOffsetSelectsTheRightCameraFrame) {
     const int    EXPECTED_SHIFT = static_cast<int>(std::llround(FIX.options.clockOffsetMs * 1e-3 * CAMERA_HZ));
     ASSERT_EQ(EXPECTED_SHIFT, 6) << "the fixture is built so this is a whole number of camera frames";
 
-    for (size_t k : {size_t{30}, size_t{45}, size_t{55}}) {
+    for (size_t k : {size_t{20}, size_t{30}, size_t{42}}) {
         const size_t CHOSEN = predictCameraFrame(FIX, 0, k, FPS);
         const size_t BLIND  = predictClockBlindCameraFrame(FIX, 0, k, FPS);
 
@@ -284,7 +302,7 @@ TEST(EndToEnd, TheClockOffsetSelectsTheRightCameraFrame) {
         // And the pixels agree: the frame-identity patch encodes which camera frame
         // was sampled, so this reads the answer out of the composite itself.
         const SImage IMAGE       = RENDERED.frame(k);
-        const SPose  EYE         = FIX.eyePose(static_cast<int>(k), 0);
+        const SPose  EYE         = FIX.eyePose(static_cast<int>(FIX.outputRecord(k, FPS)), 0);
         const SPose  CAMERA_POSE = FIX.scene.headAt(FIX.cameraHostNs(0, CHOSEN)).compose(FIX.camera(0).headToCamera);
         const auto   PATCH       = predictBackgroundPixel(EYE, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, CAMERA_POSE, FIX.scene.codeCentre, 2.0);
         ASSERT_TRUE(PATCH.has_value());
@@ -313,13 +331,19 @@ TEST(EndToEnd, StereoPanesDifferByTheSyntheticIpdParallax) {
     const SImage IMAGE = RENDERED.frame(K);
     ASSERT_EQ(IMAGE.width, PANE_WIDTH * 2);
 
-    const SVec3 MARKER = overlayMarkerWorld(FIX.scene, "centre");
-    const SPose HEAD   = FIX.headPose(static_cast<int>(K));
-    const SPose EYE_L  = FIX.eyePose(static_cast<int>(K), 0);
-    const SPose EYE_R  = FIX.eyePose(static_cast<int>(K), 1);
+    const double FPS            = RENDERED.report.fps;
+    const size_t OUTPUT_RECORD  = FIX.outputRecord(K, FPS);
+    const size_t SOURCE_RECORD  = FIX.overlaySourceRecord(K, FPS);
 
-    const auto PREDICTED_L = predictOverlayPixel(EYE_L, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, EYE_L, MARKER);
-    const auto PREDICTED_R = predictOverlayPixel(EYE_R, FIX.scene.eyeFov[1], PANE_WIDTH, PANE_HEIGHT, EYE_R, MARKER);
+    const SVec3 MARKER   = overlayMarkerWorld(FIX.scene, "centre");
+    const SPose HEAD     = FIX.headPose(static_cast<int>(OUTPUT_RECORD));
+    const SPose EYE_L    = FIX.eyePose(static_cast<int>(OUTPUT_RECORD), 0);
+    const SPose EYE_R    = FIX.eyePose(static_cast<int>(OUTPUT_RECORD), 1);
+    const SPose SOURCE_L = FIX.eyePose(static_cast<int>(SOURCE_RECORD), 0);
+    const SPose SOURCE_R = FIX.eyePose(static_cast<int>(SOURCE_RECORD), 1);
+
+    const auto PREDICTED_L = predictOverlayPixel(EYE_L, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, SOURCE_L, MARKER);
+    const auto PREDICTED_R = predictOverlayPixel(EYE_R, FIX.scene.eyeFov[1], PANE_WIDTH, PANE_HEIGHT, SOURCE_R, MARKER);
     ASSERT_TRUE(PREDICTED_L.has_value());
     ASSERT_TRUE(PREDICTED_R.has_value());
 
@@ -335,8 +359,9 @@ TEST(EndToEnd, StereoPanesDifferByTheSyntheticIpdParallax) {
 
     // Now isolate the parallax from the frustum asymmetry: predict again with both
     // eyes collapsed onto the head, and take the difference of differences.
-    const auto NO_IPD_L = predictOverlayPixel(HEAD, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, HEAD, MARKER);
-    const auto NO_IPD_R = predictOverlayPixel(HEAD, FIX.scene.eyeFov[1], PANE_WIDTH, PANE_HEIGHT, HEAD, MARKER);
+    const SPose SOURCE_HEAD = FIX.headPose(static_cast<int>(SOURCE_RECORD));
+    const auto  NO_IPD_L    = predictOverlayPixel(HEAD, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, SOURCE_HEAD, MARKER);
+    const auto  NO_IPD_R    = predictOverlayPixel(HEAD, FIX.scene.eyeFov[1], PANE_WIDTH, PANE_HEIGHT, SOURCE_HEAD, MARKER);
     ASSERT_TRUE(NO_IPD_L.has_value());
     ASSERT_TRUE(NO_IPD_R.has_value());
 
@@ -372,7 +397,7 @@ TEST(EndToEnd, ChangingTheAssumedBackgroundDepthMovesTheImageByThePredictedParal
     });
 
     const size_t K            = 20;
-    const SPose  EYE          = FIX.eyePose(static_cast<int>(K), 0);
+    const SPose  EYE          = FIX.eyePose(static_cast<int>(FIX.outputRecord(K, AT_TWO.report.fps)), 0);
     const size_t CAMERA_FRAME = predictCameraFrame(FIX, 0, K, AT_TWO.report.fps);
     const SPose  CAMERA_POSE  = FIX.scene.headAt(FIX.cameraHostNs(0, CAMERA_FRAME)).compose(FIX.camera(0).headToCamera);
     const auto&  MARKER       = wallMarker(FIX.scene, "green");
@@ -419,16 +444,21 @@ TEST(EndToEnd, StabilizedFramingRendersFromTheSmoothedCamera) {
         track.push_back({RECORD.tHostNs, RECORD.headPose()});
     const auto SMOOTHED = gaussianSmoothPoses(track, SIGMA);
 
-    const size_t K      = 30;
-    const SPose  HEAD   = FIX.bundle.telemetry[K].headPose();
-    const SPose  EYE    = FIX.bundle.telemetry[K].eyes[0].pose;
-    const SPose  OUTPUT = SMOOTHED[K].compose(HEAD.inverse().compose(EYE));
+    const size_t K              = 30;
+    const double FPS            = RENDERED.report.fps;
+    const size_t OUTPUT_RECORD  = FIX.outputRecord(K, FPS);
+    const size_t SOURCE_RECORD  = FIX.overlaySourceRecord(K, FPS);
+
+    const SPose  HEAD   = FIX.bundle.telemetry[OUTPUT_RECORD].headPose();
+    const SPose  EYE    = FIX.bundle.telemetry[OUTPUT_RECORD].eyes[0].pose;
+    const SPose  SOURCE = FIX.bundle.telemetry[SOURCE_RECORD].eyes[0].pose;
+    const SPose  OUTPUT = SMOOTHED[OUTPUT_RECORD].compose(HEAD.inverse().compose(EYE));
     const SVec3  MARKER = overlayMarkerWorld(FIX.scene, "centre");
 
     // Infinite foreground depth means the warp preserves directions from the
     // recording eye, so the prediction uses the recorded eye for the direction and
     // the smoothed camera for the frustum.
-    const auto PREDICTED = predictOverlayPixel(OUTPUT, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, EYE, MARKER);
+    const auto PREDICTED = predictOverlayPixel(OUTPUT, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, SOURCE, MARKER);
     ASSERT_TRUE(PREDICTED.has_value());
 
     const auto MEASURED = findColor(RENDERED.frame(K), {255, 0, 255}, 30, 0, PANE_WIDTH);
@@ -437,7 +467,7 @@ TEST(EndToEnd, StabilizedFramingRendersFromTheSmoothedCamera) {
     EXPECT_NEAR(MEASURED->y, (*PREDICTED)[1], 1.5);
 
     // And the framing really did change: the as-is position must be somewhere else.
-    const auto ASIS = predictOverlayPixel(EYE, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, EYE, MARKER);
+    const auto ASIS = predictOverlayPixel(EYE, FIX.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, SOURCE, MARKER);
     ASSERT_TRUE(ASIS.has_value());
     const double MOVED = std::hypot((*PREDICTED)[0] - (*ASIS)[0], (*PREDICTED)[1] - (*ASIS)[1]);
     std::cout << "[measured] stabilization moved the marker " << MOVED << " px at frame " << K << "\n";
@@ -509,9 +539,10 @@ TEST(EndToEnd, AHostOnlyTakeComposesOverTheCheckerBackground) {
     if (!fs::exists(TAKE / "manifest.json")) {
         SSynthOptions options;
         options.out     = TAKE;
-        options.frames  = 12;
-        options.hz      = 60.0;
-        options.cameras = false;
+        options.frames    = 12;
+        options.hz        = 60.0;
+        options.overlayHz = 60.0;
+        options.cameras   = false;
         options.audio   = false;
         options.quiet   = true;
         setLogLevel(eLogLevel::WARN);
@@ -573,6 +604,6 @@ TEST(EndToEnd, ThroughputIsMeasuredAndReported) {
               << REPORT.wallSeconds << " s)\n";
 
     EXPECT_GT(REPORT.framesPerSecond, 0.0);
-    EXPECT_EQ(REPORT.frames.size(), 60u);
+    EXPECT_EQ(REPORT.frames.size(), 45u);
     EXPECT_TRUE(fs::exists(RENDERED.video));
 }

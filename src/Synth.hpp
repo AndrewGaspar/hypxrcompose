@@ -49,8 +49,10 @@ namespace hxc {
         std::filesystem::path out;
 
         int     frames        = 60;
-        double  hz            = 60.0;
-        double  overlayHz     = 0.0; // 0 means "same as hz"
+        // A session at 90 Hz with the overlay captured at 45: the producers' default
+        // target_hz, and the case that makes the `dropped` alignment rule matter.
+        double  hz            = 90.0;
+        double  overlayHz     = 45.0; // 0 means "same as hz"
         int     overlayWidth  = 640;
         int     overlayHeight = 480;
 

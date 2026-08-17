@@ -86,6 +86,10 @@ namespace hxc {
         std::vector<STelemetryEye> eyes;
         std::optional<SPose>       stageCorrection;
         std::string                blendMode;
+        // "this frame has no pixels in the overlay video" - either decimated down to
+        // overlay.target_hz or lost to the readback queue. The records *without* it
+        // are what the video's frames correspond to, in order.
+        bool                       dropped = false;
         // INTERPRETATION: the contract carries per-eye poses only, but a camera
         // extrinsic is head-relative, so a head pose is needed. An optional `head`
         // pose is read when the producer supplies one; otherwise head() returns the
@@ -106,13 +110,18 @@ namespace hxc {
         // says otherwise; see README.
         std::string alpha    = "straight";
 
-        std::vector<std::string>          videoPaths;
-        std::vector<SVideoInfo>           videoInfo;
-        // Per eye, per decoded frame: the host timestamp the frame belongs to,
-        // after the container pts have been resolved against the telemetry epoch.
-        std::vector<std::vector<int64_t>> hostNs;
-        int64_t                           ptsEpochNs   = 0;
-        bool                              ptsWereRelative = false;
+        std::vector<std::string> videoPaths;
+        std::vector<SVideoInfo>  videoInfo;
+
+        // The alignment rule, and the only one: the n-th frame of each eye's video
+        // is the n-th telemetry record that is not `dropped`, and that record's
+        // t_host_ns is the frame's true time. Container pts carry a uniform nominal
+        // timeline at target_hz and are never used to align - Matroska's 1 ms
+        // timestamp scale could not carry t_host_ns even if a producer wanted it to.
+        //
+        // Both eyes share these, because both eyes share the telemetry.
+        std::vector<size_t>      frameTelemetryIndex;
+        std::vector<int64_t>     frameHostNs;
     };
 
     struct SCameraFrame {
@@ -150,8 +159,7 @@ namespace hxc {
     struct SLoadOptions {
         // Probing runs ffprobe over every media file; render needs it, a purely
         // structural check can skip it.
-        bool                   probeMedia        = true;
-        std::optional<int64_t> overlayEpochNsOverride;
+        bool probeMedia = true;
     };
 
     struct SBundle {

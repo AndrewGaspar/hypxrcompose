@@ -115,7 +115,8 @@ gap 2 (both are "the pose/depth for a sample is not constant across the frame").
 | **`stage_correction` is recorded but never applied.** | v1 reads the stamped eye poses as already corrected (research 27 §3 footnote 2 speaks of "the *applied value* per frame"). If the producers' semantics turn out to be "the correction still to apply", `Render.cpp` needs one composition and `validate` needs to say so. Until the producers settle this, it is the interpretation most likely to be wrong. |
 | **Output camera is one of two presets.** | The framing menu research 27 §5 describes — fixed tripod, orbit, arbitrary keyframed path — is a `SPose` per output frame, which the render loop already consumes. It needs a path format and a CLI, not new geometry. |
 | **MV-HEVC / spatial video output.** | `--eye stereo-sbs` covers the immediately shareable case. MV-HEVC is a mux-time concern (§5.1) and lands in `Ffmpeg.cpp`'s writer spec, not in the kernel. |
-| **Nearest-neighbour source resampling.** | Output frames pick the nearest source frame in time. At 30 Hz cameras against 60 Hz output that visibly stutters. Motion-compensated interpolation is the fix; simple frame blending is not (it doubles edges). Until then, matching `--fps` to the camera rate is the honest option for camera-dominant cuts. |
+| **Nearest-neighbour source resampling.** | Output frames pick the nearest source frame in time. At 30 Hz cameras against 45 Hz output that visibly stutters, and the same applies to overlay frames lost to the readback queue. Motion-compensated interpolation is the fix; simple frame blending is not (it doubles edges). Until then, matching `--fps` to the camera rate is the honest option for camera-dominant cuts. |
+| **A dropped overlay frame is held, not synthesized.** | When a record carries `"dropped": true` the composite reuses the nearest surviving overlay frame, reprojected from *its* pose. That is correct rather than merely convenient - the pixels really were rendered from that viewpoint - but a long readback stall shows as a static overlay over a moving background. Grade-B replay (gap 1) removes the problem entirely, since it re-renders rather than resamples. |
 | **The overlay's straight-alpha edges.** | Bilinear sampling of straight-alpha RGBA bleeds background colour at matte edges. Premultiplying on upload would fix it; the manifest key that says which association the file uses (Interpretation 1) has to be settled first. |
 | **Per-frame fov is taken from the nearest telemetry record, not interpolated.** | Correct for `asis` at capture rate. If output rates diverge from capture rates, the frustum should interpolate the way the pose does. |
 | **No colour management.** | Everything is treated as 8-bit sRGB-ish and blended in that space. Alpha blending in a non-linear space is wrong at partial alpha, visibly so on the halo edges of a bright overlay. Blending in linear light needs the transfer function the overlay tap actually wrote. |
@@ -130,10 +131,10 @@ These are the ones the compositor cannot answer alone; they are also listed in R
 Interpretations table.
 
 1. **Overlay alpha association** — straight or premultiplied? Please emit `manifest.overlay.alpha`.
-2. **Overlay pts epoch** — Matroska cannot store nanosecond pts. Either offset the muxer's timestamps
-   so the pts are absolute host nanoseconds to the millisecond, or set
-   `manifest.overlay.pts_epoch_ns` and start the pts at zero. v1 guesses when neither is present, and
-   says so.
+2. ~~**Overlay pts epoch**~~ — **settled.** Overlay frames align to telemetry by ordinal: the n-th
+   frame is the n-th record without `"dropped": true`. Container pts are a nominal timeline at
+   `target_hz` and are never used to align. `manifest.overlay.pts_epoch_ns` is obsolete and warned
+   about.
 3. **A head pose per telemetry record** — v1 derives it as the eye midpoint. Emitting `"head"`
    removes an assumption from the camera extrinsic chain.
 4. **Camera calibration header shape and `cam` key domain** — v1 accepts several spellings; pick one.

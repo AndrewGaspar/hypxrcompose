@@ -87,6 +87,10 @@ namespace hxc {
             int64_t                tHostNs        = 0;
             size_t                 telemetryIndex = 0;
             std::array<int64_t, 2> overlayFrame{-1, -1};
+            // Which telemetry record that overlay frame was rendered from - the
+            // ordinal rule's answer, which differs from `telemetryIndex` whenever
+            // frames were dropped.
+            std::array<int64_t, 2> overlayTelemetryIndex{-1, -1};
             std::array<int64_t, 2> cameraFrame{-1, -1};
             std::array<int64_t, 2> cameraHostNs{0, 0};
         };

@@ -68,6 +68,13 @@ namespace hxc {
         int     overlayWidth  = 0;
         int     overlayHeight = 0;
 
+        // Telemetry record indices that have pixels in the overlay video, in order.
+        // The n-th entry is the n-th video frame; every record not listed carries
+        // "dropped": true. Decimation to overlayHz and simulated readback-queue
+        // losses both land here, which is exactly how the real producer expresses
+        // them.
+        std::vector<int> overlayFrames;
+
         // The wall is a plane at z = wallZ spanning [-wallHalfX, wallHalfX] x
         // [-wallHalfY, wallHalfY]. Its planarity is what makes a reprojection at
         // backgroundDepth = -wallZ exact.
