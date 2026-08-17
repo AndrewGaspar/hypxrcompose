@@ -5,9 +5,11 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <sstream>
+#include <string_view>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -27,8 +29,32 @@ namespace hxc {
     }
 
     void CDiagnostics::print() const {
-        for (const auto& D : m_diags)
-            logf(D.error ? eLogLevel::ERR : eLogLevel::WARN, "{}: {}", D.where, D.message);
+        // One schema disagreement in telemetry.jsonl is one diagnostic per record,
+        // and a real take holds thousands of records. Printing all of them buries
+        // the *other* diagnostics under half a megabyte of the same sentence, so
+        // repeats of a message are collapsed after a few. The counts reported by
+        // errorCount()/warningCount() are untouched: this is a printing decision,
+        // not a filtering one, and --json still emits every diagnostic.
+        constexpr size_t                SHOWN_PER_MESSAGE = 3;
+        std::map<std::string_view, size_t> seen;
+
+        for (const auto& D : m_diags) {
+            const size_t COUNT = ++seen[D.message];
+            if (COUNT <= SHOWN_PER_MESSAGE)
+                logf(D.error ? eLogLevel::ERR : eLogLevel::WARN, "{}: {}", D.where, D.message);
+        }
+        for (const auto& [MESSAGE, COUNT] : seen) {
+            if (COUNT > SHOWN_PER_MESSAGE)
+                logf(eLogLevel::WARN, "(and {} more like it): {}", COUNT - SHOWN_PER_MESSAGE, MESSAGE);
+        }
+    }
+
+    std::string toString(eEyeVisibility visibility) {
+        switch (visibility) {
+            case eEyeVisibility::LEFT: return "left";
+            case eEyeVisibility::RIGHT: return "right";
+            default: return "both";
+        }
     }
 
     SPose STelemetryFrame::headPose() const {
@@ -274,6 +300,23 @@ namespace hxc {
             return fov;
         }
 
+        // "left", "XR_EYE_VISIBILITY_LEFT", "Left" - all the same enumerant. An
+        // unknown spelling returns nullopt rather than silently meaning "both",
+        // because a layer shown to the wrong eye is worse than a loud failure.
+        std::optional<eEyeVisibility> parseEyeVisibility(std::string text) {
+            std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            constexpr std::string_view PREFIX = "xr_eye_visibility_";
+            if (text.starts_with(PREFIX))
+                text = text.substr(PREFIX.size());
+            if (text == "both")
+                return eEyeVisibility::BOTH;
+            if (text == "left")
+                return eEyeVisibility::LEFT;
+            if (text == "right")
+                return eEyeVisibility::RIGHT;
+            return std::nullopt;
+        }
+
         // Reads one composition-layer record. The fields the producer named are
         // required; the shapes it did not pin down are accepted in every plausible
         // spelling and flagged in README.
@@ -332,7 +375,19 @@ namespace hxc {
                 return std::nullopt;
             }
 
-            // INTERPRETATION: `visibility` reads as either a flag or a 0..1 opacity.
+            // INTERPRETATION: `visibility` carries two different things depending on
+            // how the producer spells it, and the compositor reads both.
+            //
+            //   - A string is OpenXR's XrEyeVisibility - "both", "left", "right" -
+            //     which is what HypXRland stamps, because that is what the layer
+            //     structure it copied from holds. It says *which eye sees the layer*,
+            //     not how opaque it is, so the opacity stays 1.0.
+            //   - A boolean or a 0..1 number is an opacity, which is how the
+            //     synthetic bundles and the original reading of the contract spell
+            //     it; the eye mask then stays BOTH.
+            //
+            // Reading a string as "not a visibility" was v1's behaviour and it
+            // rejected every real take outright; see README's interpretations table.
             if (const json* VISIBILITY = member(node, "visibility")) {
                 if (VISIBILITY->is_boolean())
                     quad.visibility = VISIBILITY->get<bool>() ? 1.0 : 0.0;
@@ -342,8 +397,15 @@ namespace hxc {
                         diags.error(where, "`visibility` is {}; a numeric visibility is an opacity in 0..1", quad.visibility);
                         return std::nullopt;
                     }
+                } else if (VISIBILITY->is_string()) {
+                    const auto PARSED_EYES = parseEyeVisibility(VISIBILITY->get<std::string>());
+                    if (!PARSED_EYES) {
+                        diags.error(where, "`visibility` is the string \"{}\"; a string visibility is an XrEyeVisibility and must be `both`, `left`, or `right`", VISIBILITY->get<std::string>());
+                        return std::nullopt;
+                    }
+                    quad.eyeVisibility = *PARSED_EYES;
                 } else {
-                    diags.error(where, "`visibility` must be a boolean or a number in 0..1, found {}", typeName(*VISIBILITY));
+                    diags.error(where, "`visibility` must be a boolean, a number in 0..1, or one of `both`/`left`/`right`, found {}", typeName(*VISIBILITY));
                     return std::nullopt;
                 }
             } else {

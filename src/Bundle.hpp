@@ -95,13 +95,29 @@ namespace hxc {
     //      the layer had a fixed pose in STAGE, and what was recorded is that pose
     //      expressed relative to the head at t. A replay must re-anchor it, not
     //      carry it along with the head.
+    // OpenXR's XrEyeVisibility, which is what the host producer actually stamps
+    // into `visibility`: a layer is shown to both eyes, or to one of them only
+    // (the two halves of a side-by-side swapchain being the usual reason).
+    enum class eEyeVisibility {
+        BOTH,
+        LEFT,
+        RIGHT,
+    };
+
+    std::string toString(eEyeVisibility visibility);
+
     struct SQuadRecord {
         int64_t                    index = 0; // composition order, back to front
         std::optional<std::string> name;      // currently always null from the producer
         SPose                      pose;      // head-relative, see above
         double                     width      = 0.0; // metres
         double                     height     = 0.0;
+        // Two readings of one field, because two producers spell it two ways; see
+        // parseQuad. A numeric or boolean `visibility` is an opacity and leaves the
+        // eye mask at BOTH; a string one is an XrEyeVisibility and leaves the
+        // opacity at 1.0. `visibleToEye` is what a compositor should ask.
         double                     visibility = 1.0;
+        eEyeVisibility             eyeVisibility = eEyeVisibility::BOTH;
         bool                       viewSpace  = false;
         int64_t                    swapchain  = -1; // stable within a session only
         int64_t                    image      = -1;
@@ -112,6 +128,17 @@ namespace hxc {
         // The layer's pose in STAGE space, given the head pose at the same instant.
         SPose                      worldPose(const SPose& head) const {
             return head.compose(pose);
+        }
+
+        // eye 0 = left, eye 1 = right, matching the telemetry's `eyes` order.
+        bool                       visibleToEye(int eye) const {
+            if (!(visibility > 0.0))
+                return false;
+            switch (eyeVisibility) {
+                case eEyeVisibility::LEFT: return eye == 0;
+                case eEyeVisibility::RIGHT: return eye == 1;
+                default: return true;
+            }
         }
     };
 

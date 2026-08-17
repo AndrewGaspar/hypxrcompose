@@ -3,6 +3,7 @@
 #include "Log.hpp"
 
 #include <cstdio>
+#include <map>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -34,6 +35,28 @@ namespace hxc {
                 if (bundle.overlay.videoPaths[eye].empty())
                     continue;
                 out += std::format("              eye{}: {} frames, pix_fmt {}\n", eye, bundle.overlay.videoInfo[eye].ptsNs.size(), bundle.overlay.videoInfo[eye].pixelFormat);
+            }
+        }
+
+        // The quad records are not composited yet (NEXT-STEPS gap 1), so the only
+        // thing validate can usefully say about them is that they parsed and how
+        // the producer spells the two fields that have more than one spelling.
+        {
+            size_t withQuads = 0, quadCount = 0;
+            std::map<std::string, size_t> byEye;
+            for (const auto& RECORD : bundle.telemetry) {
+                if (!RECORD.hasQuadsArray)
+                    continue;
+                ++withQuads;
+                quadCount += RECORD.quads.size();
+                for (const auto& QUAD : RECORD.quads)
+                    ++byEye[toString(QUAD.eyeVisibility)];
+            }
+            if (withQuads > 0) {
+                std::string spread;
+                for (const auto& [NAME, COUNT] : byEye)
+                    spread += std::format("{}{}x{}", spread.empty() ? "" : ", ", COUNT, NAME);
+                out += std::format("  quads     : {} layer record(s) over {} telemetry record(s), eye visibility {}\n", quadCount, withQuads, spread);
             }
         }
 
