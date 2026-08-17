@@ -1,11 +1,16 @@
 #include "Process.hpp"
 #include "Log.hpp"
 
+#include <cctype>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+#include <set>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 
 namespace hxc {
@@ -217,6 +222,40 @@ namespace hxc {
 
     void CSubprocess::closeStdin() {
         closeIfOpen(m_stdin);
+    }
+
+    void CSubprocess::terminate() {
+        if (m_pid > 0 && !m_reaped)
+            ::kill(m_pid, SIGKILL);
+    }
+
+    int physicalCoreCount() {
+        // Each cpuN's thread_siblings_list names every hardware thread sharing
+        // that core, so the set of distinct lists is the set of cores. Reading
+        // topology rather than dividing by two is the difference between being
+        // right on an SMT machine and being right on every machine.
+        std::set<std::string> cores;
+        std::error_code       ec;
+        for (const auto& ENTRY : std::filesystem::directory_iterator("/sys/devices/system/cpu", ec)) {
+            const std::string NAME = ENTRY.path().filename().string();
+            if (!NAME.starts_with("cpu") || NAME.size() < 4 || !std::isdigit(static_cast<unsigned char>(NAME[3])))
+                continue;
+            std::ifstream siblings(ENTRY.path() / "topology" / "thread_siblings_list");
+            std::string   line;
+            if (siblings && std::getline(siblings, line) && !line.empty())
+                cores.insert(line);
+        }
+        if (!cores.empty())
+            return static_cast<int>(cores.size());
+
+        const unsigned THREADS = std::thread::hardware_concurrency();
+        return THREADS > 1 ? static_cast<int>(THREADS / 2) : 1;
+    }
+
+    std::string executablePath() {
+        std::error_code ec;
+        const auto      LINK = std::filesystem::read_symlink("/proc/self/exe", ec);
+        return ec ? std::string{} : LINK.string();
     }
 
     int CSubprocess::wait() {

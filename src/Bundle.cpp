@@ -53,6 +53,7 @@ namespace hxc {
         switch (visibility) {
             case eEyeVisibility::LEFT: return "left";
             case eEyeVisibility::RIGHT: return "right";
+            case eEyeVisibility::NONE: return "none";
             default: return "both";
         }
     }
@@ -314,6 +315,8 @@ namespace hxc {
                 return eEyeVisibility::LEFT;
             if (text == "right")
                 return eEyeVisibility::RIGHT;
+            if (text == "none")
+                return eEyeVisibility::NONE;
             return std::nullopt;
         }
 
@@ -375,37 +378,40 @@ namespace hxc {
                 return std::nullopt;
             }
 
-            // INTERPRETATION: `visibility` carries two different things depending on
-            // how the producer spells it, and the compositor reads both.
+            // PINNED: `visibility` is an XrEyeVisibility, spelled as one of the
+            // four strings "both", "left", "right", "none". It says *which eye the
+            // layer was composed into*, not how opaque it was - a stereo-depth
+            // desktop submits a per-eye pair sharing one pose and taking opposite
+            // halves of a side-by-side swapchain, and a HUD submits "both".
             //
-            //   - A string is OpenXR's XrEyeVisibility - "both", "left", "right" -
-            //     which is what HypXRland stamps, because that is what the layer
-            //     structure it copied from holds. It says *which eye sees the layer*,
-            //     not how opaque it is, so the opacity stays 1.0.
-            //   - A boolean or a 0..1 number is an opacity, which is how the
-            //     synthetic bundles and the original reading of the contract spell
-            //     it; the eye mask then stays BOTH.
+            // A boolean or a 0..1 number is the deprecated spelling, read as an
+            // opacity with the eye mask left at BOTH. It is still accepted, with a
+            // warning, because bundles written against the earlier reading exist.
             //
-            // Reading a string as "not a visibility" was v1's behaviour and it
-            // rejected every real take outright; see README's interpretations table.
+            // v1 rejected strings outright, which meant it rejected every real
+            // take ever recorded; see README's interpretations table.
             if (const json* VISIBILITY = member(node, "visibility")) {
-                if (VISIBILITY->is_boolean())
-                    quad.visibility = VISIBILITY->get<bool>() ? 1.0 : 0.0;
-                else if (VISIBILITY->is_number()) {
-                    quad.visibility = VISIBILITY->get<double>();
-                    if (!(quad.visibility >= 0.0 && quad.visibility <= 1.0)) {
-                        diags.error(where, "`visibility` is {}; a numeric visibility is an opacity in 0..1", quad.visibility);
-                        return std::nullopt;
-                    }
-                } else if (VISIBILITY->is_string()) {
+                if (VISIBILITY->is_string()) {
                     const auto PARSED_EYES = parseEyeVisibility(VISIBILITY->get<std::string>());
                     if (!PARSED_EYES) {
-                        diags.error(where, "`visibility` is the string \"{}\"; a string visibility is an XrEyeVisibility and must be `both`, `left`, or `right`", VISIBILITY->get<std::string>());
+                        diags.error(where, "`visibility` is the string \"{}\"; it is an XrEyeVisibility and must be `both`, `left`, `right`, or `none`", VISIBILITY->get<std::string>());
                         return std::nullopt;
                     }
                     quad.eyeVisibility = *PARSED_EYES;
+                } else if (VISIBILITY->is_boolean()) {
+                    quad.visibility = VISIBILITY->get<bool>() ? 1.0 : 0.0;
+                    diags.warn(where, "`visibility` is a boolean; it is an XrEyeVisibility and the spelling is one of `both`/`left`/`right`/`none`. Reading it as an opacity for compatibility "
+                                      "with bundles written before that was settled");
+                } else if (VISIBILITY->is_number()) {
+                    quad.visibility = VISIBILITY->get<double>();
+                    if (!(quad.visibility >= 0.0 && quad.visibility <= 1.0)) {
+                        diags.error(where, "`visibility` is {}; a numeric visibility is the deprecated opacity spelling and must be in 0..1", quad.visibility);
+                        return std::nullopt;
+                    }
+                    diags.warn(where, "`visibility` is a number; it is an XrEyeVisibility and the spelling is one of `both`/`left`/`right`/`none`. Reading it as an opacity for compatibility "
+                                      "with bundles written before that was settled");
                 } else {
-                    diags.error(where, "`visibility` must be a boolean, a number in 0..1, or one of `both`/`left`/`right`, found {}", typeName(*VISIBILITY));
+                    diags.error(where, "`visibility` must be one of `both`/`left`/`right`/`none` (or, deprecated, a boolean or a number in 0..1), found {}", typeName(*VISIBILITY));
                     return std::nullopt;
                 }
             } else {
@@ -872,7 +878,7 @@ namespace hxc {
 
                 const std::string NAME = chosen.filename().string();
                 std::string       probeError;
-                if (!probeVideo(chosen.string(), bundle.overlay.videoInfo.back(), probeError, options.probeDepth)) {
+                if (!probeVideoCached(chosen.string(), bundle.overlay.videoInfo.back(), probeError, options.probeDepth, options.probeCache)) {
                     diags.error(NAME, "{}", probeError);
                     continue;
                 }
@@ -1118,7 +1124,7 @@ namespace hxc {
                     const int   DECLARED_W = camera.video.width;
                     const int   DECLARED_H = camera.video.height;
                     std::string probeError;
-                    if (!probeVideo(camera.videoPath, camera.video, probeError, options.probeDepth)) {
+                    if (!probeVideoCached(camera.videoPath, camera.video, probeError, options.probeDepth, options.probeCache)) {
                         diags.error(fs::path(camera.videoPath).filename().string(), "{}", probeError);
                         continue;
                     }

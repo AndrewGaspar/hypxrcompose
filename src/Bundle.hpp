@@ -95,13 +95,17 @@ namespace hxc {
     //      the layer had a fixed pose in STAGE, and what was recorded is that pose
     //      expressed relative to the head at t. A replay must re-anchor it, not
     //      carry it along with the head.
-    // OpenXR's XrEyeVisibility, which is what the host producer actually stamps
-    // into `visibility`: a layer is shown to both eyes, or to one of them only
-    // (the two halves of a side-by-side swapchain being the usual reason).
+    // OpenXR's XrEyeVisibility, which is what the host producer stamps into
+    // `visibility` - PINNED, see README's interpretations table. A layer is
+    // composed into both eyes, or into one of them only: a stereo-depth desktop
+    // emits a per-eye pair of quads sharing a pose and taking opposite halves of
+    // a side-by-side swapchain, while a HUD is `both`. `NONE` is the producer's
+    // fourth spelling, for a layer that was submitted but composed nowhere.
     enum class eEyeVisibility {
         BOTH,
         LEFT,
         RIGHT,
+        NONE,
     };
 
     std::string toString(eEyeVisibility visibility);
@@ -112,11 +116,12 @@ namespace hxc {
         SPose                      pose;      // head-relative, see above
         double                     width      = 0.0; // metres
         double                     height     = 0.0;
-        // Two readings of one field, because two producers spell it two ways; see
-        // parseQuad. A numeric or boolean `visibility` is an opacity and leaves the
-        // eye mask at BOTH; a string one is an XrEyeVisibility and leaves the
-        // opacity at 1.0. `visibleToEye` is what a compositor should ask.
-        double                     visibility = 1.0;
+        // The canonical reading is `eyeVisibility`: an XrEyeVisibility spelled
+        // as a string. `visibility` survives for the deprecated boolean/numeric
+        // spelling, which older bundles use as an opacity and which the loader
+        // still accepts with a warning. `composedInEye` is the question a
+        // compositor should ask; it answers both spellings at once.
+        double                     visibility    = 1.0;
         eEyeVisibility             eyeVisibility = eEyeVisibility::BOTH;
         bool                       viewSpace  = false;
         int64_t                    swapchain  = -1; // stable within a session only
@@ -130,13 +135,16 @@ namespace hxc {
             return head.compose(pose);
         }
 
-        // eye 0 = left, eye 1 = right, matching the telemetry's `eyes` order.
-        bool                       visibleToEye(int eye) const {
+        // Was this layer composed into the given eye's view? eye 0 = left,
+        // eye 1 = right, matching the telemetry's `eyes` order. A grade-B replay
+        // draws a quad into a pane exactly when this is true for that pane's eye.
+        bool                       composedInEye(int eye) const {
             if (!(visibility > 0.0))
                 return false;
             switch (eyeVisibility) {
                 case eEyeVisibility::LEFT: return eye == 0;
                 case eEyeVisibility::RIGHT: return eye == 1;
+                case eEyeVisibility::NONE: return false;
                 default: return true;
             }
         }
@@ -233,6 +241,10 @@ namespace hxc {
         // Hash every decoded frame. Implies a full decode, so it is only ever
         // asked for alongside DEEP.
         bool        checksum   = false;
+        // Consulted before, and filled in after, every video probe. A segmented
+        // render's parent hands one of these to its workers so K processes do
+        // not each demux the same gigabytes to count the same frames.
+        std::shared_ptr<CProbeCache> probeCache;
     };
 
     struct SBundle {

@@ -109,13 +109,19 @@ front:
  "view_space" (bool), "swapchain", "image", "array_layer", "rect"}
 ```
 
-Two semantics here are load-bearing, and getting either wrong puts every layer in the wrong place:
+Three semantics here are load-bearing, and getting any of them wrong puts layers in the wrong place —
+or in the wrong eye:
 
 1. **`pose` is head-relative.** The layer's pose in STAGE space at time *t* is `head(t) ∘ pose`.
 2. **`view_space` says what that means over time.** `true` = head-locked: the layer stays at this
    head-relative pose always. `false` = room-anchored: the layer had a fixed pose in STAGE, and what
    was recorded is that pose expressed relative to the head at *t*. A replay must re-anchor it rather
    than carry it along with the head.
+3. **`visibility` is an `XrEyeVisibility`, not an opacity** — one of `"both"`, `"left"`, `"right"`,
+   `"none"`. It says which eye the layer was composed into. A stereo-depth desktop submits a *pair* of
+   quads per monitor, sharing one pose, one per eye, taking opposite halves of a side-by-side
+   swapchain via `rect`; a HUD submits `"both"`. Ask `composedInEye(0|1)` rather than reading the
+   field. A boolean or a 0..1 number is the older opacity spelling and is still read, with a warning.
 
 `swapchain` is stable within a session only. v1 does not composite quads — it uses the recorded
 matte — but it parses, validates, and carries them, because telemetry not recorded correctly today is
@@ -197,7 +203,7 @@ side producers need to converge on these, or change them here.
 | 8 | ~~**`stage_correction`'s semantics**~~ — **confirmed pinned by the producers: informational only, never applied.** | Read as a pose and recorded; the stamped eye poses already include it. v1's original reading was right. |
 | 9 | **Overlay file names.** The contract says `overlay/eye{0,1}.mkv`; research 27 §4 wrote `overlay/{left,right}.mkv`. | Both are accepted, `eye{0,1}` preferred, with a warning on the older spelling. |
 | 10 | **Distortion vector length.** | 0, 4, or 5 coefficients are read as OpenCV `k1,k2,p1,p2,k3` with missing terms zero; longer vectors warn and the first five are used. |
-| 12 | **Quad record field shapes.** `size`, `visibility`, and `rect` have unstated spellings. | `size` reads as `[w, h]` metres or an object with `width`/`height`; `visibility` as a boolean or a 0..1 opacity; `rect` as `[x, y, w, h]` swapchain pixels or an object. `index` must equal the entry's position in the array, since the array is composition order. |
+| 12 | ~~**Quad record field shapes.**~~ — **`visibility` PINNED: it is an `XrEyeVisibility`, not an opacity.** | `visibility` is one of the strings `both`, `left`, `right`, `none`, and says *which eye the layer was composed into*. A stereo-depth desktop submits a per-eye **pair** of quads sharing one pose and taking opposite halves of a side-by-side swapchain; a HUD submits `both`. Ask `composedInEye(0\|1)`. A boolean or a 0..1 number is the deprecated opacity spelling: still read, with a warning. `size` reads as `[w, h]` metres or an object with `width`/`height`; `rect` as `[x, y, w, h]` swapchain pixels or an object. `index` must equal the entry's position in the array, since the array is composition order. |
 | 11 | **Extra files.** | Unknown files and directories are ignored, which is what lets `synth` drop its ground truth at `synth/ground-truth.json` inside a bundle that still validates clean. |
 
 ## Usage

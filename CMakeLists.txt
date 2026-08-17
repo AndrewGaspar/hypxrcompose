@@ -65,6 +65,12 @@ if(HYPXRCOMPOSE_TESTS)
         target_include_directories(hypxrcompose_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(hypxrcompose_tests PRIVATE hypxrcompose_core GTest::gtest GTest::gtest_main)
         target_compile_options(hypxrcompose_tests PRIVATE -Wall -Wextra)
+        # A segmented render spawns copies of the compositor. Left to itself it
+        # spawns /proc/self/exe, which inside the test binary is the test binary;
+        # the suite therefore has to be told where the real one is, and to wait
+        # for it to be built.
+        target_compile_definitions(hypxrcompose_tests PRIVATE HYPXRCOMPOSE_BINARY="$<TARGET_FILE:hypxrcompose>")
+        add_dependencies(hypxrcompose_tests hypxrcompose)
         add_test(NAME hypxrcompose_tests COMMAND hypxrcompose_tests)
     else()
         message(STATUS "GTest not found - skipping the hypxrcompose test suite")

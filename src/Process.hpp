@@ -42,6 +42,10 @@ namespace hxc {
         // Reaps the child. Returns the exit status, or -signal for a signalled
         // death. Safe to call more than once.
         int                                 wait();
+        // Ends the child without waiting for it. Used when one worker of a
+        // segmented render has failed and the rest are now doing work nobody
+        // will read. A no-op once the child has been reaped.
+        void                                terminate();
 
         const std::vector<std::string>&     argv() const {
             return m_argv;
@@ -64,6 +68,16 @@ namespace hxc {
     bool runCapture(const std::vector<std::string>& argv, std::string& stdoutText, std::string& error);
 
     std::string describeArgv(const std::vector<std::string>& argv);
+
+    // Cores, not hardware threads. The distinction matters for the segmented
+    // render's default job count: each worker runs a decoder that will happily
+    // saturate every sibling thread it is given, so counting SMT siblings as
+    // independent workers oversubscribes by exactly two.
+    int         physicalCoreCount();
+
+    // This executable, as `execvp` would need to find it again. Empty when the
+    // path cannot be recovered, which is what makes --worker-binary exist.
+    std::string executablePath();
 
     // Set by --dump-commands: every spawn logs its argument vector.
     void setCommandTracing(bool enabled);

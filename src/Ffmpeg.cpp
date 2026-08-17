@@ -4,9 +4,13 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <format>
+#include <fstream>
+#include <nlohmann/json.hpp>
 #include <set>
 #include <sstream>
 
@@ -156,6 +160,111 @@ namespace hxc {
         return true;
     }
 
+    namespace {
+
+        // Identity of a file as far as the cache is concerned: nothing that costs
+        // a read.
+        bool fileStamp(const std::string& path, int64_t& size, int64_t& modifiedNs) {
+            std::error_code ec;
+            const auto      BYTES = std::filesystem::file_size(path, ec);
+            if (ec)
+                return false;
+            const auto WRITTEN = std::filesystem::last_write_time(path, ec);
+            if (ec)
+                return false;
+            size       = static_cast<int64_t>(BYTES);
+            modifiedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(WRITTEN.time_since_epoch()).count();
+            return true;
+        }
+
+    }
+
+    std::shared_ptr<CProbeCache> CProbeCache::read(const std::string& path) {
+        auto cache = std::make_shared<CProbeCache>();
+        try {
+            std::ifstream stream(path);
+            if (!stream)
+                return cache;
+            nlohmann::json document;
+            stream >> document;
+            for (const auto& [KEY, VALUE] : document.items()) {
+                SEntry entry;
+                entry.fileSize        = VALUE.value("file_size", int64_t{0});
+                entry.modifiedNs      = VALUE.value("modified_ns", int64_t{0});
+                entry.info.width      = VALUE.value("width", 0);
+                entry.info.height     = VALUE.value("height", 0);
+                entry.info.avgFps     = VALUE.value("avg_fps", 0.0);
+                entry.info.codecName  = VALUE.value("codec_name", std::string{});
+                entry.info.pixelFormat = VALUE.value("pix_fmt", std::string{});
+                entry.info.intraOnly  = VALUE.value("intra_only", false);
+                entry.info.depth      = VALUE.value("deep", false) ? eProbeDepth::DEEP : eProbeDepth::INDEX;
+                entry.info.ptsNs      = VALUE.value("pts_ns", std::vector<int64_t>{});
+                cache->m_entries.emplace(KEY, std::move(entry));
+            }
+        } catch (const std::exception&) {
+            // A cache that cannot be read is a cache that is not there.
+            cache->m_entries.clear();
+        }
+        return cache;
+    }
+
+    bool CProbeCache::lookup(const std::string& path, eProbeDepth depth, SVideoInfo& out) const {
+        const auto IT = m_entries.find(path);
+        if (IT == m_entries.end())
+            return false;
+        // A cached INDEX probe does not answer a request for a DEEP one; the
+        // point of --deep is that it decodes.
+        if (depth == eProbeDepth::DEEP && IT->second.info.depth != eProbeDepth::DEEP)
+            return false;
+
+        int64_t size = 0, modifiedNs = 0;
+        if (!fileStamp(path, size, modifiedNs) || size != IT->second.fileSize || modifiedNs != IT->second.modifiedNs)
+            return false;
+
+        out = IT->second.info;
+        return true;
+    }
+
+    void CProbeCache::record(const std::string& path, const SVideoInfo& info) {
+        SEntry entry;
+        entry.info = info;
+        if (!fileStamp(path, entry.fileSize, entry.modifiedNs))
+            return;
+        m_entries[path] = std::move(entry);
+    }
+
+    bool CProbeCache::write(const std::string& path, std::string& error) const {
+        nlohmann::json document = nlohmann::json::object();
+        for (const auto& [KEY, ENTRY] : m_entries) {
+            document[KEY] = {
+                {"file_size", ENTRY.fileSize}, {"modified_ns", ENTRY.modifiedNs}, {"width", ENTRY.info.width},      {"height", ENTRY.info.height},
+                {"avg_fps", ENTRY.info.avgFps}, {"codec_name", ENTRY.info.codecName}, {"pix_fmt", ENTRY.info.pixelFormat}, {"intra_only", ENTRY.info.intraOnly},
+                {"deep", ENTRY.info.depth == eProbeDepth::DEEP}, {"pts_ns", ENTRY.info.ptsNs},
+            };
+        }
+        std::ofstream stream(path);
+        if (!stream) {
+            error = std::format("{}: cannot write the probe cache", path);
+            return false;
+        }
+        stream << document.dump();
+        return true;
+    }
+
+    size_t CProbeCache::size() const {
+        return m_entries.size();
+    }
+
+    bool probeVideoCached(const std::string& path, SVideoInfo& out, std::string& error, eProbeDepth depth, const std::shared_ptr<CProbeCache>& cache) {
+        if (cache && cache->lookup(path, depth, out))
+            return true;
+        if (!probeVideo(path, out, error, depth))
+            return false;
+        if (cache)
+            cache->record(path, out);
+        return true;
+    }
+
     bool probeAudio(const std::string& path, SAudioInfo& out, std::string& error) {
         out = {};
 
@@ -206,7 +315,17 @@ namespace hxc {
             argv.push_back("-ss");
             argv.push_back(std::format("{:.6f}", options.seekSeconds));
         }
-        argv.insert(argv.end(), {"-i", path, "-f", "rawvideo", "-pix_fmt", "rgba", "-"});
+        // `-fps_mode passthrough` is load-bearing, not tidiness. Left to itself
+        // ffmpeg conforms the output to a constant frame rate, duplicating and
+        // dropping frames to hit the nominal grid. From the start of a file whose
+        // timestamps begin at zero that happens to be a no-op, which is why this
+        // was invisible until the segmented render started seeking: after `-ss`
+        // the first frame's timestamp is not on the grid, so ffmpeg emitted one
+        // extra frame and the whole sequence slipped by one a few frames later.
+        // A decoder asked for "the frames in this file" must return exactly
+        // those frames, in order, however the container stamps them - the
+        // ordinal alignment rule is counted in decoded frames and nothing else.
+        argv.insert(argv.end(), {"-i", path, "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgba", "-"});
 
         CSubprocess::SOptions spawnOptions;
         spawnOptions.pipeStdout = true;
@@ -273,6 +392,49 @@ namespace hxc {
             if (outPath.size() >= 5 && outPath.compare(outPath.size() - 5, 5, ".webm") == 0)
                 return "libopus";
             return "aac";
+        }
+
+        bool isMatroska(const std::string& outPath) {
+            return outPath.ends_with(".mkv") || outPath.ends_with(".webm") || outPath.ends_with(".mka");
+        }
+
+        // Stereo signalling, written two ways because no single one is understood
+        // everywhere.
+        //
+        //   - Matroska carries it in the container, as the StereoMode track
+        //     element. ffmpeg writes it from a stream-level `stereo_mode` tag, and
+        //     ffprobe reads it back as stream_tags=stereo_mode. This is what mpv
+        //     and the XR desktop's auto-tagging read.
+        //   - MP4 has no equivalent tag that ffmpeg's mov muxer will accept, so
+        //     the signal has to go into the bitstream instead: H.264/HEVC
+        //     frame-packing SEI, arrangement type 3 (side by side), which the
+        //     encoder emits and ffprobe surfaces as a "Stereo 3D" frame side
+        //     data. It survives a stream copy, which matters because a segmented
+        //     render muxes its final file with -c:v copy.
+        //
+        // A container-level tag is applied whatever the codec; the SEI needs an
+        // encoder that can write it, which among the codecs this tool offers means
+        // libx264 and libx265. Both are applied when both are possible.
+        void appendStereoContainerArgs(const SWriterSpec& spec, std::vector<std::string>& argv) {
+            if (!spec.stereoSideBySide || !isMatroska(spec.outPath))
+                return;
+            argv.push_back("-metadata:s:v:0");
+            argv.push_back("stereo_mode=left_right");
+        }
+
+        void appendStereoEncoderArgs(const SWriterSpec& spec, std::vector<std::string>& argv) {
+            if (!spec.stereoSideBySide)
+                return;
+            if (spec.videoCodec == "libx264") {
+                argv.push_back("-x264-params");
+                argv.push_back("frame-packing=3");
+            } else if (spec.videoCodec == "libx265") {
+                argv.push_back("-x265-params");
+                argv.push_back("frame-packing=3");
+            } else if (!isMatroska(spec.outPath))
+                HXC_WARN("--eye stereo-sbs into {} with codec {}: neither this container nor this encoder can carry a side-by-side stereo signal, so the output will not announce itself as "
+                         "stereo. Write a .mkv, or use libx264/libx265, if a player has to detect it",
+                         spec.outPath, spec.videoCodec);
         }
 
         std::string audioFilterChain(const SWriterSpec& spec, size_t& mixedCount) {
@@ -358,9 +520,29 @@ namespace hxc {
             argv.push_back(std::to_string(spec.crf));
             argv.push_back("-preset");
             argv.push_back(spec.preset);
+        } else if (spec.videoCodec.ends_with("_nvenc")) {
+            // NVENC does not take -crf, and left alone it targets a default
+            // bitrate that has nothing to do with the quality the user asked
+            // for - a take encoded that way is a tenth the size of the x264 one
+            // because it is a tenth the quality. Constant-quality VBR with the
+            // bitrate cap removed is NVENC's nearest thing to CRF, so --crf
+            // keeps meaning what it means everywhere else.
+            argv.push_back("-rc");
+            argv.push_back("vbr");
+            argv.push_back("-cq");
+            argv.push_back(std::to_string(spec.crf));
+            argv.push_back("-b:v");
+            argv.push_back("0");
+            // NVENC's preset ladder is p1..p7 rather than x264's names, so an
+            // x264 preset name would be rejected outright; p5 is the "medium"
+            // of that ladder. A caller who knows the ladder can still say p7.
+            argv.push_back("-preset");
+            argv.push_back(spec.preset.size() == 2 && spec.preset[0] == 'p' ? spec.preset : "p5");
         }
         argv.push_back("-pix_fmt");
         argv.push_back(spec.pixelFormat);
+        appendStereoEncoderArgs(spec, argv);
+        appendStereoContainerArgs(spec, argv);
         argv.push_back(spec.outPath);
 
         CSubprocess::SOptions options;
@@ -374,6 +556,82 @@ namespace hxc {
         writer->m_command       = argv;
         writer->m_expectedBytes = static_cast<size_t>(spec.width) * static_cast<size_t>(spec.height) * 4;
         return writer;
+    }
+
+    bool concatSegments(const std::vector<std::string>& segmentPaths, const SWriterSpec& spec, std::string& error) {
+        if (segmentPaths.empty()) {
+            error = "cannot concatenate an empty segment list";
+            return false;
+        }
+
+        // The concat demuxer's list file. Its quoting rule is its own: single
+        // quotes around the path, and a literal quote written as '\''.
+        const std::string LIST_PATH = spec.outPath + ".concat.txt";
+        {
+            std::ofstream list(LIST_PATH);
+            if (!list) {
+                error = std::format("{}: cannot write the concat list", LIST_PATH);
+                return false;
+            }
+            for (const auto& PATH : segmentPaths) {
+                std::string quoted;
+                for (char c : PATH) {
+                    if (c == '\'')
+                        quoted += "'\\''";
+                    else
+                        quoted += c;
+                }
+                list << "file '" << quoted << "'\n";
+            }
+        }
+
+        // -safe 0 because the paths are absolute.
+        std::vector<std::string> argv{"ffmpeg", "-hide_banner", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", LIST_PATH};
+        for (const auto& TRACK : spec.audio) {
+            argv.push_back("-i");
+            argv.push_back(TRACK.path);
+        }
+
+        size_t            mixed = 0;
+        const std::string CHAIN = audioFilterChain(spec, mixed);
+        if (!CHAIN.empty()) {
+            argv.push_back("-filter_complex");
+            argv.push_back(CHAIN);
+            argv.push_back("-map");
+            argv.push_back("0:v");
+            argv.push_back("-map");
+            argv.push_back("[aout]");
+            argv.push_back("-c:a");
+            argv.push_back(audioCodecFor(spec.outPath));
+            argv.push_back("-shortest");
+        } else {
+            argv.push_back("-map");
+            argv.push_back("0:v");
+        }
+        argv.push_back("-c:v");
+        argv.push_back("copy");
+        // Only the container tag here: the frame-packing SEI already rode in
+        // with the copied bitstream, and there is no encoder left to add one.
+        appendStereoContainerArgs(spec, argv);
+        argv.push_back(spec.outPath);
+
+        CSubprocess::SOptions options;
+        auto                  process = CSubprocess::spawn(argv, options, error);
+        if (!process) {
+            std::error_code ec;
+            std::filesystem::remove(LIST_PATH, ec);
+            return false;
+        }
+        const int STATUS = process->wait();
+
+        std::error_code ec;
+        std::filesystem::remove(LIST_PATH, ec);
+
+        if (STATUS != 0) {
+            error = std::format("joining {} segment(s) failed with status {}; command was: {}", segmentPaths.size(), STATUS, describeArgv(argv));
+            return false;
+        }
+        return true;
     }
 
     bool CVideoWriter::writeFrame(const uint8_t* rgba, size_t bytes) {

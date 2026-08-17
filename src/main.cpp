@@ -78,7 +78,18 @@ render:
       --gpu SUBSTR         pin the EGL device by renderer/vendor/DRM node; `list` enumerates
       --frames-dir DIR     also write every output frame as a PNG
       --report FILE        write the per-frame render report as JSON
-      --limit N            stop after N output frames)");
+      --limit N            stop after N output frames
+      --jobs N             compose N chunks of the timeline concurrently, one
+                           worker process each, joined by a stream copy.
+                           Default 1: the serial pipeline already saturates a
+                           24-thread machine, so on the measured take --jobs 4
+                           came in slower than --jobs 1. Worth trying when the
+                           encode is off the CPU (--codec hevc_nvenc)
+      --decode-threads N   threads each worker's ffmpeg may use
+                           (default: hardware threads / --jobs)
+      --segment i/k        render only chunk i of k. What --jobs spawns; useful
+                           by hand for resuming or distributing a long take
+      --worker-binary PATH what to spawn for a worker (default: this binary))");
     }
 
     bool parseInt(const char* text, int64_t& out) {
@@ -336,7 +347,31 @@ int main(int argc, char** argv) {
                 options.reportPath = PATH;
             } else if (ARG == "--limit" && parseInt(value(COUNT, REST, i), integer))
                 options.limitFrames = static_cast<size_t>(integer);
-            else if (ARG.starts_with("-")) {
+            else if (ARG == "--jobs" && parseInt(value(COUNT, REST, i), integer))
+                options.jobs = static_cast<int>(integer);
+            else if (ARG == "--decode-threads" && parseInt(value(COUNT, REST, i), integer))
+                options.decodeThreads = static_cast<int>(integer);
+            else if (ARG == "--segment") {
+                const std::string SPEC  = value(COUNT, REST, i) ?: "";
+                const size_t      SLASH = SPEC.find('/');
+                int64_t           index = 0, count = 0;
+                if (SLASH == std::string::npos || !parseInt(SPEC.substr(0, SLASH).c_str(), index) || !parseInt(SPEC.c_str() + SLASH + 1, count) || count <= 0 || index < 0 || index >= count) {
+                    HXC_ERR("--segment takes i/k with 0 <= i < k");
+                    return 2;
+                }
+                options.segmentIndex = static_cast<int>(index);
+                options.segmentCount = static_cast<int>(count);
+            } else if (ARG == "--worker-binary") {
+                const char* PATH = value(COUNT, REST, i);
+                if (!PATH)
+                    return 2;
+                options.workerBinary = PATH;
+            } else if (ARG == "--probe-cache") {
+                const char* PATH = value(COUNT, REST, i);
+                if (!PATH)
+                    return 2;
+                options.probeCachePath = PATH;
+            } else if (ARG.starts_with("-")) {
                 HXC_ERR("unknown or malformed flag {}", ARG);
                 return 2;
             } else if (options.take.empty())

@@ -6,6 +6,7 @@
 #include "Log.hpp"
 #include "Validate.hpp"
 
+#include <array>
 #include <cstring>
 #include <fstream>
 #include <gtest/gtest.h>
@@ -380,8 +381,17 @@ namespace {
                            tHostNs, frame, poseLine(1.0), poseLine(1.0), quadBody);
     }
 
-    constexpr const char* GOOD_QUAD = R"({"index":0,"name":null,"pose":{"pos":[0,0,-1],"quat":[0,0,0,1]},"size":[0.7,0.42],"visibility":1.0,"view_space":false,)"
+    // The canonical spelling: `visibility` is an XrEyeVisibility string.
+    constexpr const char* GOOD_QUAD = R"({"index":0,"name":null,"pose":{"pos":[0,0,-1],"quat":[0,0,0,1]},"size":[0.7,0.42],"visibility":"both","view_space":false,)"
                                       R"("swapchain":7,"image":0,"array_layer":0,"rect":[0,0,640,480]})";
+
+    // Same record with `visibility` replaced by whatever the caller wants to try.
+    std::string quadWithVisibility(const std::string& spelling) {
+        std::string  quad = GOOD_QUAD;
+        const size_t AT   = quad.find(R"("visibility":"both")");
+        quad.replace(AT, std::strlen(R"("visibility":"both")"), std::format(R"("visibility":{})", spelling));
+        return quad;
+    }
 
     std::vector<std::string> quadTelemetry(const std::string& quadBody) {
         return {quadTelemetryLine(1000000000, 0, quadBody), quadTelemetryLine(1016666666, 1, quadBody), quadTelemetryLine(1033333333, 2, quadBody)};
@@ -407,7 +417,7 @@ TEST(Validate, AQuadWithoutViewSpaceIsRejected) {
 }
 
 TEST(Validate, AQuadWithoutAPoseIsRejectedWithTheHeadRelativeSemanticsSpelledOut) {
-    const std::string QUAD = R"({"index":0,"name":null,"size":[0.7,0.42],"visibility":1.0,"view_space":false,"swapchain":7,"image":0})";
+    const std::string QUAD = R"({"index":0,"name":null,"size":[0.7,0.42],"visibility":"both","view_space":false,"swapchain":7,"image":0})";
     const auto        DIAGS = loadAndCollect(writeTake("quadnopose", minimalManifest(), quadTelemetry(QUAD), goodClock()));
     EXPECT_TRUE(hasDiagnostic(DIAGS, true, "head-relative")) << describe(DIAGS);
 }
@@ -432,14 +442,69 @@ TEST(Validate, AQuadIndexThatDisagreesWithCompositionOrderIsRejected) {
     EXPECT_TRUE(hasDiagnostic(DIAGS, true, "composition order back-to-front")) << describe(DIAGS);
 }
 
-TEST(Validate, AQuadVisibilityOutsideZeroToOneIsRejected) {
-    std::string quad = GOOD_QUAD;
-    const size_t AT  = quad.find(R"("visibility":1.0)");
-    ASSERT_NE(AT, std::string::npos);
-    quad.replace(AT, std::strlen(R"("visibility":1.0)"), R"("visibility":1.4)");
+// `visibility` is an XrEyeVisibility. The producer emits one of four strings,
+// and reading a string as "not a visibility" is what made v1 reject every real
+// take ever recorded - so each spelling gets an assertion.
+TEST(Validate, QuadEyeVisibilityReadsAllFourSpellings) {
+    const std::array<std::pair<const char*, eEyeVisibility>, 4> CASES{{
+        {R"("both")", eEyeVisibility::BOTH},
+        {R"("left")", eEyeVisibility::LEFT},
+        {R"("right")", eEyeVisibility::RIGHT},
+        {R"("none")", eEyeVisibility::NONE},
+    }};
 
-    const auto DIAGS = loadAndCollect(writeTake("quadbadvis", minimalManifest(), quadTelemetry(quad), goodClock()));
-    EXPECT_TRUE(hasDiagnostic(DIAGS, true, "opacity in 0..1")) << describe(DIAGS);
+    for (const auto& [SPELLING, EXPECTED] : CASES) {
+        CDiagnostics diags;
+        const auto   BUNDLE = SBundle::load(writeTake(std::format("quadvis{}", static_cast<int>(EXPECTED)), minimalManifest(), quadTelemetry(quadWithVisibility(SPELLING)), goodClock()), diags,
+                                            SLoadOptions{.probeMedia = false, .probeDepth = eProbeDepth::INDEX, .checksum = false, .probeCache = nullptr});
+        ASSERT_TRUE(BUNDLE.has_value()) << SPELLING;
+        EXPECT_FALSE(diags.hasErrors()) << SPELLING << describe(diags);
+        ASSERT_FALSE(BUNDLE->telemetry.empty());
+        ASSERT_EQ(BUNDLE->telemetry.front().quads.size(), 1u);
+        EXPECT_EQ(BUNDLE->telemetry.front().quads.front().eyeVisibility, EXPECTED) << SPELLING;
+    }
+}
+
+TEST(Validate, QuadEyeVisibilityDecidesWhichEyeComposedTheLayer) {
+    CDiagnostics diags;
+    const auto   BUNDLE = SBundle::load(writeTake("quadviseye", minimalManifest(), quadTelemetry(quadWithVisibility(R"("right")")), goodClock()), diags, SLoadOptions{.probeMedia = false, .probeDepth = eProbeDepth::INDEX, .checksum = false, .probeCache = nullptr});
+    ASSERT_TRUE(BUNDLE.has_value());
+    const auto& QUAD = BUNDLE->telemetry.front().quads.front();
+    EXPECT_FALSE(QUAD.composedInEye(0)) << "a right-eye layer is not in the left eye's view";
+    EXPECT_TRUE(QUAD.composedInEye(1));
+
+    CDiagnostics none;
+    const auto   NOWHERE = SBundle::load(writeTake("quadvisnone", minimalManifest(), quadTelemetry(quadWithVisibility(R"("none")")), goodClock()), none, SLoadOptions{.probeMedia = false, .probeDepth = eProbeDepth::INDEX, .checksum = false, .probeCache = nullptr});
+    ASSERT_TRUE(NOWHERE.has_value());
+    EXPECT_FALSE(NOWHERE->telemetry.front().quads.front().composedInEye(0));
+    EXPECT_FALSE(NOWHERE->telemetry.front().quads.front().composedInEye(1));
+}
+
+TEST(Validate, AnUnknownQuadVisibilityStringIsRejectedRatherThanTreatedAsBoth) {
+    const auto DIAGS = loadAndCollect(writeTake("quadvisjunk", minimalManifest(), quadTelemetry(quadWithVisibility(R"("stereo")")), goodClock()));
+    // Guessing "both" would put a one-eye layer in front of both eyes, which is
+    // worse than refusing the file.
+    EXPECT_TRUE(hasDiagnostic(DIAGS, true, "XrEyeVisibility")) << describe(DIAGS);
+}
+
+TEST(Validate, TheDeprecatedNumericVisibilityIsStillReadButWarns) {
+    CDiagnostics diags;
+    const auto   BUNDLE = SBundle::load(writeTake("quadvisnum", minimalManifest(), quadTelemetry(quadWithVisibility("0.5")), goodClock()), diags, SLoadOptions{.probeMedia = false, .probeDepth = eProbeDepth::INDEX, .checksum = false, .probeCache = nullptr});
+    ASSERT_TRUE(BUNDLE.has_value());
+    EXPECT_FALSE(diags.hasErrors()) << describe(diags);
+    EXPECT_TRUE(hasDiagnostic(diags, false, "XrEyeVisibility")) << describe(diags);
+    const auto& QUAD = BUNDLE->telemetry.front().quads.front();
+    EXPECT_DOUBLE_EQ(QUAD.visibility, 0.5) << "the old spelling still means an opacity";
+    EXPECT_EQ(QUAD.eyeVisibility, eEyeVisibility::BOTH) << "and leaves the eye mask alone";
+
+    const auto BOOLEAN = loadAndCollect(writeTake("quadvisbool", minimalManifest(), quadTelemetry(quadWithVisibility("true")), goodClock()));
+    EXPECT_FALSE(BOOLEAN.hasErrors()) << describe(BOOLEAN);
+    EXPECT_TRUE(hasDiagnostic(BOOLEAN, false, "XrEyeVisibility")) << describe(BOOLEAN);
+}
+
+TEST(Validate, AQuadVisibilityOutsideZeroToOneIsRejected) {
+    const auto DIAGS = loadAndCollect(writeTake("quadbadvis", minimalManifest(), quadTelemetry(quadWithVisibility("1.4")), goodClock()));
+    EXPECT_TRUE(hasDiagnostic(DIAGS, true, "0..1")) << describe(DIAGS);
 }
 
 TEST(Validate, ATakeWithoutQuadRecordsWarnsThatGradeBReplayIsForeclosed) {

@@ -338,12 +338,18 @@ void main() {
             // decode has to happen. Doing it in the shader after a bilinear fetch
             // would filter encoded values, which is wrong at every edge. Alpha is
             // left alone by the sRGB format, which is also correct.
+            // Allocation and upload are separate calls, and the allocation
+            // carries no pixels, so that every upload - the first one included -
+            // goes through one path instead of two. That is a tidiness argument
+            // rather than a correctness one: it was tried as a fix for the
+            // chunk-boundary LSB difference documented in Render.cpp and did not
+            // move it, so do not read this as the cure for that.
             if (slot.width != width || slot.height != height) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB8_ALPHA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB8_ALPHA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
                 slot.width  = width;
                 slot.height = height;
-            } else
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+            }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
 
             return glGetError() == GL_NO_ERROR;
         }

@@ -17,6 +17,7 @@
 // narrow enough that it is a contained change.
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -64,6 +65,41 @@ namespace hxc {
     };
 
     bool probeVideo(const std::string& path, SVideoInfo& out, std::string& error, eProbeDepth depth = eProbeDepth::INDEX);
+
+    // Probe results, written by one process and read by another.
+    //
+    // A segmented render is K processes opening the same take. Each of them
+    // would otherwise demux every video in the bundle to count its frames -
+    // 4.8 GB per worker on a two-eye take, for numbers the parent worked out
+    // seconds earlier. The parent therefore saves what it learned and the
+    // workers read it.
+    //
+    // An entry names the file's size and modification time and is ignored
+    // unless both still match, so a cache cannot outlive the file it describes
+    // or be pointed at the wrong one. A miss is not an error: it costs a probe.
+    class CProbeCache {
+      public:
+        // A cache that knows nothing. Reading a file that is absent or malformed
+        // gives the same thing, because a bad cache must degrade to no cache.
+        static std::shared_ptr<CProbeCache> read(const std::string& path);
+
+        bool                                lookup(const std::string& path, eProbeDepth depth, SVideoInfo& out) const;
+        void                                record(const std::string& path, const SVideoInfo& info);
+        bool                                write(const std::string& path, std::string& error) const;
+        size_t                              size() const;
+
+      private:
+        struct SEntry {
+            SVideoInfo info;
+            int64_t    fileSize  = 0;
+            int64_t    modifiedNs = 0;
+        };
+        std::map<std::string, SEntry> m_entries;
+    };
+
+    // probeVideo(), consulting `cache` first and recording into it after. A null
+    // cache is exactly probeVideo().
+    bool probeVideoCached(const std::string& path, SVideoInfo& out, std::string& error, eProbeDepth depth, const std::shared_ptr<CProbeCache>& cache);
 
     // Whether every frame of this codec stands alone. The list is closed on
     // purpose: a codec nobody named is assumed to be inter-coded, which costs a
@@ -186,6 +222,12 @@ namespace hxc {
         int                         audioSampleRate = 48000;
         // As for SReaderOptions::threads: 0 leaves ffmpeg's default.
         int                         threads         = 0;
+        // The output is a side-by-side stereo pair (left half = left eye), and
+        // must say so in the file rather than in the filename. Without this a
+        // player shows a stereo take as two squashed pictures and an XR
+        // compositor cannot auto-tag the window. Mono output must leave it
+        // false: a wrong stereo flag is worse than none.
+        bool                        stereoSideBySide = false;
         // Linear ceiling for the summing limiter; <= 0 disables it. Only inserted
         // when two or more tracks are summed, since a single track cannot clip
         // against itself.
@@ -217,6 +259,20 @@ namespace hxc {
         size_t                       m_expectedBytes = 0;
         bool                         m_finished      = false;
     };
+
+    // Joins already-encoded video segments into `spec.outPath` and folds
+    // `spec.audio` in on the way past, in one ffmpeg invocation.
+    //
+    // The video is stream-copied: the segments were encoded once, by the workers
+    // that composed them, and re-encoding here would both cost a second pass and
+    // throw away the exactness the segmented render exists to preserve. The audio
+    // is mixed here rather than in a worker because it is one track spanning the
+    // whole take, not a per-segment thing - so it is placed against the finished
+    // timeline exactly as the single-job writer places it.
+    //
+    // Every segment must carry the same codec, geometry and rate, which they do
+    // by construction: they came from one SWriterSpec.
+    bool concatSegments(const std::vector<std::string>& segmentPaths, const SWriterSpec& spec, std::string& error);
 
     // Encodes interleaved signed-16 PCM into a file (FLAC for `.flac`). Used by
     // the synthetic bundle generator.

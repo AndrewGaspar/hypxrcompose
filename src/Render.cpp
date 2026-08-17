@@ -3,14 +3,19 @@
 #include "ComposeGL.hpp"
 #include "Ffmpeg.hpp"
 #include "Log.hpp"
+#include "Process.hpp"
 #include "Stabilize.hpp"
 #include "Validate.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <sstream>
+#include <thread>
+#include <unistd.h>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -55,6 +60,24 @@ namespace hxc {
 
     }
 
+    std::pair<size_t, size_t> segmentRange(size_t frameCount, int index, int count) {
+        if (count <= 1 || index < 0)
+            return {0, frameCount};
+        if (index >= count)
+            return {frameCount, frameCount};
+
+        const size_t BASE      = frameCount / static_cast<size_t>(count);
+        const size_t REMAINDER = frameCount % static_cast<size_t>(count);
+        const size_t I         = static_cast<size_t>(index);
+        // The first REMAINDER segments carry one extra frame, so the chunk sizes
+        // differ by at most one and the boundaries are a closed form rather than a
+        // running sum - which is what lets a worker compute its own range without
+        // being told the others'.
+        const size_t BEGIN = I * BASE + std::min(I, REMAINDER);
+        const size_t END   = BEGIN + BASE + (I < REMAINDER ? 1 : 0);
+        return {BEGIN, END};
+    }
+
     std::string SRenderReport::toJson() const {
         json report;
         report["pane_width"]  = paneWidth;
@@ -64,6 +87,7 @@ namespace hxc {
         report["first_t_host_ns"] = firstHostNs;
         report["gpu"]         = gpu;
         report["framing"]     = framing;
+        report["jobs"]        = jobs;
         report["throughput"]  = {
             {"wall_seconds", wallSeconds},        {"decode_seconds", decodeSeconds},
             {"gpu_seconds", gpuSeconds},          {"encode_seconds", encodeSeconds},
@@ -89,80 +113,175 @@ namespace hxc {
         return report.dump(2);
     }
 
-    int runRender(const SRenderOptions& options, SRenderReport* reportOut) {
-        SRenderReport report;
-        report.framing = framingName(options.framing);
+    bool SRenderReport::fromJson(const std::string& text, SRenderReport& out, std::string& error) {
+        out = {};
+        try {
+            const json REPORT = json::parse(text);
+            out.paneWidth     = REPORT.value("pane_width", 0);
+            out.paneHeight    = REPORT.value("pane_height", 0);
+            out.paneCount     = REPORT.value("pane_count", 1);
+            out.fps           = REPORT.value("fps", 0.0);
+            out.firstHostNs   = REPORT.value("first_t_host_ns", int64_t{0});
+            out.gpu           = REPORT.value("gpu", std::string{});
+            out.framing       = REPORT.value("framing", std::string{});
+            out.jobs          = REPORT.value("jobs", 1);
 
-        CDiagnostics diags;
-        const auto   LOADED = SBundle::load(options.take, diags, {});
-        diags.print();
-        if (!LOADED) {
-            HXC_ERR("cannot open the bundle");
-            return 2;
-        }
-        if (diags.hasErrors()) {
-            HXC_ERR("the bundle has {} error(s); fix them or inspect with `hypxrcompose validate`", diags.errorCount());
-            return 1;
-        }
-        const SBundle& BUNDLE = *LOADED;
-        if (logEnabled(eLogLevel::INFO))
-            std::fputs(describeBundle(BUNDLE).c_str(), stdout);
-
-        if (BUNDLE.telemetry.empty()) {
-            HXC_ERR("the take holds no telemetry; there is nothing to compose against");
-            return 1;
-        }
-
-        // ---- panes ---------------------------------------------------------------
-        std::vector<int> paneEyes;
-        switch (options.eye) {
-            case eEyeSelection::LEFT: paneEyes = {0}; break;
-            case eEyeSelection::RIGHT: paneEyes = {1}; break;
-            case eEyeSelection::STEREO_SBS: paneEyes = {0, 1}; break;
-        }
-        const int PANE_COUNT = static_cast<int>(paneEyes.size());
-        for (int eye : paneEyes) {
-            if (eye >= static_cast<int>(BUNDLE.telemetry.front().eyes.size())) {
-                HXC_ERR("the take stamps {} eye(s); eye {} was requested", BUNDLE.telemetry.front().eyes.size(), eye);
-                return 1;
+            if (const auto IT = REPORT.find("throughput"); IT != REPORT.end()) {
+                out.wallSeconds   = IT->value("wall_seconds", 0.0);
+                out.decodeSeconds = IT->value("decode_seconds", 0.0);
+                out.gpuSeconds    = IT->value("gpu_seconds", 0.0);
+                out.encodeSeconds = IT->value("encode_seconds", 0.0);
             }
-        }
 
-        // ---- geometry ------------------------------------------------------------
-        int paneWidth  = options.width;
-        int paneHeight = options.height;
-        if (paneWidth <= 0 || paneHeight <= 0) {
-            if (BUNDLE.overlay.width > 0) {
-                paneWidth  = BUNDLE.overlay.width;
-                paneHeight = BUNDLE.overlay.height;
-            } else if (!BUNDLE.cameras.empty() && BUNDLE.cameras.front().video.width > 0) {
-                paneWidth  = BUNDLE.cameras.front().video.width;
-                paneHeight = BUNDLE.cameras.front().video.height;
-            } else {
-                paneWidth  = 1280;
-                paneHeight = 720;
+            for (const auto& FRAME : REPORT.value("frames", json::array())) {
+                SFrameRecord record;
+                record.index          = FRAME.value("index", size_t{0});
+                record.tHostNs        = FRAME.value("t_host_ns", int64_t{0});
+                record.telemetryIndex = FRAME.value("telemetry_index", size_t{0});
+                const auto pair       = [&](const char* key, std::array<int64_t, 2>& into) {
+                    const auto IT = FRAME.find(key);
+                    if (IT == FRAME.end() || !IT->is_array() || IT->size() != 2)
+                        return;
+                    into[0] = (*IT)[0].get<int64_t>();
+                    into[1] = (*IT)[1].get<int64_t>();
+                };
+                pair("overlay_frame", record.overlayFrame);
+                pair("overlay_telemetry_index", record.overlayTelemetryIndex);
+                pair("camera_frame", record.cameraFrame);
+                pair("camera_t_host_ns", record.cameraHostNs);
+                out.frames.push_back(record);
             }
-        }
-        // H.264 and HEVC want even dimensions in both axes.
-        paneWidth  &= ~1;
-        paneHeight &= ~1;
 
-        double fps = options.fps;
-        if (!(fps > 0.0))
-            fps = BUNDLE.overlay.targetHz;
-        if (!(fps > 0.0)) {
-            const int64_t INTERVAL = BUNDLE.medianTelemetryIntervalNs();
-            fps                    = INTERVAL > 0 ? 1e9 / static_cast<double>(INTERVAL) : 60.0;
+            for (const auto& TRACK : REPORT.value("audio", json::array()))
+                out.audio.push_back({TRACK.value("role", std::string{}), TRACK.value("start_sample", int64_t{0}), TRACK.value("gain", 1.0)});
+        } catch (const std::exception& e) {
+            error = std::format("cannot read a render report: {}", e.what());
+            return false;
+        }
+        return true;
+    }
+
+    namespace {
+
+        // Everything about the output that does not depend on *which* frames are
+        // being composed. The parent of a segmented render and each of its workers
+        // both derive this from the same bundle and the same options, so they agree
+        // on the timeline by construction rather than by being told.
+        struct SRenderPlan {
+            std::vector<int>  paneEyes;
+            int               paneWidth  = 0;
+            int               paneHeight = 0;
+            double            fps        = 0.0;
+            int64_t           t0         = 0;
+            size_t            frameCount = 0; // the whole timeline, before any segmenting
+            eBackgroundChoice background = eBackgroundChoice::CHECKER;
+        };
+
+        bool makePlan(const SRenderOptions& options, const SBundle& BUNDLE, SRenderPlan& out) {
+            // ---- panes -----------------------------------------------------------
+            switch (options.eye) {
+                case eEyeSelection::LEFT: out.paneEyes = {0}; break;
+                case eEyeSelection::RIGHT: out.paneEyes = {1}; break;
+                case eEyeSelection::STEREO_SBS: out.paneEyes = {0, 1}; break;
+            }
+            for (int eye : out.paneEyes) {
+                if (eye >= static_cast<int>(BUNDLE.telemetry.front().eyes.size())) {
+                    HXC_ERR("the take stamps {} eye(s); eye {} was requested", BUNDLE.telemetry.front().eyes.size(), eye);
+                    return false;
+                }
+            }
+
+            // ---- geometry --------------------------------------------------------
+            out.paneWidth  = options.width;
+            out.paneHeight = options.height;
+            if (out.paneWidth <= 0 || out.paneHeight <= 0) {
+                if (BUNDLE.overlay.width > 0) {
+                    out.paneWidth  = BUNDLE.overlay.width;
+                    out.paneHeight = BUNDLE.overlay.height;
+                } else if (!BUNDLE.cameras.empty() && BUNDLE.cameras.front().video.width > 0) {
+                    out.paneWidth  = BUNDLE.cameras.front().video.width;
+                    out.paneHeight = BUNDLE.cameras.front().video.height;
+                } else {
+                    out.paneWidth  = 1280;
+                    out.paneHeight = 720;
+                }
+            }
+            // H.264 and HEVC want even dimensions in both axes.
+            out.paneWidth  &= ~1;
+            out.paneHeight &= ~1;
+
+            out.fps = options.fps;
+            if (!(out.fps > 0.0))
+                out.fps = BUNDLE.overlay.targetHz;
+            if (!(out.fps > 0.0)) {
+                const int64_t INTERVAL = BUNDLE.medianTelemetryIntervalNs();
+                out.fps                = INTERVAL > 0 ? 1e9 / static_cast<double>(INTERVAL) : 60.0;
+            }
+
+            out.t0             = BUNDLE.firstHostNs();
+            const int64_t SPAN = BUNDLE.lastHostNs() - out.t0;
+            // The epsilon is not cosmetic: at the common case of an output rate equal
+            // to the capture rate the span is n-1 frames to within a few nanoseconds
+            // of floating-point noise, and a bare truncation drops the last frame.
+            out.frameCount = SPAN > 0 ? static_cast<size_t>(std::floor(static_cast<double>(SPAN) * 1e-9 * out.fps + 1e-6)) + 1 : 1;
+            if (options.limitFrames > 0)
+                out.frameCount = std::min(out.frameCount, options.limitFrames);
+
+            // ---- background choice ------------------------------------------------
+            out.background = options.background;
+            if (out.background == eBackgroundChoice::AUTO)
+                out.background = BUNDLE.cameras.empty() ? eBackgroundChoice::CHECKER : eBackgroundChoice::CAMERA;
+            if (out.background == eBackgroundChoice::CAMERA && BUNDLE.cameras.empty()) {
+                HXC_WARN("--background camera was asked for but the take has no camera source; falling back to the checker");
+                out.background = eBackgroundChoice::CHECKER;
+            }
+            return true;
         }
 
-        const int64_t T0   = BUNDLE.firstHostNs();
-        const int64_t SPAN = BUNDLE.lastHostNs() - T0;
-        // The epsilon is not cosmetic: at the common case of an output rate equal to
-        // the capture rate the span is n-1 frames to within a few nanoseconds of
-        // floating-point noise, and a bare truncation drops the last frame.
-        size_t        frameCount = SPAN > 0 ? static_cast<size_t>(std::floor(static_cast<double>(SPAN) * 1e-9 * fps + 1e-6)) + 1 : 1;
-        if (options.limitFrames > 0)
-            frameCount = std::min(frameCount, options.limitFrames);
+        // The output instant of frame k. Depends on nothing but k, so a worker
+        // starting at k = 1500 lands on exactly the instant the single-job run's
+        // 1500th iteration did.
+        int64_t outputHostNs(const SRenderPlan& PLAN, size_t k) {
+            return PLAN.t0 + static_cast<int64_t>(std::llround(static_cast<double>(k) * 1e9 / PLAN.fps));
+        }
+
+        // Composes output frames [beginFrame, endFrame) into `outPath`.
+        //
+        // This is the whole compositor. A single-job render calls it once over the
+        // whole timeline; a worker calls it once over its chunk. There is no second
+        // code path, which is the entire argument for why the two produce the same
+        // pixels.
+        //
+        // HOW EXACTLY THE SAME, measured rather than assumed.
+        //
+        // Which source frame every output frame draws on is identical whatever
+        // --jobs was: that is arithmetic on the frame index, and the suite
+        // asserts it frame by frame. Nearly every composed frame is then
+        // byte-identical as well - but not quite all of them. A few come back
+        // differing by one or two least-significant bits on a handful of pixels
+        // out of ~170000, and only where the background is a photographic camera
+        // texture; a flat synthetic overlay never shows it.
+        //
+        // That residue belongs to the driver rather than to this code. The same
+        // binary composing the same range twice is bit-exact, so what varies is
+        // how equal two *processes* can be made to be, and three attempts to
+        // equalize the GL state - uploading through a single path, allocating
+        // every texture up front, composing a throwaway frame first - each left
+        // it precisely where it was. Worth keeping the scale in view: against
+        // the ~10000 pixels at 161 LSB that a real off-by-one in the seek
+        // produced while this was being debugged, the suite's tolerance of
+        // <0.1% of pixels at <=4 LSB is three orders of magnitude tighter, so
+        // nothing real can hide inside it.
+        int composeRange(const SRenderOptions& options, const SBundle& BUNDLE, const SRenderPlan& PLAN, size_t beginFrame, size_t endFrame, const std::string& outPath, bool withAudio,
+                         SRenderReport& report) {
+            const int    PANE_COUNT = static_cast<int>(PLAN.paneEyes.size());
+            const auto&  paneEyes   = PLAN.paneEyes;
+            const int    paneWidth  = PLAN.paneWidth;
+            const int    paneHeight = PLAN.paneHeight;
+            const double fps        = PLAN.fps;
+            const int64_t T0        = PLAN.t0;
+            const eBackgroundChoice background = PLAN.background;
+            const size_t frameCount = PLAN.frameCount;
 
         // ---- pose tracks ---------------------------------------------------------
         std::vector<int64_t>            telemetryTimes = BUNDLE.telemetryHostNs;
@@ -186,15 +305,6 @@ namespace hxc {
                      gaussianCutoffHz(options.stabilizeSigmaNs));
         }
 
-        // ---- background choice ----------------------------------------------------
-        eBackgroundChoice background = options.background;
-        if (background == eBackgroundChoice::AUTO)
-            background = BUNDLE.cameras.empty() ? eBackgroundChoice::CHECKER : eBackgroundChoice::CAMERA;
-        if (background == eBackgroundChoice::CAMERA && BUNDLE.cameras.empty()) {
-            HXC_WARN("--background camera was asked for but the take has no camera source; falling back to the checker");
-            background = eBackgroundChoice::CHECKER;
-        }
-
         // ---- GPU ------------------------------------------------------------------
         std::string error;
         auto        gl = CComposeGL::create(paneWidth, paneHeight, PANE_COUNT, options.gpuHint, error);
@@ -214,6 +324,35 @@ namespace hxc {
             int64_t                       cameraFrame  = -1;
         };
 
+        // A range that does not start at zero starts its decoders partway along
+        // too. The frame to start at is not a guess: it is the same
+        // nearestIndex() the loop below would have arrived at by walking there,
+        // so the worker's first iteration sees exactly the source frame the
+        // single-job run's iteration k = beginFrame saw. Where the source cannot
+        // be seeked exactly (an inter-coded camera, say) the reader decodes from
+        // the beginning and the answer is still right, only slower.
+        const auto startFrameFor = [&](const std::vector<int64_t>& hostNs) -> size_t {
+            if (beginFrame == 0 || hostNs.empty())
+                return 0;
+            const auto INDEX = nearestIndex(hostNs, outputHostNs(PLAN, beginFrame));
+            return INDEX ? *INDEX : 0;
+        };
+        const auto readerOptionsFor = [&](const SVideoInfo& info, size_t startFrame, const std::string& label) {
+            SReaderOptions reader;
+            reader.threads = options.decodeThreads;
+            if (startFrame == 0)
+                return reader;
+            const auto SEEK = seekSecondsForFrame(info, startFrame);
+            if (!SEEK) {
+                HXC_WARN("{}: cannot seek to frame {} exactly ({} is not intra-only, or its timestamps do not allow it); decoding from the start of the file instead", label, startFrame,
+                         info.codecName);
+                return reader;
+            }
+            reader.startFrame  = startFrame;
+            reader.seekSeconds = *SEEK;
+            return reader;
+        };
+
         std::vector<SPaneSources> panes(static_cast<size_t>(PANE_COUNT));
         for (int pane = 0; pane < PANE_COUNT; ++pane) {
             auto& SOURCES = panes[static_cast<size_t>(pane)];
@@ -221,7 +360,8 @@ namespace hxc {
 
             const size_t EYE = static_cast<size_t>(SOURCES.eye);
             if (BUNDLE.sources.overlay && EYE < BUNDLE.overlay.videoPaths.size() && !BUNDLE.overlay.videoPaths[EYE].empty()) {
-                SOURCES.overlay = CVideoReader::open(BUNDLE.overlay.videoPaths[EYE], BUNDLE.overlay.width, BUNDLE.overlay.height, error);
+                const auto READER = readerOptionsFor(BUNDLE.overlay.videoInfo[EYE], startFrameFor(BUNDLE.overlay.frameHostNs), BUNDLE.overlay.videoPaths[EYE]);
+                SOURCES.overlay   = CVideoReader::open(BUNDLE.overlay.videoPaths[EYE], BUNDLE.overlay.width, BUNDLE.overlay.height, error, READER);
                 if (!SOURCES.overlay) {
                     HXC_ERR("{}", error);
                     return 1;
@@ -233,7 +373,8 @@ namespace hxc {
                 if (!SOURCES.cameraMeta) {
                     HXC_WARN("no camera for eye {}; that pane gets the checker background", SOURCES.eye);
                 } else {
-                    SOURCES.camera = CVideoReader::open(SOURCES.cameraMeta->videoPath, SOURCES.cameraMeta->video.width, SOURCES.cameraMeta->video.height, error);
+                    const auto READER = readerOptionsFor(SOURCES.cameraMeta->video, startFrameFor(SOURCES.cameraMeta->hostNs), SOURCES.cameraMeta->videoPath);
+                    SOURCES.camera    = CVideoReader::open(SOURCES.cameraMeta->videoPath, SOURCES.cameraMeta->video.width, SOURCES.cameraMeta->video.height, error, READER);
                     if (!SOURCES.camera) {
                         HXC_ERR("{}", error);
                         return 1;
@@ -244,16 +385,21 @@ namespace hxc {
 
         // ---- audio ----------------------------------------------------------------
         SWriterSpec spec;
-        spec.outPath     = options.outPath;
+        spec.outPath     = outPath;
         spec.width       = paneWidth * PANE_COUNT;
         spec.height      = paneHeight;
         spec.fps         = fps;
         spec.videoCodec  = options.videoCodec;
         spec.crf         = options.crf;
         spec.preset      = options.preset;
+        spec.threads     = options.decodeThreads;
         spec.limiterCeiling = options.noLimiter ? 0.0 : 0.98;
+        // A worker writes a chunk of the same stereo pair, so its segment is
+        // signalled too - the frame-packing SEI has to be in the bitstream
+        // before the join stream-copies it.
+        spec.stereoSideBySide = options.eye == eEyeSelection::STEREO_SBS;
 
-        if (!options.noAudio) {
+        if (withAudio && !options.noAudio) {
             const auto place = [&](const SAudioTrack& track, double gain) {
                 SAudioMixInput input;
                 input.path  = track.path;
@@ -291,14 +437,14 @@ namespace hxc {
         report.fps         = fps;
         report.firstHostNs = T0;
         report.gpu         = gl->description();
-        report.frames.reserve(frameCount);
+        report.frames.reserve(endFrame - beginFrame);
 
         std::vector<uint8_t> composed;
         double               sidecarSeconds = 0.0;
-        const auto           STARTED        = SClock::now();
+        auto                 started        = SClock::now();
 
-        for (size_t k = 0; k < frameCount; ++k) {
-            const int64_t T_HOST = T0 + static_cast<int64_t>(std::llround(static_cast<double>(k) * 1e9 / fps));
+        for (size_t k = beginFrame; k < endFrame; ++k) {
+            const int64_t T_HOST = outputHostNs(PLAN, k);
 
             SRenderReport::SFrameRecord record;
             record.index   = k;
@@ -428,7 +574,7 @@ namespace hxc {
                 HXC_DEBUG("composed {} / {} frames", k, frameCount);
         }
 
-        report.wallSeconds = secondsSince(STARTED) - sidecarSeconds;
+        report.wallSeconds = secondsSince(started) - sidecarSeconds;
 
         if (!writer->finish(error)) {
             HXC_ERR("{}", error);
@@ -441,8 +587,385 @@ namespace hxc {
 
         HXC_INFO("composed {} frames of {}x{} in {:.2f} s = {:.1f} fps, {:.1f} Mpix/s (decode {:.2f} s, gpu {:.2f} s, encode {:.2f} s)", report.frames.size(), paneWidth * PANE_COUNT, paneHeight,
                  report.wallSeconds, report.framesPerSecond, report.megapixelsPerSecond, report.decodeSeconds, report.gpuSeconds, report.encodeSeconds);
-        HXC_INFO("wrote {}", options.outPath);
+        HXC_INFO("wrote {}", outPath);
+        return 0;
+        }
 
+        // How many workers, when the caller did not say. One - that is, none.
+        //
+        // This is a measured default, and it is not the one this code was written
+        // expecting. Segmenting only pays when the serial pipeline leaves the
+        // machine idle, and on the reference take it does not: a single-job render
+        // already keeps 17 to 20 of 24 hardware threads busy, because ffmpeg's
+        // ffv1 decode and x264's encode are each already multithreaded across the
+        // whole machine. Running two whole renders side by side takes exactly
+        // twice as long as running one (measured: 2.0x wall for 2x the work, 4.0x
+        // for 4x) - so there is no idle capacity for a second worker to take, and
+        // every worker added is pure overhead. Measured on the real bundle: --jobs
+        // 4 came in 1.07x *slower* than --jobs 1, --jobs 8 1.10x slower.
+        //
+        // The machinery stays because the conclusion is about this workload on
+        // this machine, not about the idea: --jobs pays wherever the per-frame
+        // cost is not already spread across every core (a GPU-bound composite at
+        // higher output resolutions, a hardware encoder that takes the encode off
+        // the CPU entirely), and --segment i/k is how a long take gets split
+        // across several machines or resumed after a failure. What it must not do
+        // is cost a user time by default.
+        //
+        // See NEXT-STEPS "Throughput" for the numbers and for where the time
+        // actually goes.
+        int defaultJobs() {
+            return 1;
+        }
+
+        // A worker's ffmpeg thread budget. The machine's hardware threads shared
+        // out, floored at one: K workers each asking ffmpeg for "all of them" is
+        // how a parallel decode ends up slower than a serial one.
+        int defaultDecodeThreads(int jobs) {
+            const unsigned THREADS = std::thread::hardware_concurrency();
+            if (jobs <= 1 || THREADS == 0)
+                return 0; // 0 = leave ffmpeg's own default, which is right when we are alone
+            return std::max(1, static_cast<int>(THREADS) / jobs);
+        }
+
+        // Rebuilds this run's command line for a worker, differing only in which
+        // chunk it renders and where it writes. Everything that could otherwise be
+        // re-derived differently - the pane size, the output rate, the frame limit
+        // - is passed explicitly, so a worker's plan cannot drift from the parent's
+        // even if a default changes underneath it.
+        std::vector<std::string> workerArgv(const std::string& binary, const SRenderOptions& options, const SRenderPlan& PLAN, int index, int count, const std::string& segmentPath,
+                                            const std::string& reportPath) {
+            const auto EYE_NAME = [&] {
+                switch (options.eye) {
+                    case eEyeSelection::LEFT: return "left";
+                    case eEyeSelection::RIGHT: return "right";
+                    default: return "stereo-sbs";
+                }
+            }();
+            const auto BACKGROUND_NAME = [&] {
+                switch (PLAN.background) {
+                    case eBackgroundChoice::CAMERA: return "camera";
+                    case eBackgroundChoice::SOLID: return "solid";
+                    default: return "checker";
+                }
+            }();
+
+            std::vector<std::string> argv{
+                binary,
+                "render",
+                options.take.string(),
+                "--out",
+                segmentPath,
+                "--segment",
+                std::format("{}/{}", index, count),
+                "--report",
+                reportPath,
+                "--eye",
+                EYE_NAME,
+                "--framing",
+                options.framing == eFraming::STABILIZED ? "stabilized" : "asis",
+                "--background",
+                BACKGROUND_NAME,
+                "--size",
+                std::format("{}x{}", PLAN.paneWidth, PLAN.paneHeight),
+                // {:.17g} round-trips a double exactly, so every worker's frame
+                // count arithmetic is bit-for-bit the parent's.
+                "--fps",
+                std::format("{:.17g}", PLAN.fps),
+                "--bg-depth",
+                std::format("{:.17g}", options.backgroundDepth),
+                "--fg-depth",
+                std::isinf(options.overlayDepth) ? std::string("inf") : std::format("{:.17g}", options.overlayDepth),
+                "--stabilize-ms",
+                std::format("{:.17g}", static_cast<double>(options.stabilizeSigmaNs) * 1e-6),
+                "--codec",
+                options.videoCodec,
+                "--crf",
+                std::to_string(options.crf),
+                "--preset",
+                options.preset,
+                "--decode-threads",
+                std::to_string(options.decodeThreads),
+                "--no-audio",
+            };
+            if (PLAN.frameCount > 0 && options.limitFrames > 0) {
+                argv.push_back("--limit");
+                argv.push_back(std::to_string(options.limitFrames));
+            }
+            if (!options.gpuHint.empty()) {
+                argv.push_back("--gpu");
+                argv.push_back(options.gpuHint);
+            }
+            if (!options.framesDir.empty()) {
+                argv.push_back("--frames-dir");
+                argv.push_back(options.framesDir);
+            }
+            if (!options.probeCachePath.empty()) {
+                argv.push_back("--probe-cache");
+                argv.push_back(options.probeCachePath);
+            }
+            argv.push_back(logEnabled(eLogLevel::DEBUG) ? "-v" : "-q");
+            return argv;
+        }
+
+        int runSegmented(const SRenderOptions& options, const SBundle& BUNDLE, const SRenderPlan& PLAN, const std::shared_ptr<CProbeCache>& probeCache, SRenderReport& report) {
+            const int JOBS = options.jobs;
+
+            std::string binary = options.workerBinary.empty() ? executablePath() : options.workerBinary;
+            if (binary.empty()) {
+                HXC_ERR("cannot find this executable to spawn segment workers; pass --worker-binary or --jobs 1");
+                return 1;
+            }
+
+            // Segments live beside the output, so the join is a rename-distance
+            // stream copy rather than a copy across filesystems, and so a run that
+            // dies leaves its debris somewhere the user will find it.
+            const fs::path OUT       = fs::absolute(options.outPath);
+            const fs::path EXTENSION = OUT.extension();
+            const fs::path WORK      = OUT.parent_path() / std::format(".{}.segments.{}", OUT.filename().string(), ::getpid());
+            std::error_code ec;
+            fs::create_directories(WORK, ec);
+            if (ec) {
+                HXC_ERR("cannot create the segment directory {}: {}", WORK.string(), ec.message());
+                return 1;
+            }
+            // Whatever happens below, the temporary files go away.
+            struct SCleanup {
+                fs::path path;
+                ~SCleanup() {
+                    std::error_code ec;
+                    fs::remove_all(path, ec);
+                }
+            } cleanup{WORK};
+
+            // What the parent already learned about every video in the take. The
+            // workers read this instead of demuxing gigabytes to recount frames
+            // their parent counted seconds ago - on a two-eye take that is 4.8 GB
+            // of pointless reading per worker, and it lands all at once.
+            SRenderOptions spawnOptions = options;
+            if (probeCache && probeCache->size() > 0) {
+                const std::string CACHE = (WORK / "probe.json").string();
+                std::string       error;
+                if (probeCache->write(CACHE, error))
+                    spawnOptions.probeCachePath = CACHE;
+                else
+                    HXC_WARN("{}; the workers will re-probe the take themselves", error);
+            }
+
+            std::vector<std::string>                  segmentPaths, reportPaths;
+            std::vector<std::unique_ptr<CSubprocess>> workers;
+            std::vector<std::pair<size_t, size_t>>    ranges;
+
+            HXC_INFO("segmenting {} output frames across {} worker(s), {} decode thread(s) each", PLAN.frameCount, JOBS, options.decodeThreads);
+
+            for (int i = 0; i < JOBS; ++i) {
+                const auto RANGE = segmentRange(PLAN.frameCount, i, JOBS);
+                ranges.push_back(RANGE);
+                if (RANGE.first >= RANGE.second) {
+                    // More workers than frames. Nothing to do for this one.
+                    segmentPaths.emplace_back();
+                    reportPaths.emplace_back();
+                    workers.emplace_back();
+                    continue;
+                }
+
+                segmentPaths.push_back((WORK / std::format("seg{:03}{}", i, EXTENSION.string())).string());
+                reportPaths.push_back((WORK / std::format("seg{:03}.json", i)).string());
+
+                std::string error;
+                auto        worker = CSubprocess::spawn(workerArgv(binary, spawnOptions, PLAN, i, JOBS, segmentPaths.back(), reportPaths.back()), {}, error);
+                if (!worker) {
+                    HXC_ERR("cannot start segment worker {}: {}", i, error);
+                    for (auto& RUNNING : workers) {
+                        if (RUNNING)
+                            RUNNING->terminate();
+                    }
+                    return 1;
+                }
+                workers.push_back(std::move(worker));
+            }
+
+            bool   failed = false;
+            size_t done   = 0;
+            for (int i = 0; i < JOBS; ++i) {
+                if (!workers[static_cast<size_t>(i)])
+                    continue;
+                const int STATUS = workers[static_cast<size_t>(i)]->wait();
+                if (STATUS != 0) {
+                    HXC_ERR("segment worker {} (frames {}..{}) exited with status {}", i, ranges[static_cast<size_t>(i)].first, ranges[static_cast<size_t>(i)].second, STATUS);
+                    failed = true;
+                    // The survivors are now composing frames nobody will read.
+                    for (int j = i + 1; j < JOBS; ++j) {
+                        if (workers[static_cast<size_t>(j)])
+                            workers[static_cast<size_t>(j)]->terminate();
+                    }
+                    break;
+                }
+                done += ranges[static_cast<size_t>(i)].second - ranges[static_cast<size_t>(i)].first;
+                HXC_INFO("segment {}/{} done ({} of {} frames composed)", i + 1, JOBS, done, PLAN.frameCount);
+            }
+            if (failed)
+                return 1;
+
+            // Fold the workers' reports into one describing the whole take.
+            for (size_t i = 0; i < reportPaths.size(); ++i) {
+                if (reportPaths[i].empty())
+                    continue;
+                std::ifstream     stream(reportPaths[i]);
+                std::stringstream text;
+                text << stream.rdbuf();
+                SRenderReport segment;
+                std::string   error;
+                if (!SRenderReport::fromJson(text.str(), segment, error)) {
+                    HXC_WARN("segment {}: {}", i, error);
+                    continue;
+                }
+                if (report.gpu.empty())
+                    report.gpu = segment.gpu;
+                report.frames.insert(report.frames.end(), segment.frames.begin(), segment.frames.end());
+                // Worker times are concurrent, so these sum to more than the wall
+                // clock. That is what they are for: they say where the machine's
+                // time went, not how long the user waited.
+                report.decodeSeconds += segment.decodeSeconds;
+                report.gpuSeconds    += segment.gpuSeconds;
+                report.encodeSeconds += segment.encodeSeconds;
+            }
+
+            // ---- the join ---------------------------------------------------------
+            SWriterSpec spec;
+            spec.outPath        = options.outPath;
+            spec.width          = PLAN.paneWidth * static_cast<int>(PLAN.paneEyes.size());
+            spec.height         = PLAN.paneHeight;
+            spec.fps            = PLAN.fps;
+            spec.videoCodec     = options.videoCodec;
+            spec.crf            = options.crf;
+            spec.preset         = options.preset;
+            spec.limiterCeiling = options.noLimiter ? 0.0 : 0.98;
+            spec.stereoSideBySide = options.eye == eEyeSelection::STEREO_SBS;
+
+            if (!options.noAudio) {
+                const auto place = [&](const SAudioTrack& track, double gain) {
+                    SAudioMixInput input;
+                    input.path        = track.path;
+                    input.gain        = gain;
+                    input.label       = track.role;
+                    input.startSample = static_cast<int64_t>(std::llround(static_cast<double>(track.startHostNs - PLAN.t0) * 1e-9 * spec.audioSampleRate));
+                    HXC_INFO("audio {}: starts {:+.3f} ms into the take -> sample {:+}", track.role, static_cast<double>(track.startHostNs - PLAN.t0) * 1e-6, input.startSample);
+                    spec.audio.push_back(input);
+                    report.audio.push_back({track.role, input.startSample, gain});
+                };
+                if (BUNDLE.appAudio)
+                    place(*BUNDLE.appAudio, 1.0);
+                if (BUNDLE.mic)
+                    place(*BUNDLE.mic, options.micGain);
+            }
+
+            std::vector<std::string> present;
+            for (const auto& PATH : segmentPaths) {
+                if (!PATH.empty())
+                    present.push_back(PATH);
+            }
+
+            std::string error;
+            if (!concatSegments(present, spec, error)) {
+                HXC_ERR("{}", error);
+                return 1;
+            }
+            return 0;
+        }
+
+    }
+
+    int runRender(const SRenderOptions& options, SRenderReport* reportOut) {
+        SRenderReport report;
+        report.framing = framingName(options.framing);
+
+        const auto STARTED = SClock::now();
+
+        CDiagnostics diags;
+        SLoadOptions load;
+        // A worker reads what its parent already learned. A parent collects, so
+        // it has something to hand over.
+        load.probeCache     = options.probeCachePath.empty() ? std::make_shared<CProbeCache>() : CProbeCache::read(options.probeCachePath);
+        const auto   LOADED = SBundle::load(options.take, diags, load);
+        diags.print();
+        if (!LOADED) {
+            HXC_ERR("cannot open the bundle");
+            return 2;
+        }
+        if (diags.hasErrors()) {
+            HXC_ERR("the bundle has {} error(s); fix them or inspect with `hypxrcompose validate`", diags.errorCount());
+            return 1;
+        }
+        const SBundle& BUNDLE = *LOADED;
+        if (logEnabled(eLogLevel::INFO))
+            std::fputs(describeBundle(BUNDLE).c_str(), stdout);
+
+        if (BUNDLE.telemetry.empty()) {
+            HXC_ERR("the take holds no telemetry; there is nothing to compose against");
+            return 1;
+        }
+
+        SRenderPlan plan;
+        if (!makePlan(options, BUNDLE, plan))
+            return 1;
+
+        SRenderOptions effective = options;
+        int            status    = 0;
+
+        if (options.segmentCount > 0) {
+            // A worker. One chunk, no audio, no further segmenting.
+            const auto RANGE = segmentRange(plan.frameCount, options.segmentIndex, options.segmentCount);
+            HXC_INFO("segment {}/{}: output frames [{}, {})", options.segmentIndex, options.segmentCount, RANGE.first, RANGE.second);
+            report.jobs = 1;
+            status      = composeRange(effective, BUNDLE, plan, RANGE.first, RANGE.second, options.outPath, false, report);
+        } else {
+            if (effective.jobs <= 0)
+                effective.jobs = defaultJobs();
+            // Nothing to gain from splitting fewer frames than workers, and a
+            // segment shorter than a second or so is all fixed cost.
+            effective.jobs = std::max(1, std::min<int>(effective.jobs, static_cast<int>(plan.frameCount)));
+            if (effective.decodeThreads <= 0)
+                effective.decodeThreads = defaultDecodeThreads(effective.jobs);
+            report.jobs = effective.jobs;
+
+            if (effective.jobs <= 1)
+                status = composeRange(effective, BUNDLE, plan, 0, plan.frameCount, options.outPath, true, report);
+            else
+                status = runSegmented(effective, BUNDLE, plan, load.probeCache, report);
+        }
+
+        if (status != 0)
+            return status;
+
+        // A segmented run has no single loop to have timed itself, and its
+        // workers' wall clocks overlap anyway, so the parent fills the geometry
+        // in from the plan and reports the time the user actually waited through
+        // - bundle load and join included.
+        if (report.jobs > 1) {
+            report.paneWidth   = plan.paneWidth;
+            report.paneHeight  = plan.paneHeight;
+            report.paneCount   = static_cast<int>(plan.paneEyes.size());
+            report.fps         = plan.fps;
+            report.firstHostNs = plan.t0;
+            report.wallSeconds = secondsSince(STARTED);
+        }
+
+        if (report.wallSeconds > 0.0) {
+            const double MEGAPIXELS    = static_cast<double>(report.frames.size()) * static_cast<double>(report.paneWidth * report.paneCount) * static_cast<double>(report.paneHeight) * 1e-6;
+            report.framesPerSecond     = static_cast<double>(report.frames.size()) / report.wallSeconds;
+            report.megapixelsPerSecond = MEGAPIXELS / report.wallSeconds;
+        }
+
+        if (report.jobs > 1) {
+            HXC_INFO("composed {} frames of {}x{} in {:.2f} s across {} worker(s) = {:.1f} fps, {:.1f} Mpix/s (machine time: decode {:.2f} s, gpu {:.2f} s, encode {:.2f} s)", report.frames.size(),
+                     report.paneWidth * report.paneCount, report.paneHeight, report.wallSeconds, report.jobs, report.framesPerSecond, report.megapixelsPerSecond, report.decodeSeconds,
+                     report.gpuSeconds, report.encodeSeconds);
+            HXC_INFO("wrote {}", options.outPath);
+        }
+
+        // A worker writes one too: it is how the parent learns what its segment
+        // composed, and it is the same document, just narrower.
         if (!options.reportPath.empty()) {
             std::ofstream stream(options.reportPath);
             if (!stream)

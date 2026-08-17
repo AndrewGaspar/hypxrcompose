@@ -9,6 +9,7 @@
 #include "Ffmpeg.hpp"
 #include "Harness.hpp"
 #include "Log.hpp"
+#include "Process.hpp"
 #include "Render.hpp"
 #include "Stabilize.hpp"
 
@@ -16,6 +17,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <set>
 
 using namespace hxc;
 using namespace hxctest;
@@ -745,13 +747,34 @@ TEST(EndToEnd, QuadRecordsRoundTripWithHeadRelativePoses) {
     ASSERT_FALSE(FIX.bundle.telemetry.empty());
     for (const auto& RECORD : FIX.bundle.telemetry) {
         ASSERT_TRUE(RECORD.hasQuadsArray);
-        ASSERT_EQ(RECORD.quads.size(), 2u);
+        ASSERT_EQ(RECORD.quads.size(), 3u);
         EXPECT_EQ(RECORD.quads[0].index, 0);
         EXPECT_EQ(RECORD.quads[1].index, 1);
+        EXPECT_EQ(RECORD.quads[2].index, 2);
         EXPECT_FALSE(RECORD.quads[0].name.has_value()) << "the producer sends null names for now";
-        EXPECT_FALSE(RECORD.quads[0].viewSpace) << "index 0 is the room-anchored monitor";
-        EXPECT_TRUE(RECORD.quads[1].viewSpace) << "index 1 is the head-locked HUD";
+        EXPECT_FALSE(RECORD.quads[0].viewSpace) << "indices 0 and 1 are the room-anchored monitor's per-eye pair";
+        EXPECT_FALSE(RECORD.quads[1].viewSpace);
+        EXPECT_TRUE(RECORD.quads[2].viewSpace) << "index 2 is the head-locked HUD";
         EXPECT_TRUE(RECORD.head.has_value()) << "quad poses are relative to this";
+
+        // The pinned reading of `visibility`: an eye mask, not an opacity. The
+        // monitor's pair is one quad per eye sharing a pose and splitting a
+        // side-by-side swapchain; the HUD goes to both.
+        EXPECT_EQ(RECORD.quads[0].eyeVisibility, eEyeVisibility::LEFT);
+        EXPECT_EQ(RECORD.quads[1].eyeVisibility, eEyeVisibility::RIGHT);
+        EXPECT_EQ(RECORD.quads[2].eyeVisibility, eEyeVisibility::BOTH);
+        EXPECT_TRUE(RECORD.quads[0].composedInEye(0));
+        EXPECT_FALSE(RECORD.quads[0].composedInEye(1));
+        EXPECT_FALSE(RECORD.quads[1].composedInEye(0));
+        EXPECT_TRUE(RECORD.quads[1].composedInEye(1));
+        EXPECT_TRUE(RECORD.quads[2].composedInEye(0));
+        EXPECT_TRUE(RECORD.quads[2].composedInEye(1));
+        // A per-eye pair is the same layer twice, so the poses must agree; only
+        // the swapchain sub-rect differs.
+        EXPECT_LT((RECORD.quads[0].pose.pos - RECORD.quads[1].pose.pos).length(), 1e-12);
+        ASSERT_TRUE(RECORD.quads[0].hasRect);
+        ASSERT_TRUE(RECORD.quads[1].hasRect);
+        EXPECT_LT(RECORD.quads[0].rect[0], RECORD.quads[1].rect[0]) << "the pair takes opposite halves of one swapchain";
     }
 
     // The room-anchored layer: head * pose must land on the same STAGE pose at
@@ -771,9 +794,309 @@ TEST(EndToEnd, QuadRecordsRoundTripWithHeadRelativePoses) {
 
     // And the head-locked layer is the opposite: constant head-relative, so its
     // STAGE pose must move with the head rather than stay put.
-    const SPose FIRST = FIX.bundle.telemetry.front().quads[1].worldPose(FIX.bundle.telemetry.front().headPose());
-    const SPose LATER = FIX.bundle.telemetry[45].quads[1].worldPose(FIX.bundle.telemetry[45].headPose());
+    const SPose FIRST = FIX.bundle.telemetry.front().quads[2].worldPose(FIX.bundle.telemetry.front().headPose());
+    const SPose LATER = FIX.bundle.telemetry[45].quads[2].worldPose(FIX.bundle.telemetry[45].headPose());
     for (const auto& RECORD : FIX.bundle.telemetry)
-        EXPECT_LT((RECORD.quads[1].pose.pos - FIX.scene.hudQuad.pos).length(), 1e-9) << "the head-locked pose must be recorded unchanged";
+        EXPECT_LT((RECORD.quads[2].pose.pos - FIX.scene.hudQuad.pos).length(), 1e-9) << "the head-locked pose must be recorded unchanged";
     EXPECT_GT((LATER.pos - FIRST.pos).length(), 1e-3) << "a head-locked layer's STAGE pose must follow the head";
+}
+
+// ---------------------------------------------------------------------------
+// 14. Throughput, and the two claims it rests on.
+//
+// `validate` counts an overlay's frames from the container's packet index
+// rather than by decoding it, and a segmented render composes chunks of the
+// timeline in parallel worker processes. Both are only allowed to be faster if
+// they are also the same. These tests are where "the same" is checked.
+// ---------------------------------------------------------------------------
+
+// Proves: the fast frame count and the slow one agree. `validate` trusts the
+// packet count for the alignment rule - the n-th frame is the n-th undropped
+// record - so if a packet were ever not a frame, the arbiter would be wrong
+// about the one thing it exists to arbitrate.
+TEST(EndToEnd, PacketCountedFramesAgreeWithADeepDecode) {
+    const auto& FIX = fixture();
+
+    CDiagnostics indexDiags, deepDiags;
+    const auto   INDEXED = SBundle::load(FIX.take, indexDiags, SLoadOptions{.probeMedia = true, .probeDepth = eProbeDepth::INDEX, .checksum = false, .probeCache = nullptr});
+    const auto   DEEP    = SBundle::load(FIX.take, deepDiags, SLoadOptions{.probeMedia = true, .probeDepth = eProbeDepth::DEEP, .checksum = false, .probeCache = nullptr});
+
+    ASSERT_TRUE(INDEXED.has_value());
+    ASSERT_TRUE(DEEP.has_value());
+    EXPECT_FALSE(indexDiags.hasErrors());
+    EXPECT_FALSE(deepDiags.hasErrors());
+
+    ASSERT_EQ(INDEXED->overlay.videoInfo.size(), DEEP->overlay.videoInfo.size());
+    ASSERT_FALSE(INDEXED->overlay.videoInfo.empty());
+    for (size_t eye = 0; eye < INDEXED->overlay.videoInfo.size(); ++eye) {
+        const auto& FAST = INDEXED->overlay.videoInfo[eye];
+        const auto& SLOW = DEEP->overlay.videoInfo[eye];
+        EXPECT_TRUE(FAST.intraOnly) << "the overlay encoders in the contract are all intra-only; that is what makes a packet a frame";
+        EXPECT_EQ(FAST.ptsNs.size(), SLOW.ptsNs.size()) << "eye " << eye << ": counting packets and counting decoded frames must agree";
+        EXPECT_EQ(FAST.ptsNs, SLOW.ptsNs) << "eye " << eye << ": and so must the timestamps";
+        // The count the alignment rule is checked against.
+        EXPECT_EQ(FAST.ptsNs.size(), INDEXED->overlay.frameTelemetryIndex.size());
+    }
+
+    ASSERT_EQ(INDEXED->cameras.size(), DEEP->cameras.size());
+    for (size_t i = 0; i < INDEXED->cameras.size(); ++i)
+        EXPECT_EQ(INDEXED->cameras[i].video.ptsNs.size(), DEEP->cameras[i].video.ptsNs.size()) << "camera " << INDEXED->cameras[i].key;
+
+    std::cout << "[measured] overlay eye0: " << INDEXED->overlay.videoInfo[0].ptsNs.size() << " frames from the container index, " << DEEP->overlay.videoInfo[0].ptsNs.size()
+              << " from a full decode\n";
+}
+
+// Proves: a decoder seeked to frame f emits exactly the frames a decoder run
+// from the start emits from f onward, pixel for pixel, and numbers them the
+// same. This is the whole basis of a segment worker: it starts partway along
+// the source and must land on precisely the frame the ordinal rule assigns to
+// its first output instant.
+TEST(EndToEnd, SeekingToAnOrdinalFrameGivesTheSamePixelsAsDecodingToIt) {
+    const auto& FIX = fixture();
+    ASSERT_FALSE(FIX.bundle.overlay.videoPaths.empty());
+
+    const std::string PATH   = FIX.bundle.overlay.videoPaths[0];
+    const auto&       INFO   = FIX.bundle.overlay.videoInfo[0];
+    const int         WIDTH  = FIX.bundle.overlay.width;
+    const int         HEIGHT = FIX.bundle.overlay.height;
+    ASSERT_GT(INFO.ptsNs.size(), 8u);
+
+    std::string error;
+    auto        sequential = CVideoReader::open(PATH, WIDTH, HEIGHT, error);
+    ASSERT_TRUE(sequential) << error;
+
+    // Every frame, decoded the slow way, kept for comparison.
+    std::vector<std::vector<uint8_t>> reference;
+    for (size_t i = 0; i < INFO.ptsNs.size(); ++i) {
+        ASSERT_TRUE(sequential->advanceTo(i, error)) << error;
+        ASSERT_EQ(sequential->currentIndex().value(), i);
+        reference.push_back(sequential->rgba());
+    }
+
+    // Every start, and the whole tail from each - not a sample of either.
+    //
+    // A weaker version of this test passed while the compositor was quietly
+    // wrong: checking only the first few frames after a seek missed that
+    // ffmpeg's default constant-frame-rate conversion emits one *extra* frame
+    // after `-ss` and slips the sequence by one several frames later. A seek is
+    // only correct if everything after it is.
+    size_t checked = 0;
+    for (size_t start = 1; start < INFO.ptsNs.size(); ++start) {
+        const auto SEEK = seekSecondsForFrame(INFO, start);
+        ASSERT_TRUE(SEEK.has_value()) << "an intra-only source must be seekable to any frame; frame " << start;
+
+        SReaderOptions options;
+        options.startFrame  = start;
+        options.seekSeconds = *SEEK;
+        auto seeked         = CVideoReader::open(PATH, WIDTH, HEIGHT, error, options);
+        ASSERT_TRUE(seeked) << error;
+
+        for (size_t i = start; i < INFO.ptsNs.size(); ++i) {
+            ASSERT_TRUE(seeked->advanceTo(i, error)) << error;
+            ASSERT_EQ(seeked->currentIndex().value(), i) << "a seeked reader must number its frames on the whole-file timeline";
+            ASSERT_EQ(seeked->rgba(), reference[i]) << "frame " << i << " reached by seeking to " << start << " differs from the same frame decoded from the start";
+            ++checked;
+        }
+        // And the seek must be a jump, not a silent decode from zero.
+        EXPECT_LE(seeked->framesDecoded(), INFO.ptsNs.size() - start) << "seeking to frame " << start << " decoded frames before it";
+    }
+    std::cout << "[measured] " << checked << " seeked frames across " << INFO.ptsNs.size() - 1 << " start points matched their sequentially decoded originals byte for byte\n";
+}
+
+TEST(EndToEnd, SegmentRangesTileTheTimelineExactly) {
+    for (size_t frames : {size_t{1}, size_t{7}, size_t{45}, size_t{4137}}) {
+        for (int jobs : {1, 2, 3, 4, 8, 12}) {
+            size_t next = 0;
+            size_t widest = 0, narrowest = frames + 1;
+            for (int i = 0; i < jobs; ++i) {
+                const auto RANGE = segmentRange(frames, i, jobs);
+                EXPECT_EQ(RANGE.first, next) << "frames=" << frames << " jobs=" << jobs << " segment " << i << " must start where the last one ended";
+                EXPECT_LE(RANGE.first, RANGE.second);
+                next = RANGE.second;
+                if (RANGE.second > RANGE.first) {
+                    widest    = std::max(widest, RANGE.second - RANGE.first);
+                    narrowest = std::min(narrowest, RANGE.second - RANGE.first);
+                }
+            }
+            EXPECT_EQ(next, frames) << "frames=" << frames << " jobs=" << jobs << ": the segments must cover the whole timeline";
+            if (narrowest <= frames) {
+                EXPECT_LE(widest - narrowest, 1u) << "frames=" << frames << " jobs=" << jobs << ": chunk sizes must differ by at most one";
+            }
+        }
+    }
+}
+
+// Proves: --jobs changes how long a render takes and nothing else. The output
+// is compared after decoding, because that is where the guarantee lives: K
+// encoders each start cold, so the *bitstreams* differ even for a lossless
+// codec, while the pixels they carry must not.
+TEST(EndToEnd, ASegmentedRenderComposesTheSameFramesAsASingleJob) {
+    const auto& FIX = fixture();
+
+    const auto render = [&](const std::string& name, int jobs) {
+        SRenderOptions options;
+        options.take    = FIX.take;
+        options.outPath = (scratchRoot() / (name + ".mkv")).string();
+        options.width   = PANE_WIDTH;
+        options.height  = PANE_HEIGHT;
+        options.noAudio = true;
+        // Lossless, so "the same decoded pixels" is a statement about the
+        // compositor rather than about two encoders' rate decisions.
+        options.videoCodec = "ffv1";
+        options.jobs       = jobs;
+        // The workers are copies of this program, and this program is the test
+        // binary; CMake hands over the real one.
+        options.workerBinary = HYPXRCOMPOSE_BINARY;
+
+        SRenderReport report;
+        setLogLevel(eLogLevel::WARN);
+        const int STATUS = runRender(options, &report);
+        setLogLevel(eLogLevel::INFO);
+        EXPECT_EQ(STATUS, 0) << name;
+        return std::pair{options.outPath, report};
+    };
+
+    const auto [SINGLE_PATH, SINGLE] = render("segment-single", 1);
+    const auto [MANY_PATH, MANY]     = render("segment-many", 4);
+
+    ASSERT_FALSE(SINGLE.frames.empty());
+    ASSERT_EQ(SINGLE.frames.size(), MANY.frames.size()) << "a segmented render must compose every frame the serial one does, and no others";
+    EXPECT_EQ(MANY.jobs, 4);
+
+    // 1. The timeline: every output frame drew on the same sources.
+    for (size_t k = 0; k < SINGLE.frames.size(); ++k) {
+        const auto& A = SINGLE.frames[k];
+        const auto& B = MANY.frames[k];
+        ASSERT_EQ(A.index, B.index) << "frame " << k;
+        EXPECT_EQ(A.tHostNs, B.tHostNs) << "frame " << k << ": the output instant must not depend on which worker computed it";
+        EXPECT_EQ(A.telemetryIndex, B.telemetryIndex) << "frame " << k;
+        EXPECT_EQ(A.overlayFrame, B.overlayFrame) << "frame " << k << ": a worker that seeked must land on the ordinal rule's frame";
+        EXPECT_EQ(A.overlayTelemetryIndex, B.overlayTelemetryIndex) << "frame " << k;
+        EXPECT_EQ(A.cameraFrame, B.cameraFrame) << "frame " << k;
+    }
+
+    // 2. The pixels.
+    std::string error;
+    const int   WIDTH  = SINGLE.paneWidth * SINGLE.paneCount;
+    const int   HEIGHT = SINGLE.paneHeight;
+    auto        single = CVideoReader::open(SINGLE_PATH, WIDTH, HEIGHT, error);
+    ASSERT_TRUE(single) << error;
+    auto many = CVideoReader::open(MANY_PATH, WIDTH, HEIGHT, error);
+    ASSERT_TRUE(many) << error;
+
+    // 2. The pixels.
+    //
+    // Nearly every frame comes back byte-identical, and the handful that do not
+    // differ by an LSB or two on a few pixels out of ~170000. That residue is
+    // the GPU's, not the compositor's: the same binary rendering the same range
+    // twice is bit-exact (checked while chasing this), so what varies is only
+    // how equal two *processes* can be made, and neither uploading through one
+    // path, nor allocating every texture up front, nor composing a throwaway
+    // frame first moved it. It shows up only where the background is a
+    // photographic camera texture; a synthetic flat overlay hides it.
+    //
+    // So the assertion is a tight numeric bound rather than equality, and the
+    // bound is chosen to be far below any real defect. For scale: a genuine
+    // off-by-one in the segment seek - a real bug this test caught - missed by
+    // ~10000 pixels at 161 LSB. This allows <0.1% of pixels at <=4 LSB, three
+    // orders of magnitude tighter, and the frame-by-frame source mapping
+    // checked above is exact regardless.
+    size_t exact = 0, approximate = 0;
+    size_t worstPixels = 0;
+    int    worstDelta  = 0;
+    for (size_t k = 0; k < SINGLE.frames.size(); ++k) {
+        ASSERT_TRUE(single->advanceTo(k, error)) << error;
+        ASSERT_TRUE(many->advanceTo(k, error)) << error;
+        const auto& A = single->rgba();
+        const auto& B = many->rgba();
+        ASSERT_EQ(A.size(), B.size());
+
+        if (A == B) {
+            ++exact;
+            continue;
+        }
+
+        size_t differingPixels = 0;
+        int    maxDelta        = 0;
+        for (size_t i = 0; i < A.size(); i += 4) {
+            int delta = 0;
+            for (size_t c = 0; c < 4; ++c)
+                delta = std::max(delta, std::abs(static_cast<int>(A[i + c]) - static_cast<int>(B[i + c])));
+            if (delta > 0) {
+                ++differingPixels;
+                maxDelta = std::max(maxDelta, delta);
+            }
+        }
+        const size_t PIXELS = A.size() / 4;
+        EXPECT_LE(maxDelta, 4) << "output frame " << k << ": --jobs may cost an LSB or two of GPU reproducibility, not " << maxDelta << " - that is a composite that differs, not a rounding";
+        EXPECT_LT(static_cast<double>(differingPixels) / static_cast<double>(PIXELS), 0.001)
+            << "output frame " << k << ": " << differingPixels << " of " << PIXELS << " pixels differ, far too many to be texture reproducibility";
+        worstPixels = std::max(worstPixels, differingPixels);
+        worstDelta  = std::max(worstDelta, maxDelta);
+        ++approximate;
+    }
+
+    EXPECT_EQ(exact + approximate, SINGLE.frames.size());
+    std::cout << "[measured] " << exact << " of " << SINGLE.frames.size() << " frames byte-identical between --jobs 1 and --jobs 4; the other " << approximate << " within " << worstDelta
+              << " LSB on at most " << worstPixels << " pixel(s) of " << (SINGLE.paneWidth * SINGLE.paneCount * SINGLE.paneHeight) << "\n";
+}
+
+// Proves: a side-by-side render says so in the file, and a mono one does not.
+//
+// Reported from the first real stereo take: the output was a correct SBS pair
+// that no player could recognize as one, because nothing in the container or the
+// bitstream said "side by side". The XR desktop auto-tags stereo windows off
+// exactly these signals, so our own output failed our own pipeline.
+TEST(EndToEnd, StereoSideBySideOutputCarriesStereoSignalling) {
+    const auto& FIX = fixture();
+
+    const auto renderTo = [&](const std::string& name, eEyeSelection eye) {
+        SRenderOptions options;
+        options.take        = FIX.take;
+        options.outPath     = (scratchRoot() / name).string();
+        options.width       = 160;
+        options.height      = 120;
+        options.eye         = eye;
+        options.noAudio     = true;
+        options.limitFrames = 6;
+        setLogLevel(eLogLevel::WARN);
+        const int STATUS = runRender(options);
+        setLogLevel(eLogLevel::INFO);
+        EXPECT_EQ(STATUS, 0) << name;
+        return options.outPath;
+    };
+
+    // Matroska carries StereoMode in the container; ffprobe reads it back as a
+    // stream tag. This is the signal mpv and the XR desktop's window tagging use.
+    const auto matroskaTag = [](const std::string& path) {
+        std::string text, error;
+        runCapture({"ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream_tags=stereo_mode", "-of", "csv=p=0", path}, text, error);
+        while (!text.empty() && (text.back() == '\n' || text.back() == ',' || text.back() == '\r'))
+            text.pop_back();
+        return text;
+    };
+    // MP4 has no tag ffmpeg's mov muxer will take, so the signal lives in the
+    // bitstream as frame-packing SEI and surfaces as a frame side data.
+    const auto hasStereoSideData = [](const std::string& path) {
+        std::string text, error;
+        runCapture({"ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1", "-show_frames", "-of", "default", path}, text, error);
+        return text.find("side_data_type=Stereo 3D") != std::string::npos;
+    };
+
+    const std::string SBS_MKV  = renderTo("stereo-signal.mkv", eEyeSelection::STEREO_SBS);
+    const std::string SBS_MP4  = renderTo("stereo-signal.mp4", eEyeSelection::STEREO_SBS);
+    const std::string MONO_MKV = renderTo("mono-signal.mkv", eEyeSelection::LEFT);
+    const std::string MONO_MP4 = renderTo("mono-signal.mp4", eEyeSelection::LEFT);
+
+    EXPECT_EQ(matroskaTag(SBS_MKV), "left_right") << "a stereo .mkv must carry StereoMode left_right";
+    EXPECT_TRUE(hasStereoSideData(SBS_MKV)) << "and the frame-packing SEI too, since libx264 can write it";
+    EXPECT_TRUE(hasStereoSideData(SBS_MP4)) << "a stereo .mp4 must carry frame-packing SEI, arrangement type 3";
+
+    // A wrong stereo flag is worse than none: a mono take tagged side-by-side
+    // shows as two half-width pictures in anything that honours the signal.
+    EXPECT_EQ(matroskaTag(MONO_MKV), "") << "a mono render must not claim to be stereo";
+    EXPECT_FALSE(hasStereoSideData(MONO_MKV));
+    EXPECT_FALSE(hasStereoSideData(MONO_MP4));
+
+    std::cout << "[measured] stereo .mkv: StereoMode=" << matroskaTag(SBS_MKV) << " + frame-packing SEI; stereo .mp4: frame-packing SEI; mono: neither\n";
 }

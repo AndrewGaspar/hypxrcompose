@@ -403,21 +403,25 @@ namespace hxc {
                 // with its fixed STAGE pose and therefore changes every record; the
                 // HUD is head-locked, so its recorded pose is constant.
                 //
-                // The two quads deliberately spell `visibility` the two ways the
-                // wild does: the monitor as a numeric opacity (the contract's
-                // original reading) and the HUD as an XrEyeVisibility string (what
-                // HypXRland actually stamps). A bundle that exercises only one
-                // spelling cannot catch a loader that only understands one.
+                // `visibility` is an XrEyeVisibility, and the primary case is the
+                // per-eye pair a stereo-depth desktop submits: two quads sharing
+                // one pose, one composed into each eye, taking opposite halves of
+                // a side-by-side swapchain. The HUD is the other case, `both`.
+                // The deprecated boolean/numeric spelling is exercised in the unit
+                // tests instead, so that the bundle every end-to-end test shares
+                // validates without a deprecation warning.
                 const SPose MONITOR_RELATIVE = HEAD.inverse().compose(scene.overlayQuad);
-                const auto  quadJson         = [&](int index, const SPose& pose, double width, double height, bool viewSpace, int swapchain, const std::string& visibility) {
-                    return std::format(R"({{"index":{},"name":null,"pose":{},"size":[{},{}],"visibility":{},"view_space":{},"swapchain":{},"image":{},"array_layer":0,"rect":[0,0,{},{}]}})", index,
-                                       poseJson(pose), jsonDouble(width), jsonDouble(height), visibility, viewSpace ? "true" : "false", swapchain, k % 3, scene.overlayWidth, scene.overlayHeight);
+                const auto  quadJson         = [&](int index, const SPose& pose, double width, double height, bool viewSpace, int swapchain, const char* visibility, int rectX) {
+                    return std::format(R"({{"index":{},"name":null,"pose":{},"size":[{},{}],"visibility":"{}","view_space":{},"swapchain":{},"image":{},"array_layer":0,"rect":[{},0,{},{}]}})", index,
+                                       poseJson(pose), jsonDouble(width), jsonDouble(height), visibility, viewSpace ? "true" : "false", swapchain, k % 3, rectX, scene.overlayWidth,
+                                       scene.overlayHeight);
                 };
 
                 const bool CAPTURED = CAPTURED_RECORDS.count(k) > 0;
-                telemetry << std::format(R"({{"t_host_ns":{},"frame":{},"eyes":[{}],"head":{},"quads":[{},{}],"stage_correction":{},"blend_mode":"alpha","dropped":{}}})", T_HOST, k, eyes,
-                                         poseJson(HEAD), quadJson(0, MONITOR_RELATIVE, scene.quadWidth, scene.quadHeight, false, 7, "1.0"),
-                                         quadJson(1, scene.hudQuad, scene.hudWidth, scene.hudHeight, true, 9, R"("both")"), poseJson(STAGE_CORRECTION), CAPTURED ? "false" : "true")
+                telemetry << std::format(R"({{"t_host_ns":{},"frame":{},"eyes":[{}],"head":{},"quads":[{},{},{}],"stage_correction":{},"blend_mode":"alpha","dropped":{}}})", T_HOST, k, eyes,
+                                         poseJson(HEAD), quadJson(0, MONITOR_RELATIVE, scene.quadWidth, scene.quadHeight, false, 7, "left", 0),
+                                         quadJson(1, MONITOR_RELATIVE, scene.quadWidth, scene.quadHeight, false, 7, "right", scene.overlayWidth),
+                                         quadJson(2, scene.hudQuad, scene.hudWidth, scene.hudHeight, true, 9, "both", 0), poseJson(STAGE_CORRECTION), CAPTURED ? "false" : "true")
                           << "\n";
             }
 
