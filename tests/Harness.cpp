@@ -95,7 +95,7 @@ namespace hxctest {
 
     namespace {
 
-        SFixture buildFixture(const std::string& name, double clockOffsetMs) {
+        SFixture buildFixture(const std::string& name, double clockOffsetMs, const std::string& alpha = "premultiplied") {
             SFixture fixture;
             fixture.take = scratchRoot() / (name + ".hypxrtake");
 
@@ -112,6 +112,7 @@ namespace hxctest {
             // "what would a compositor that ignored the clock have picked?"
             // assertion an exact integer rather than a rounding argument.
             fixture.options.clockOffsetMs = clockOffsetMs;
+            fixture.options.alpha         = alpha;
             fixture.options.quiet         = true;
 
             if (!fs::exists(fixture.take / "manifest.json")) {
@@ -146,6 +147,11 @@ namespace hxctest {
 
     const SFixture& zeroOffsetFixture() {
         static const SFixture FIXTURE = buildFixture("zero-offset", 0.0);
+        return FIXTURE;
+    }
+
+    const SFixture& straightAlphaFixture() {
+        static const SFixture FIXTURE = buildFixture("straight-alpha", 200.0, "straight");
         return FIXTURE;
     }
 

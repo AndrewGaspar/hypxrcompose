@@ -266,3 +266,40 @@ TEST(Fov, RejectsFrustaThatAreNotUsable) {
     EXPECT_FALSE((SFov{-1.6, 0.9, 0.8, -0.8}).sane());  // past 90 degrees
     EXPECT_FALSE((SFov{std::nan(""), 0.9, 0.8, -0.8}).sane());
 }
+
+TEST(Srgb, KnownPointsOnTheTransferCurve) {
+    EXPECT_NEAR(srgbToLinear(0.0), 0.0, 1e-15);
+    EXPECT_NEAR(srgbToLinear(1.0), 1.0, 1e-15);
+    // The linear segment below the 0.04045 knee has slope 1/12.92.
+    EXPECT_NEAR(srgbToLinear(0.04), 0.04 / 12.92, 1e-15);
+    // Mid grey: sRGB 0.5 is famously about 21.4% of the light.
+    EXPECT_NEAR(srgbToLinear(0.5), 0.21404, 1e-5);
+    EXPECT_NEAR(linearToSrgb(0.21404), 0.5, 1e-5);
+    EXPECT_NEAR(linearToSrgb(0.0031308 / 2.0), 0.0031308 / 2.0 * 12.92, 1e-15);
+}
+
+TEST(Srgb, RoundTripsEveryByteValueExactly) {
+    // The compositor decodes, blends, and encodes. An opaque pixel must survive
+    // that unchanged, or every frame would drift on its own transfer curve.
+    for (int byte = 0; byte <= 255; ++byte) {
+        const double ENCODED = byte / 255.0;
+        const double BACK    = linearToSrgb(srgbToLinear(ENCODED));
+        EXPECT_EQ(static_cast<int>(std::lround(BACK * 255.0)), byte) << "byte " << byte;
+    }
+}
+
+TEST(Srgb, IsClampedRatherThanUndefinedOutsideTheUnitRange) {
+    EXPECT_EQ(srgbToLinear(-0.5), 0.0);
+    EXPECT_EQ(srgbToLinear(1.5), 1.0);
+    EXPECT_EQ(linearToSrgb(-0.5), 0.0);
+    EXPECT_EQ(linearToSrgb(1.5), 1.0);
+}
+
+TEST(Srgb, BlendingInEncodedSpaceIsVisiblyWrongWhichIsWhyItIsNotDone) {
+    // Half of sRGB 1.0 over black: linear light says 0.5 of the light, which
+    // encodes to about 0.7354 - not 0.5. The gap is the artifact the compositor
+    // exists to avoid.
+    const double CORRECT = linearToSrgb(srgbToLinear(1.0) * 0.5 + srgbToLinear(0.0) * 0.5);
+    EXPECT_NEAR(CORRECT, 0.7354, 1e-3);
+    EXPECT_GT(std::abs(CORRECT - 0.5) * 255.0, 55.0);
+}

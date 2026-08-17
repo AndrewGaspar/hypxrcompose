@@ -5,6 +5,7 @@
 // the test compares a measurement against a prediction rather than against a
 // stored image. What each one proves is stated at the top of the test.
 
+#include "ComposeGL.hpp"
 #include "Ffmpeg.hpp"
 #include "Harness.hpp"
 #include "Log.hpp"
@@ -174,6 +175,11 @@ TEST(EndToEnd, OverlayMarkersLandWherePredicted) {
         const SFov& FOV        = FIX.scene.eyeFov[0];
 
         for (const auto& MARKER : FIX.scene.overlayMarkers) {
+            // Partially transparent markers sit over the panel's own gradient, so
+            // their composited colour is a blend and colour-matching cannot find
+            // them; the linear-light test below measures those instead.
+            if (MARKER.alpha < 1.0)
+                continue;
             const SVec3 WORLD     = MARKER.world(FIX.scene.overlayQuad);
             const auto  PREDICTED = predictOverlayPixel(OUTPUT_EYE, FOV, PANE_WIDTH, PANE_HEIGHT, SOURCE_EYE, WORLD);
             ASSERT_TRUE(PREDICTED.has_value()) << MARKER.name;
@@ -609,4 +615,165 @@ TEST(EndToEnd, ThroughputIsMeasuredAndReported) {
     EXPECT_GT(REPORT.framesPerSecond, 0.0);
     EXPECT_EQ(REPORT.frames.size(), 45u);
     EXPECT_TRUE(fs::exists(RENDERED.video));
+}
+
+// ---------------------------------------------------------------------------
+// 11. Alpha association and the colour space compositing happens in.
+//
+// The head-locked HUD layer is stored at 75% alpha over a known solid
+// background, so its composited colour is computable in closed form. The
+// assertion is discriminating twice over: blending the same pixel in encoded
+// space instead of linear light lands ~30 levels away, and reading a
+// premultiplied source as though it were straight lands ~30 levels the other
+// way. Both wrong answers are checked for explicitly, so this cannot pass by
+// accident.
+// ---------------------------------------------------------------------------
+namespace {
+
+    // Where the head-locked HUD's centre appears, and what colour it must be.
+    struct SHudExpectation {
+        std::array<double, 2> pixel{};
+        std::array<double, 3> color{};
+    };
+
+    SHudExpectation expectHud(const SFixture& fix, size_t k, double fps, const std::array<float, 4>& solidSrgb, bool encodedSpaceInstead) {
+        const size_t OUTPUT_RECORD = fix.outputRecord(k, fps);
+        const size_t SOURCE_RECORD = fix.overlaySourceRecord(k, fps);
+
+        const SPose OUTPUT_EYE = fix.eyePose(static_cast<int>(OUTPUT_RECORD), 0);
+        const SPose SOURCE_EYE = fix.eyePose(static_cast<int>(SOURCE_RECORD), 0);
+        // Head-locked: the layer's world pose follows the head, so its centre at the
+        // instant the overlay frame was rendered is head(source) * hudQuad.
+        const SVec3 CENTRE     = fix.headPose(static_cast<int>(SOURCE_RECORD)).compose(fix.scene.hudQuad).pos;
+
+        SHudExpectation expectation;
+        const auto      PIXEL = predictOverlayPixel(OUTPUT_EYE, fix.scene.eyeFov[0], PANE_WIDTH, PANE_HEIGHT, SOURCE_EYE, CENTRE);
+        expectation.pixel     = PIXEL.value_or(std::array<double, 2>{-1.0, -1.0});
+
+        // Alpha survives as a byte, so the prediction uses the quantized value the
+        // file actually carries rather than the ideal 0.75.
+        const double ALPHA = std::round(fix.scene.hudAlpha * 255.0) / 255.0;
+        for (int channel = 0; channel < 3; ++channel) {
+            const double BACKGROUND = solidSrgb[static_cast<size_t>(channel)];
+            const double FOREGROUND = fix.scene.hudColor[static_cast<size_t>(channel)] / 255.0;
+            if (encodedSpaceInstead)
+                expectation.color[static_cast<size_t>(channel)] = 255.0 * (BACKGROUND * (1.0 - ALPHA) + FOREGROUND * ALPHA);
+            else
+                expectation.color[static_cast<size_t>(channel)] = 255.0 * linearToSrgb(srgbToLinear(BACKGROUND) * (1.0 - ALPHA) + srgbToLinear(FOREGROUND) * ALPHA);
+        }
+        return expectation;
+    }
+
+}
+
+TEST(EndToEnd, PartialAlphaCompositesInLinearLightFromAPremultipliedSource) {
+    const auto& FIX      = fixture();
+    ASSERT_EQ(FIX.scene.overlayAlpha, "premultiplied");
+    ASSERT_EQ(FIX.bundle.overlay.alpha, "premultiplied") << "the manifest must say how the file stores colour";
+
+    const auto RENDERED = renderCase("alpha-premultiplied", [](SRenderOptions& o) {
+        o.eye        = eEyeSelection::LEFT;
+        o.background = eBackgroundChoice::SOLID;
+    });
+
+    const SPaneDraw DEFAULTS; // the solid colour the SOLID background paints
+    const size_t    K        = 20;
+    const auto      EXPECTED = expectHud(FIX, K, RENDERED.report.fps, DEFAULTS.solidColor, false);
+    const auto      WRONG    = expectHud(FIX, K, RENDERED.report.fps, DEFAULTS.solidColor, true);
+
+    const SImage IMAGE    = RENDERED.frame(K);
+    const auto   MEASURED = blockColor(IMAGE, EXPECTED.pixel[0], EXPECTED.pixel[1], 4);
+
+    std::cout << "[measured] HUD at 75% alpha composites to (" << MEASURED[0] << ", " << MEASURED[1] << ", " << MEASURED[2] << "); linear-light prediction (" << EXPECTED.color[0] << ", "
+              << EXPECTED.color[1] << ", " << EXPECTED.color[2] << "), encoded-space would be (" << WRONG.color[0] << ", " << WRONG.color[1] << ", " << WRONG.color[2] << ")\n";
+
+    for (size_t channel = 0; channel < 3; ++channel)
+        EXPECT_NEAR(MEASURED[channel], EXPECTED.color[channel], 3.0) << "channel " << channel;
+
+    // The test is only worth anything if the wrong answer is far away.
+    double separation = 0.0;
+    for (size_t channel = 0; channel < 3; ++channel)
+        separation = std::max(separation, std::abs(EXPECTED.color[channel] - WRONG.color[channel]));
+    EXPECT_GT(separation, 15.0) << "the linear and encoded predictions must differ enough to tell apart";
+}
+
+TEST(EndToEnd, StraightAndPremultipliedBundlesComposeToTheSamePixels) {
+    const auto& PREMULTIPLIED = fixture();
+    const auto& STRAIGHT      = straightAlphaFixture();
+    ASSERT_EQ(STRAIGHT.scene.overlayAlpha, "straight");
+    ASSERT_EQ(STRAIGHT.bundle.overlay.alpha, "straight");
+
+    const auto FROM_PREMULTIPLIED = renderCase("alpha-assoc-premul",
+                                               [](SRenderOptions& o) {
+                                                   o.eye        = eEyeSelection::LEFT;
+                                                   o.background = eBackgroundChoice::SOLID;
+                                               },
+                                               PREMULTIPLIED);
+    const auto FROM_STRAIGHT      = renderCase("alpha-assoc-straight",
+                                               [](SRenderOptions& o) {
+                                                   o.eye        = eEyeSelection::LEFT;
+                                                   o.background = eBackgroundChoice::SOLID;
+                                               },
+                                               STRAIGHT);
+
+    const SPaneDraw DEFAULTS;
+    const size_t    K        = 20;
+    const auto      EXPECTED = expectHud(PREMULTIPLIED, K, FROM_PREMULTIPLIED.report.fps, DEFAULTS.solidColor, false);
+
+    const auto A = blockColor(FROM_PREMULTIPLIED.frame(K), EXPECTED.pixel[0], EXPECTED.pixel[1], 4);
+    const auto B = blockColor(FROM_STRAIGHT.frame(K), EXPECTED.pixel[0], EXPECTED.pixel[1], 4);
+
+    std::cout << "[measured] same HUD pixel from a premultiplied file (" << A[0] << ", " << A[1] << ", " << A[2] << ") and a straight one (" << B[0] << ", " << B[1] << ", " << B[2] << ")\n";
+
+    // Two encodings of the same imagery must compose alike; the only difference
+    // allowed is the rounding each encoding costs.
+    for (size_t channel = 0; channel < 3; ++channel) {
+        EXPECT_NEAR(A[channel], EXPECTED.color[channel], 3.0) << "premultiplied, channel " << channel;
+        EXPECT_NEAR(B[channel], EXPECTED.color[channel], 3.0) << "straight, channel " << channel;
+        EXPECT_NEAR(A[channel], B[channel], 3.0) << "the two associations disagree on channel " << channel;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 12. Quad records: v1 does not composite them, but it must carry them intact,
+// and the head-relative semantics have to survive the round trip - a v2 that
+// reads them as world poses would put every layer in the wrong place.
+// ---------------------------------------------------------------------------
+TEST(EndToEnd, QuadRecordsRoundTripWithHeadRelativePoses) {
+    const auto& FIX = fixture();
+
+    ASSERT_FALSE(FIX.bundle.telemetry.empty());
+    for (const auto& RECORD : FIX.bundle.telemetry) {
+        ASSERT_TRUE(RECORD.hasQuadsArray);
+        ASSERT_EQ(RECORD.quads.size(), 2u);
+        EXPECT_EQ(RECORD.quads[0].index, 0);
+        EXPECT_EQ(RECORD.quads[1].index, 1);
+        EXPECT_FALSE(RECORD.quads[0].name.has_value()) << "the producer sends null names for now";
+        EXPECT_FALSE(RECORD.quads[0].viewSpace) << "index 0 is the room-anchored monitor";
+        EXPECT_TRUE(RECORD.quads[1].viewSpace) << "index 1 is the head-locked HUD";
+        EXPECT_TRUE(RECORD.head.has_value()) << "quad poses are relative to this";
+    }
+
+    // The room-anchored layer: head * pose must land on the same STAGE pose at
+    // every record, however much the head moved. That is the whole content of
+    // "quad poses are head-relative", and it fails loudly if they were read as
+    // world poses.
+    double worstPosition = 0.0;
+    double worstAngle    = 0.0;
+    for (const auto& RECORD : FIX.bundle.telemetry) {
+        const SPose WORLD = RECORD.quads[0].worldPose(RECORD.headPose());
+        worstPosition     = std::max(worstPosition, (WORLD.pos - FIX.scene.overlayQuad.pos).length());
+        worstAngle        = std::max(worstAngle, (FIX.scene.overlayQuad.rot.inverse() * WORLD.rot).log().length());
+    }
+    std::cout << "[measured] room-anchored quad re-anchors to within " << worstPosition * 1000.0 << " mm and " << worstAngle * 1000.0 << " mrad over the take\n";
+    EXPECT_LT(worstPosition, 1e-6);
+    EXPECT_LT(worstAngle, 1e-6);
+
+    // And the head-locked layer is the opposite: constant head-relative, so its
+    // STAGE pose must move with the head rather than stay put.
+    const SPose FIRST = FIX.bundle.telemetry.front().quads[1].worldPose(FIX.bundle.telemetry.front().headPose());
+    const SPose LATER = FIX.bundle.telemetry[45].quads[1].worldPose(FIX.bundle.telemetry[45].headPose());
+    for (const auto& RECORD : FIX.bundle.telemetry)
+        EXPECT_LT((RECORD.quads[1].pose.pos - FIX.scene.hudQuad.pos).length(), 1e-9) << "the head-locked pose must be recorded unchanged";
+    EXPECT_GT((LATER.pos - FIRST.pos).length(), 1e-3) << "a head-locked layer's STAGE pose must follow the head";
 }

@@ -69,6 +69,9 @@ namespace hxctest {
     };
 
     const SFixture& fixture();
+    // The same scene stored with unassociated alpha instead of premultiplied. Both
+    // describe identical imagery, so both must compose to the same pixels.
+    const SFixture& straightAlphaFixture();
     // A second bundle whose only difference is a zero host<->device clock offset;
     // used to show what the clock path is worth.
     const SFixture& zeroOffsetFixture();

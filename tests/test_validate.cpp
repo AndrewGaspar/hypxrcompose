@@ -371,6 +371,107 @@ TEST(Validate, AnObsoletePtsEpochIsCalledOut) {
     EXPECT_TRUE(hasDiagnostic(DIAGS, false, "obsolete")) << describe(DIAGS);
 }
 
+namespace {
+
+    // A telemetry line with one quad record, whose fields the caller can break.
+    std::string quadTelemetryLine(int64_t tHostNs, int64_t frame, const std::string& quadBody) {
+        return std::format(R"({{"t_host_ns":{},"frame":{},"eyes":[{{{},"fov":{{"l":-0.9,"r":0.9,"u":0.8,"d":-0.8}}}},{{{},"fov":{{"l":-0.9,"r":0.9,"u":0.8,"d":-0.8}}}}],)"
+                           R"("head":{{"pos":[0,0,0],"quat":[0,0,0,1]}},"quads":[{}],"blend_mode":"alpha"}})",
+                           tHostNs, frame, poseLine(1.0), poseLine(1.0), quadBody);
+    }
+
+    constexpr const char* GOOD_QUAD = R"({"index":0,"name":null,"pose":{"pos":[0,0,-1],"quat":[0,0,0,1]},"size":[0.7,0.42],"visibility":1.0,"view_space":false,)"
+                                      R"("swapchain":7,"image":0,"array_layer":0,"rect":[0,0,640,480]})";
+
+    std::vector<std::string> quadTelemetry(const std::string& quadBody) {
+        return {quadTelemetryLine(1000000000, 0, quadBody), quadTelemetryLine(1016666666, 1, quadBody), quadTelemetryLine(1033333333, 2, quadBody)};
+    }
+
+}
+
+TEST(Validate, AWellFormedQuadRecordIsAccepted) {
+    const auto DIAGS = loadAndCollect(writeTake("quadgood", minimalManifest(), quadTelemetry(GOOD_QUAD), goodClock()));
+    EXPECT_FALSE(DIAGS.hasErrors()) << describe(DIAGS);
+}
+
+TEST(Validate, AQuadWithoutViewSpaceIsRejected) {
+    std::string quad = GOOD_QUAD;
+    const size_t AT  = quad.find(R"("view_space":false,)");
+    ASSERT_NE(AT, std::string::npos);
+    quad.erase(AT, std::strlen(R"("view_space":false,)"));
+
+    const auto DIAGS = loadAndCollect(writeTake("quadnoview", minimalManifest(), quadTelemetry(quad), goodClock()));
+    // view_space decides whether a layer is head-locked or room-anchored, so a
+    // record without it cannot be replayed at all.
+    EXPECT_TRUE(hasDiagnostic(DIAGS, true, "`view_space`")) << describe(DIAGS);
+}
+
+TEST(Validate, AQuadWithoutAPoseIsRejectedWithTheHeadRelativeSemanticsSpelledOut) {
+    const std::string QUAD = R"({"index":0,"name":null,"size":[0.7,0.42],"visibility":1.0,"view_space":false,"swapchain":7,"image":0})";
+    const auto        DIAGS = loadAndCollect(writeTake("quadnopose", minimalManifest(), quadTelemetry(QUAD), goodClock()));
+    EXPECT_TRUE(hasDiagnostic(DIAGS, true, "head-relative")) << describe(DIAGS);
+}
+
+TEST(Validate, AQuadWithANonPositiveSizeIsRejected) {
+    std::string quad = GOOD_QUAD;
+    const size_t AT  = quad.find(R"("size":[0.7,0.42])");
+    ASSERT_NE(AT, std::string::npos);
+    quad.replace(AT, std::strlen(R"("size":[0.7,0.42])"), R"("size":[0.7,0])");
+
+    const auto DIAGS = loadAndCollect(writeTake("quadbadsize", minimalManifest(), quadTelemetry(quad), goodClock()));
+    EXPECT_TRUE(hasDiagnostic(DIAGS, true, "positive in both axes")) << describe(DIAGS);
+}
+
+TEST(Validate, AQuadIndexThatDisagreesWithCompositionOrderIsRejected) {
+    std::string quad = GOOD_QUAD;
+    const size_t AT  = quad.find(R"("index":0)");
+    ASSERT_NE(AT, std::string::npos);
+    quad.replace(AT, std::strlen(R"("index":0)"), R"("index":3)");
+
+    const auto DIAGS = loadAndCollect(writeTake("quadbadindex", minimalManifest(), quadTelemetry(quad), goodClock()));
+    EXPECT_TRUE(hasDiagnostic(DIAGS, true, "composition order back-to-front")) << describe(DIAGS);
+}
+
+TEST(Validate, AQuadVisibilityOutsideZeroToOneIsRejected) {
+    std::string quad = GOOD_QUAD;
+    const size_t AT  = quad.find(R"("visibility":1.0)");
+    ASSERT_NE(AT, std::string::npos);
+    quad.replace(AT, std::strlen(R"("visibility":1.0)"), R"("visibility":1.4)");
+
+    const auto DIAGS = loadAndCollect(writeTake("quadbadvis", minimalManifest(), quadTelemetry(quad), goodClock()));
+    EXPECT_TRUE(hasDiagnostic(DIAGS, true, "opacity in 0..1")) << describe(DIAGS);
+}
+
+TEST(Validate, ATakeWithoutQuadRecordsWarnsThatGradeBReplayIsForeclosed) {
+    const auto DIAGS = loadAndCollect(writeTake("noquads", minimalManifest(), goodTelemetry(), goodClock()));
+    EXPECT_FALSE(DIAGS.hasErrors()) << describe(DIAGS);
+    EXPECT_TRUE(hasDiagnostic(DIAGS, false, "grade-B replay")) << describe(DIAGS);
+}
+
+TEST(Validate, QuadsOnSomeRecordsButNotOthersIsAProducerBug) {
+    auto telemetry = quadTelemetry(GOOD_QUAD);
+    telemetry[1]   = telemetryLine(1016666666, 1);
+    const auto DIAGS = loadAndCollect(writeTake("quadpartial", minimalManifest(), telemetry, goodClock()));
+    EXPECT_TRUE(hasDiagnostic(DIAGS, true, "must be present on all of them or none")) << describe(DIAGS);
+}
+
+TEST(Validate, AHeadPoseOnSomeRecordsButNotOthersIsRejected) {
+    auto telemetry = quadTelemetry(GOOD_QUAD);
+    // Strip the head from the middle record only.
+    const size_t AT = telemetry[1].find(R"("head":{"pos":[0,0,0],"quat":[0,0,0,1]},)");
+    ASSERT_NE(AT, std::string::npos);
+    telemetry[1].erase(AT, std::strlen(R"("head":{"pos":[0,0,0],"quat":[0,0,0,1]},)"));
+
+    const auto DIAGS = loadAndCollect(writeTake("headpartial", minimalManifest(), telemetry, goodClock()));
+    EXPECT_TRUE(hasDiagnostic(DIAGS, true, "`head` pose; it must be present on all")) << describe(DIAGS);
+}
+
+TEST(Validate, ATakeWithoutHeadPosesFallsBackToTheEyeMidpointAndSaysSo) {
+    const auto DIAGS = loadAndCollect(writeTake("nohead", minimalManifest(), goodTelemetry(), goodClock()));
+    EXPECT_FALSE(DIAGS.hasErrors()) << describe(DIAGS);
+    EXPECT_TRUE(hasDiagnostic(DIAGS, false, "midpoint of the eyes")) << describe(DIAGS);
+}
+
 TEST(Validate, StrictTurnsWarningsIntoAFailure) {
     // A take whose clock does not span it warns; --strict makes that fatal.
     const std::vector<std::string> CLOCK{R"({"t_host_ns":1020000000,"offset_ns":250000000,"rtt_us":1800})"};
