@@ -199,6 +199,24 @@ namespace hxc {
             // levels away from this one.
             {"halfalpha", {240, 60, 30}, -0.24, -0.13, 0.10, 0.5},
         };
+        if (options.geometryMarkers) {
+            // Four large, well-separated, opaque markers at the corners of a
+            // rectangle, *replacing* the default three. The defaults are nearly
+            // collinear and only a few pixels across once an asymmetric frustum
+            // has been padded out to a wide pane, and a centroid taken over six
+            // pixels cannot resolve a one-percent scale error. Kept small in
+            // *angle* on purpose - a big marker's filled centroid drifts off the
+            // projection of its centre, because the mapping is linear in tangent
+            // and a wide square does not stay a square - and resolved instead by
+            // rendering the check at a large pane.
+            scene.overlayMarkers = {
+                {"geomTL", {0, 128, 255}, -0.30, 0.16, 0.03, 1.0},
+                {"geomTR", {255, 128, 0}, 0.30, 0.16, 0.03, 1.0},
+                {"geomBL", {120, 255, 120}, -0.30, -0.16, 0.03, 1.0},
+                {"geomBR", {200, 0, 120}, 0.30, -0.16, 0.03, 1.0},
+            };
+        }
+
         // Head-locked, and far enough out of the way that nothing else in the frame
         // moves under it as the head sweeps.
         scene.hudQuad = {{-0.52, 0.26, -0.55}, SQuat::identity()};
@@ -210,8 +228,12 @@ namespace hxc {
         }
 
         scene.ipd       = options.ipd;
-        scene.eyeFov[0] = {-0.95, 0.86, 0.75, -0.78};
-        scene.eyeFov[1] = {-0.86, 0.95, 0.75, -0.78};
+        // Mirrored, the way a headset's two eyes are: the outward side of each
+        // eye sees further, so the optical axis sits off-centre in opposite
+        // directions. Keeping the mirror exact is what makes a stereo pair's two
+        // panes agree about scale.
+        scene.eyeFov[0] = options.eyeFov;
+        scene.eyeFov[1] = {-options.eyeFov.r, -options.eyeFov.l, options.eyeFov.u, options.eyeFov.d};
 
         // Which telemetry records carry overlay pixels. Two causes, both expressed
         // the same way in the bundle - a `"dropped": true` on the record:

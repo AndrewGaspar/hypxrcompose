@@ -141,7 +141,56 @@ namespace hxc {
             return {std::tan(l), std::tan(r), std::tan(u), std::tan(d)};
         }
         bool sane() const;
+
+        // The frustum's extent in tan space, horizontal and vertical. This, not
+        // the angles, is what a pinhole projection is linear in - so the ratio
+        // below is the aspect the frustum actually *has*, and it is generally
+        // not the pixel aspect of the buffer a runtime rendered it into.
+        double tanWidth() const {
+            return std::tan(r) - std::tan(l);
+        }
+        double tanHeight() const {
+            return std::tan(u) - std::tan(d);
+        }
+        // Width over height in tan space. A frustum whose angular aspect differs
+        // from the aspect of the image it is mapped onto renders squares as
+        // rectangles, by exactly that ratio.
+        double angularAspect() const {
+            return tanWidth() / tanHeight();
+        }
+        // Where the optical axis (the direction with zero tangent) falls in the
+        // image, as a fraction of width from the left and of height from the top.
+        // An asymmetric frustum does not put it at the centre, and a compositor
+        // that assumes it does shifts the whole picture.
+        double opticalCentreU() const {
+            return -std::tan(l) / tanWidth();
+        }
+        double opticalCentreV() const {
+            return std::tan(u) / tanHeight();
+        }
     };
+
+    // The tan-space size of one output pixel needed to show all of `fov` on a
+    // `width` x `height` pane without cropping and with angularly square pixels.
+    double angularPixelForPane(const SFov& fov, int width, int height);
+
+    // `fov` widened - never narrowed - so that it exactly fills a `width` x
+    // `height` pane at `angularPixel` tan units per pixel.
+    //
+    // This is how an output camera is built from a recorded one. A recorded eye
+    // frustum is asymmetric and its angular aspect is whatever the runtime chose;
+    // the pane the user asked for has its own aspect. Mapping the first linearly
+    // onto the second - which is what a compositor does if it just hands the
+    // recorded fov to the shader - stretches the picture by the ratio between
+    // them and slides the optical axis off where it belongs. Padding instead
+    // keeps every recorded pixel, keeps the optical axis pointing where it
+    // pointed, and makes output pixels square in angle, so a square in the world
+    // comes out square on screen.
+    //
+    // Pass one `angularPixel` for every pane of a stereo pair: two eyes fitted
+    // independently would come out at two different scales, which is a broken
+    // stereo pair. 0 derives it from this frustum alone.
+    SFov   fitFovToPane(const SFov& fov, int width, int height, double angularPixel = 0.0);
 
     // A direction in eye space (z negative, unnormalized) for the centre of pixel
     // (px, py) of a `width` x `height` image rendered with this frustum.

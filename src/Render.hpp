@@ -147,6 +147,11 @@ namespace hxc {
         // How many workers produced this. 1 for a single-job render, and for a
         // worker's own report of its own segment.
         int                       jobs       = 1;
+        // The output camera's frustum per pane, as deriveOutputFrusta built it
+        // from the recorded eye frusta. Published because it is the geometry
+        // every prediction about the output has to be made against: it is not the
+        // recorded fov, and assuming it is puts markers in the wrong place.
+        std::vector<SFov>         paneFov;
         std::vector<SFrameRecord> frames;
 
         double                    wallSeconds    = 0.0;

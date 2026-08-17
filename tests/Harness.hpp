@@ -75,6 +75,9 @@ namespace hxctest {
     // A second bundle whose only difference is a zero host<->device clock offset;
     // used to show what the clock path is worth.
     const SFixture& zeroOffsetFixture();
+    // A bundle whose eyes carry the reference take's real frustum: asymmetric,
+    // and with an angular aspect that deliberately does not match the test pane.
+    const SFixture& realFrustumFixture();
 
     // The v1 background model, evaluated exactly: where must the output pixel be
     // for its assumed-depth ray to sample the camera pixel that shows `world`?

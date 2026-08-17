@@ -58,6 +58,10 @@ synth:
       --alpha premultiplied|straight   how the overlay stores colour (default premultiplied)
       --ipd N              interpupillary distance in metres (default 0.063)
       --cam-baseline N     camera separation in metres (default 0.084)
+      --eye-fov l,r,u,d    per-eye frustum in radians, eye 0 (eye 1 mirrors it);
+                           asymmetric by default, as a real headset's is
+      --geometry-markers   four extra opaque markers on the overlay quad, at the
+                           corners of a rectangle, for measuring output scale
 
 render:
       --out FILE           output video (required)
@@ -232,6 +236,29 @@ int main(int argc, char** argv) {
                 options.ipd = number;
             else if (ARG == "--cam-baseline" && parseDouble(value(COUNT, REST, i), number))
                 options.cameraBaseline = number;
+            else if (ARG == "--geometry-markers")
+                options.geometryMarkers = true;
+            else if (ARG == "--eye-fov") {
+                const std::string SPEC = value(COUNT, REST, i) ?: "";
+                double            v[4] = {0, 0, 0, 0};
+                size_t            at   = 0;
+                int               n    = 0;
+                for (; n < 4 && at <= SPEC.size(); ++n) {
+                    const size_t COMMA = SPEC.find(',', at);
+                    if (!parseDouble(SPEC.substr(at, COMMA - at).c_str(), v[n]))
+                        break;
+                    if (COMMA == std::string::npos) {
+                        ++n;
+                        break;
+                    }
+                    at = COMMA + 1;
+                }
+                if (n != 4) {
+                    HXC_ERR("--eye-fov takes four radian angles, l,r,u,d (for example -0.9425,0.6981,0.7679,-0.9599)");
+                    return 2;
+                }
+                options.eyeFov = {v[0], v[1], v[2], v[3]};
+            }
             else if (ARG.starts_with("-")) {
                 HXC_ERR("unknown or malformed flag {}", ARG);
                 return 2;

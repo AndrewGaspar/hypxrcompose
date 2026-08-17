@@ -40,6 +40,8 @@
 // files, which is the property that lets it exist.
 
 #include <cstdint>
+#include "Math.hpp"
+
 #include <filesystem>
 #include <string>
 
@@ -72,6 +74,17 @@ namespace hxc {
         int64_t clockIntervalNs = 100000000;
 
         double  ipd             = 0.063;
+        // The recorded per-eye frustum, eye 0; eye 1 is its mirror. Asymmetric by
+        // default because every real headset's is, and a symmetric one hides a
+        // whole class of geometry bug. Set it to a real take's numbers to
+        // reproduce that take's framing.
+        SFov    eyeFov           = {-0.95, 0.86, 0.75, -0.78};
+        // Four extra opaque markers at the corners of a rectangle on the overlay
+        // quad. They exist so a test can measure the output's scale along two
+        // orthogonal baselines; the default scene's three markers are nearly
+        // collinear, which cannot show anisotropy at all. Off by default so the
+        // shared fixtures keep the imagery every other test was written against.
+        bool    geometryMarkers  = false;
         // Deliberately wider than the IPD: this is the parallax error research 27
         // section 5.1 accepts in v1, and making it real here means the test can
         // measure it.

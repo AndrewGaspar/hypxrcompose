@@ -132,9 +132,35 @@ gap 2 (both are "the pose/depth for a sample is not constant across the frame").
 | **Nearest-neighbour source resampling.** | Output frames pick the nearest source frame in time. At 30 Hz cameras against 45 Hz output that visibly stutters, and the same applies to overlay frames lost to the readback queue. Motion-compensated interpolation is the fix; simple frame blending is not (it doubles edges). Until then, matching `--fps` to the camera rate is the honest option for camera-dominant cuts. |
 | **A dropped overlay frame is held, not synthesized.** | When a record carries `"dropped": true` the composite reuses the nearest surviving overlay frame, reprojected from *its* pose. That is correct rather than merely convenient - the pixels really were rendered from that viewpoint - but a long readback stall shows as a static overlay over a moving background. Grade-B replay (gap 1) removes the problem entirely, since it re-renders rather than resamples. |
 | **Straight-alpha edge bleed.** | A `"premultiplied"` bundle — what the host producer emits — filters correctly by construction. A `"straight"` one still bleeds unassociated colour at matte edges under bilinear sampling, because association happens after the filter. Associating on upload would fix it, at the cost of a conversion pass. |
-| **Per-frame fov is taken from the nearest telemetry record, not interpolated.** | Correct for `asis` at capture rate. If output rates diverge from capture rates, the frustum should interpolate the way the pose does. |
+| ~~**Per-frame fov is taken from the nearest telemetry record.**~~ — **fixed: the output frustum is derived once and held.** | The output camera's frustum is now built from the union of every frustum the eye recorded, padded to the pane's aspect, and fixed for the whole render (`deriveOutputFrusta`). So it neither jitters with the per-record stamp — the reference take stamps 2006 distinct fovs for one eye — nor needs interpolating. The per-record fov is still used where it belongs: to sample the overlay, which was rendered with it. |
 | **Colour management is sRGB-only.** | Compositing is now correct: sources decode from sRGB to linear light (in hardware, before filtering), blend premultiplied, and encode once on output. What is still assumed is that *everything is sRGB* — a wide-gamut or HDR overlay tap would need its actual primaries and transfer function in the manifest, and the output would need somewhere to put values above 1.0. |
 | **libav\* linkage.** | v1 talks to `ffmpeg` over pipes deliberately (see README). A v2 that wants hardware decode straight into a GL texture — which is where the throughput ceiling is — should link libav\*; the seam is `src/Ffmpeg.cpp`. See "Throughput" below for why this is now the *first* thing to do rather than the last. |
+
+---
+
+## Output framing: the pane's aspect, the recorded frustum's asymmetry (fixed 2026-08-17)
+
+A recorded eye frustum is asymmetric and its angular aspect is whatever the runtime picked. On the
+reference take, eye 0 is `l=-0.9425 r=0.6981 u=0.7679 d=-0.9599`: an angular aspect of 0.9255 and an
+optical axis at **62.1%** of the width, not at half. v1 handed that fov straight to the shader, which
+maps it linearly onto whatever pane was asked for — so the picture was stretched by the ratio of the
+two aspects, and the optical axis landed wherever that mapping put it.
+
+Measured: **3.1% horizontal stretch** at the take's own buffer size (2064x2162), and **1.92x** — near
+double-width — at the documented 1920x1080 reference render.
+
+The fix is `deriveOutputFrusta` + `fitFovToPane`: keep the recorded frustum, pad it (never crop)
+until it fills the pane at one tan-units-per-pixel scale, and share that scale across both eyes of a
+stereo pair. The result has angularly square pixels, keeps every recorded pixel, and leaves the
+optical axis pointing exactly where the eye was pointing. Verified end to end on a fixture carrying
+the real take's frustum: worst aspect error **0.49%**, against the 44% the old mapping introduces on
+the same pane; markers land within 0.58 px of prediction where a frustum ignoring the asymmetry would
+move them 17.8 px.
+
+Two consequences worth knowing. The output frustum is *wider* than the recorded one, so content is
+smaller than it used to be and the edges show background the eye never saw — that is the honest
+trade for not cropping. And any px-per-tangent figure must be read off the report's `pane_fov`, not
+off the telemetry; the stereo-check expectation above is recomputed for exactly that reason.
 
 ---
 

@@ -279,6 +279,17 @@ hypxrcompose render <take> --out film.mp4
 `--size` is the size of **one eye's pane**; stereo SBS output is therefore `2W x H`, which keeps each
 eye's geometry undistorted rather than squeezing two eyes into one frame.
 
+The output camera's frustum is **derived from the recorded eye frusta, not copied from them**. A
+recorded frustum is asymmetric — on the first real take the optical axis sits at 62.1% of the eye
+buffer's width — and its angular aspect (0.9255 there) is whatever the runtime chose, which is not
+the aspect of any pane you would ask for. Mapping one onto the other stretches the picture; at
+1920x1080 that came to 1.92x. So the recorded frustum is instead *padded* — never cropped — until it
+fills the pane at one tangent-per-pixel scale, shared across both eyes so a stereo pair stays a pair.
+Squares render square, nothing recorded is lost, and the optical axis stays where the eye was
+pointing; the cost is that the pane shows some field the eye never saw, at the edges. The frustum
+actually used is published per pane in `--report` as `pane_fov`, and any pixels-per-radian figure
+should be read off that rather than off the telemetry.
+
 `--report` writes a JSON record of which telemetry record, overlay frame, and camera frame every
 output frame was made of, plus the throughput breakdown. It is the first thing to look at when a
 composite looks wrong.

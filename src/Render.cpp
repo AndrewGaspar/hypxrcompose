@@ -88,6 +88,9 @@ namespace hxc {
         report["gpu"]         = gpu;
         report["framing"]     = framing;
         report["jobs"]        = jobs;
+        report["pane_fov"]    = json::array();
+        for (const auto& FOV : paneFov)
+            report["pane_fov"].push_back({{"l", FOV.l}, {"r", FOV.r}, {"u", FOV.u}, {"d", FOV.d}});
         report["throughput"]  = {
             {"wall_seconds", wallSeconds},        {"decode_seconds", decodeSeconds},
             {"gpu_seconds", gpuSeconds},          {"encode_seconds", encodeSeconds},
@@ -125,6 +128,8 @@ namespace hxc {
             out.gpu           = REPORT.value("gpu", std::string{});
             out.framing       = REPORT.value("framing", std::string{});
             out.jobs          = REPORT.value("jobs", 1);
+            for (const auto& FOV : REPORT.value("pane_fov", json::array()))
+                out.paneFov.push_back({FOV.value("l", 0.0), FOV.value("r", 0.0), FOV.value("u", 0.0), FOV.value("d", 0.0)});
 
             if (const auto IT = REPORT.find("throughput"); IT != REPORT.end()) {
                 out.wallSeconds   = IT->value("wall_seconds", 0.0);
@@ -175,7 +180,80 @@ namespace hxc {
             int64_t           t0         = 0;
             size_t            frameCount = 0; // the whole timeline, before any segmenting
             eBackgroundChoice background = eBackgroundChoice::CHECKER;
+            // The output camera's frustum, one per pane, derived once from the
+            // recorded eye frusta and fixed for the whole render. See
+            // deriveOutputFrusta.
+            std::vector<SFov> paneFov;
         };
+
+        // Builds each pane's output frustum from what the eyes actually recorded.
+        //
+        // Two things have to be reconciled and neither is negotiable. A recorded
+        // eye frustum is asymmetric - on the reference take l=-0.507 r=0.698
+        // u=0.727 d=-0.648, so the optical axis sits at 39.8% of the width, not at
+        // half - and its angular aspect is whatever the runtime picked, 0.847 on
+        // that take, against an eye buffer whose pixel aspect is 0.955. Handing
+        // that fov straight to the shader maps the frustum linearly onto whatever
+        // pane the user asked for, which stretches the picture by the ratio of the
+        // two aspects: 12.8% at the take's own buffer size, and 110% at 1920x1080.
+        // Circles came out as ellipses and straight lines survived only because
+        // the stretch is uniform.
+        //
+        // So: keep the recorded frustum, pad it - never crop - until it fills the
+        // pane at one tan-units-per-pixel scale, and keep that scale common to
+        // both eyes of a stereo pair so the pair stays a pair. The result has
+        // angularly square pixels (a world square renders square), keeps every
+        // recorded pixel, and leaves the optical axis pointing exactly where the
+        // eye was pointing.
+        //
+        // Derived once rather than per frame: the fov is a property of the
+        // headset, and rebuilding it from each record's stamp would make the
+        // framing breathe if a producer ever varied it.
+        void deriveOutputFrusta(const SBundle& BUNDLE, SRenderPlan& plan) {
+            const size_t PANES = plan.paneEyes.size();
+            plan.paneFov.assign(PANES, SFov{});
+
+            // The union of every frustum this eye recorded, so nothing any record
+            // saw is cropped away.
+            std::vector<SFov> recorded(PANES);
+            std::vector<bool> seen(PANES, false);
+            for (const auto& RECORD : BUNDLE.telemetry) {
+                for (size_t pane = 0; pane < PANES; ++pane) {
+                    const size_t EYE = static_cast<size_t>(plan.paneEyes[pane]);
+                    if (EYE >= RECORD.eyes.size())
+                        continue;
+                    const SFov& FOV = RECORD.eyes[EYE].fov;
+                    if (!seen[pane]) {
+                        recorded[pane] = FOV;
+                        seen[pane]     = true;
+                        continue;
+                    }
+                    recorded[pane].l = std::min(recorded[pane].l, FOV.l);
+                    recorded[pane].r = std::max(recorded[pane].r, FOV.r);
+                    recorded[pane].u = std::max(recorded[pane].u, FOV.u);
+                    recorded[pane].d = std::min(recorded[pane].d, FOV.d);
+                }
+            }
+
+            // One scale for every pane: fitting two eyes independently would put
+            // them at two different magnifications, which is not a stereo pair.
+            double angularPixel = 0.0;
+            for (size_t pane = 0; pane < PANES; ++pane) {
+                if (seen[pane])
+                    angularPixel = std::max(angularPixel, angularPixelForPane(recorded[pane], plan.paneWidth, plan.paneHeight));
+            }
+
+            for (size_t pane = 0; pane < PANES; ++pane) {
+                plan.paneFov[pane] = seen[pane] ? fitFovToPane(recorded[pane], plan.paneWidth, plan.paneHeight, angularPixel) : SFov{};
+                if (!seen[pane])
+                    continue;
+                HXC_INFO("pane {} (eye {}): recorded fov l={:.4f} r={:.4f} u={:.4f} d={:.4f} (angular aspect {:.4f}, optical centre {:.1f}% x {:.1f}%) -> output fov l={:.4f} r={:.4f} u={:.4f} "
+                         "d={:.4f} (aspect {:.4f} matching the {}x{} pane, optical centre {:.1f}% x {:.1f}%)",
+                         pane, plan.paneEyes[pane], recorded[pane].l, recorded[pane].r, recorded[pane].u, recorded[pane].d, recorded[pane].angularAspect(), recorded[pane].opticalCentreU() * 100.0,
+                         recorded[pane].opticalCentreV() * 100.0, plan.paneFov[pane].l, plan.paneFov[pane].r, plan.paneFov[pane].u, plan.paneFov[pane].d, plan.paneFov[pane].angularAspect(),
+                         plan.paneWidth, plan.paneHeight, plan.paneFov[pane].opticalCentreU() * 100.0, plan.paneFov[pane].opticalCentreV() * 100.0);
+            }
+        }
 
         bool makePlan(const SRenderOptions& options, const SBundle& BUNDLE, SRenderPlan& out) {
             // ---- panes -----------------------------------------------------------
@@ -235,6 +313,8 @@ namespace hxc {
                 HXC_WARN("--background camera was asked for but the take has no camera source; falling back to the checker");
                 out.background = eBackgroundChoice::CHECKER;
             }
+
+            deriveOutputFrusta(BUNDLE, out);
             return true;
         }
 
@@ -437,6 +517,7 @@ namespace hxc {
         report.fps         = fps;
         report.firstHostNs = T0;
         report.gpu         = gl->description();
+        report.paneFov     = PLAN.paneFov;
         report.frames.reserve(endFrame - beginFrame);
 
         std::vector<uint8_t> composed;
@@ -454,14 +535,17 @@ namespace hxc {
             if (!TELEMETRY_INDEX)
                 break;
             record.telemetryIndex = *TELEMETRY_INDEX;
-            const auto& STAMPED   = BUNDLE.telemetry[*TELEMETRY_INDEX];
 
             for (int pane = 0; pane < PANE_COUNT; ++pane) {
                 auto&        sources = panes[static_cast<size_t>(pane)];
                 const size_t EYE     = static_cast<size_t>(sources.eye);
 
                 SPaneDraw draw;
-                draw.outputFov = STAMPED.eyes[std::min(EYE, STAMPED.eyes.size() - 1)].fov;
+                // Fixed for the whole render and built from the recorded frusta;
+                // see deriveOutputFrusta. Not the raw per-record stamp, which is
+                // the *source's* frustum - that one is still used, below, to
+                // sample the overlay.
+                draw.outputFov = PLAN.paneFov[static_cast<size_t>(pane)];
 
                 if (options.framing == eFraming::STABILIZED && !smoothedHeads.empty()) {
                     // Re-apply the eye's own offset from the head so the smoothed
@@ -948,6 +1032,7 @@ namespace hxc {
             report.paneCount   = static_cast<int>(plan.paneEyes.size());
             report.fps         = plan.fps;
             report.firstHostNs = plan.t0;
+            report.paneFov     = plan.paneFov;
             report.wallSeconds = secondsSince(STARTED);
         }
 

@@ -107,6 +107,36 @@ namespace hxc {
         return std::abs(l) < LIMIT && std::abs(r) < LIMIT && std::abs(u) < LIMIT && std::abs(d) < LIMIT;
     }
 
+    double angularPixelForPane(const SFov& fov, int width, int height) {
+        if (width <= 0 || height <= 0)
+            return 0.0;
+        // The larger of the two demands wins, so the axis that needs more room
+        // per pixel sets the scale and the other one gets padded.
+        return std::max(fov.tanWidth() / static_cast<double>(width), fov.tanHeight() / static_cast<double>(height));
+    }
+
+    SFov fitFovToPane(const SFov& fov, int width, int height, double angularPixel) {
+        if (width <= 0 || height <= 0)
+            return fov;
+
+        const double PIXEL = angularPixel > 0.0 ? angularPixel : angularPixelForPane(fov, width, height);
+        if (!(PIXEL > 0.0))
+            return fov;
+
+        const auto   T    = fov.tangents();
+        // Half the shortfall on each side, so the padding is symmetric about the
+        // recorded frustum and the optical axis keeps pointing where it pointed.
+        const double PADX = std::max(0.0, PIXEL * static_cast<double>(width) - fov.tanWidth()) * 0.5;
+        const double PADY = std::max(0.0, PIXEL * static_cast<double>(height) - fov.tanHeight()) * 0.5;
+
+        SFov out;
+        out.l = std::atan(T[0] - PADX);
+        out.r = std::atan(T[1] + PADX);
+        out.u = std::atan(T[2] + PADY);
+        out.d = std::atan(T[3] - PADY);
+        return out;
+    }
+
     SVec3 fovRay(const SFov& fov, double px, double py, int width, int height) {
         const auto   T = fov.tangents();
         const double U = (px + 0.5) / static_cast<double>(width);

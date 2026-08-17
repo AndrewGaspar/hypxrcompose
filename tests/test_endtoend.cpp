@@ -17,7 +17,9 @@
 
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <set>
+#include <tuple>
 
 using namespace hxc;
 using namespace hxctest;
@@ -1099,4 +1101,207 @@ TEST(EndToEnd, StereoSideBySideOutputCarriesStereoSignalling) {
     EXPECT_FALSE(hasStereoSideData(MONO_MP4));
 
     std::cout << "[measured] stereo .mkv: StereoMode=" << matroskaTag(SBS_MKV) << " + frame-packing SEI; stereo .mp4: frame-packing SEI; mono: neither\n";
+}
+
+// ---------------------------------------------------------------------------
+// 15. The output frustum.
+//
+// A recorded eye frustum is asymmetric and its angular aspect is whatever the
+// runtime chose. The pane the user asks for has its own aspect. Handing the
+// recorded fov straight to the shader maps one linearly onto the other, which
+// stretches the picture by the ratio between them and slides the optical axis
+// off where it belongs. These tests are the ones the default fixture could not
+// be: its angular aspect happens to sit within 0.12% of the pane's, so every
+// stretch cancelled and nothing noticed.
+// ---------------------------------------------------------------------------
+
+TEST(EndToEnd, TheOutputFrustumTakesThePanesAspectAndKeepsTheRecordedOpticalAxis) {
+    // The reference take's own numbers, eye 0.
+    const SFov RECORDED{-0.9425, 0.6981, 0.7679, -0.9599};
+
+    EXPECT_NEAR(RECORDED.angularAspect(), 0.9255, 1e-3);
+    EXPECT_NEAR(RECORDED.opticalCentreU(), 0.621, 1e-3) << "the optical axis is nowhere near the middle of the eye buffer";
+    EXPECT_NEAR(RECORDED.opticalCentreV(), 0.403, 1e-3);
+
+    // What the old behaviour cost: the recorded frustum mapped onto the pane.
+    for (const auto& [W, H, WAS] : std::vector<std::tuple<int, int, double>>{{2064, 2162, 0.9547}, {1920, 1080, 16.0 / 9.0}}) {
+        const double STRETCH = WAS / RECORDED.angularAspect();
+        const SFov   FITTED  = fitFovToPane(RECORDED, W, H);
+
+        // The whole point: output pixels are square in angle, so the frustum's
+        // aspect is the pane's aspect exactly.
+        EXPECT_NEAR(FITTED.angularAspect(), static_cast<double>(W) / static_cast<double>(H), 1e-9)
+            << W << "x" << H << ": before the fix this was " << RECORDED.angularAspect() << ", a " << STRETCH << "x horizontal stretch";
+
+        // Padded, never cropped: everything the eye recorded is still on screen.
+        EXPECT_LE(FITTED.l, RECORDED.l + 1e-12);
+        EXPECT_GE(FITTED.r, RECORDED.r - 1e-12);
+        EXPECT_GE(FITTED.u, RECORDED.u - 1e-12);
+        EXPECT_LE(FITTED.d, RECORDED.d + 1e-12);
+
+        // And the padding is symmetric in tan space, which is what keeps the
+        // optical axis pointing exactly where the eye was pointing.
+        const auto R = RECORDED.tangents();
+        const auto F = FITTED.tangents();
+        EXPECT_NEAR(R[0] - F[0], F[1] - R[1], 1e-9) << "horizontal padding must be even, or the picture slides sideways";
+        EXPECT_NEAR(F[2] - R[2], R[3] - F[3], 1e-9);
+
+        std::cout << "[measured] " << W << "x" << H << ": recorded aspect " << RECORDED.angularAspect() << " -> output " << FITTED.angularAspect() << "; the old mapping stretched by " << STRETCH
+                  << "x, optical centre moved " << (FITTED.opticalCentreU() - RECORDED.opticalCentreU()) * 100.0 << "% of width\n";
+    }
+}
+
+TEST(EndToEnd, BothEyesOfAStereoPairAreFittedAtOneScale) {
+    // Two mirrored frusta, as a headset's are. Fitted independently they would
+    // land at two magnifications and stop being a stereo pair.
+    const SFov LEFT{-0.9425, 0.6981, 0.7679, -0.9599};
+    const SFov RIGHT{-0.6981, 0.9425, 0.7679, -0.9599};
+
+    const double SHARED = std::max(angularPixelForPane(LEFT, PANE_WIDTH, PANE_HEIGHT), angularPixelForPane(RIGHT, PANE_WIDTH, PANE_HEIGHT));
+    const SFov   FL     = fitFovToPane(LEFT, PANE_WIDTH, PANE_HEIGHT, SHARED);
+    const SFov   FR     = fitFovToPane(RIGHT, PANE_WIDTH, PANE_HEIGHT, SHARED);
+
+    EXPECT_NEAR(FL.tanWidth() / PANE_WIDTH, FR.tanWidth() / PANE_WIDTH, 1e-12) << "one tan unit must be one pixel in both eyes";
+    EXPECT_NEAR(FL.tanHeight() / PANE_HEIGHT, FR.tanHeight() / PANE_HEIGHT, 1e-12);
+    // Mirrored in, mirrored out.
+    EXPECT_NEAR(FL.opticalCentreU(), 1.0 - FR.opticalCentreU(), 1e-9);
+}
+
+// The end-to-end one: the output's angular scale must be the same in every
+// direction, which is what "a square renders as a square" means.
+//
+// Measured from marker centroids rather than from one marker's bounding box: the
+// markers are a handful of pixels across, so a box would quantize the aspect to
+// ~14% and could not see a 1% error. The overlay is the right surface to measure
+// on because `asis` reprojects it from the pose it was rendered at, at infinite
+// depth - a pure rotation warp, exact - so nothing but the output frustum is
+// between the ground truth and the pixels.
+TEST(EndToEnd, TheOutputScaleIsIsotropicUnderTheRealFrustum) {
+    const auto& FIX = realFrustumFixture();
+
+    // Twice the pane, so the markers are wide enough for a centroid to resolve
+    // a one-percent error rather than quantize it away.
+    constexpr int WIDE = PANE_WIDTH * 4, TALL = PANE_HEIGHT * 4;
+    const auto    RENDERED = renderCase(
+        "real-frustum-square",
+        [](SRenderOptions& options) {
+            options.background = eBackgroundChoice::CHECKER;
+            options.width      = WIDE;
+            options.height     = TALL;
+        },
+        FIX, true);
+
+    ASSERT_FALSE(RENDERED.report.paneFov.empty());
+    const SFov& OUT = RENDERED.report.paneFov[0];
+    EXPECT_NEAR(OUT.angularAspect(), static_cast<double>(WIDE) / static_cast<double>(TALL), 1e-9);
+
+    // What the old mapping would have done to the same picture.
+    const double WOULD_HAVE_BEEN = (static_cast<double>(WIDE) / static_cast<double>(TALL)) / FIX.scene.eyeFov[0].angularAspect();
+
+    struct SPoint {
+        std::array<double, 2> pixel;
+        std::array<double, 2> tan;
+        bool                  found = false;
+    };
+
+    // Scale is measured per axis from the rectangle's opposite sides, not from
+    // the worst of all pairwise distances. A colour-threshold centroid sits a
+    // fraction of a pixel off the projection of a marker's centre, and that bias
+    // is what a max-over-pairs statistic reports; taking the x component across
+    // the two horizontal sides and the y component across the two vertical ones
+    // cancels most of it, because the same bias appears at both ends of a side
+    // and on both sides of the rectangle.
+    size_t frames = 0;
+    double worst  = 0.0;
+    for (size_t k = 0; k < std::min<size_t>(6, RENDERED.report.frames.size()); ++k) {
+        const SImage IMAGE  = RENDERED.frame(k);
+        const auto&  RECORD = RENDERED.report.frames[k];
+        // The overlay is reprojected at infinite depth, so a marker lands at the
+        // direction it had *from the eye that rendered it*, expressed in the
+        // *output* camera's orientation. Those are two different records whenever
+        // a frame was dropped.
+        const SPose OUTPUT_EYE = FIX.eyePose(static_cast<int>(RECORD.telemetryIndex), 0);
+        const SPose SOURCE_EYE = FIX.eyePose(static_cast<int>(RECORD.overlayTelemetryIndex[0]), 0);
+        const SPose EYE{SOURCE_EYE.pos, OUTPUT_EYE.rot};
+
+        const auto locate = [&](const char* name) {
+            SPoint point;
+            for (const auto& MARKER : FIX.scene.overlayMarkers) {
+                if (MARKER.name != name)
+                    continue;
+                const auto MEASURED = findColor(IMAGE, MARKER.color, 40, 0, WIDE);
+                if (!MEASURED || MEASURED->count < 80)
+                    break;
+                const SVec3 LOCAL = EYE.dirToLocal(overlayMarkerWorld(FIX.scene, name) - EYE.pos);
+                if (!(LOCAL.z < 0.0))
+                    break;
+                point = {{MEASURED->x, MEASURED->y}, {LOCAL.x / -LOCAL.z, LOCAL.y / -LOCAL.z}, true};
+            }
+            return point;
+        };
+
+        const SPoint TL = locate("geomTL"), TR = locate("geomTR"), BL = locate("geomBL"), BR = locate("geomBR");
+        if (!TL.found || !TR.found || !BL.found || !BR.found)
+            continue;
+
+        const auto axisScale = [](const SPoint& a, const SPoint& b, int axis) { return std::abs(a.pixel[axis] - b.pixel[axis]) / std::abs(a.tan[axis] - b.tan[axis]); };
+
+        const double SX = 0.5 * (axisScale(TL, TR, 0) + axisScale(BL, BR, 0));
+        const double SY = 0.5 * (axisScale(TL, BL, 1) + axisScale(TR, BR, 1));
+        const double ASPECT_ERROR = std::abs(SX / SY - 1.0);
+        worst                     = std::max(worst, ASPECT_ERROR);
+        ++frames;
+
+        EXPECT_LT(ASPECT_ERROR, 0.01) << "frame " << k << ": the output resolves " << SX << " px per tangent horizontally against " << SY
+                                      << " vertically, so a square renders " << SX / SY << " times too wide. Mapping the recorded frustum straight onto the pane would make that "
+                                      << WOULD_HAVE_BEEN;
+    }
+
+    ASSERT_GT(frames, 0u) << "no frame had all four geometry markers; the test proves nothing";
+    std::cout << "[measured] " << frames << " frames under the real frustum: worst aspect error " << worst * 100.0 << "%, against the " << (WOULD_HAVE_BEEN - 1.0) * 100.0
+              << "% the recorded-fov mapping would have introduced on this pane\n";
+}
+
+// And the optical axis: the whole picture must sit where the asymmetry puts it.
+TEST(EndToEnd, MarkersLandWherePredictedUnderTheRealFrustum) {
+    const auto& FIX = realFrustumFixture();
+
+    const auto RENDERED = renderCase(
+        "real-frustum-predict", [](SRenderOptions& options) { options.background = eBackgroundChoice::CAMERA; }, FIX, true);
+    ASSERT_FALSE(RENDERED.report.paneFov.empty());
+    const SFov& OUT = RENDERED.report.paneFov[0];
+
+    // A wrong optical centre would move everything by the difference between the
+    // recorded and fitted centres - about 6% of the width here - so this is a
+    // sharp test of the frustum, not just of the pose chain.
+    const double CENTRE_SHIFT_PX = std::abs(OUT.opticalCentreU() - FIX.scene.eyeFov[0].opticalCentreU()) * PANE_WIDTH;
+
+    size_t checked = 0;
+    double worst   = 0.0;
+    for (size_t k = 0; k < std::min<size_t>(4, RENDERED.report.frames.size()); ++k) {
+        const SImage IMAGE   = RENDERED.frame(k);
+        const auto&  RECORD  = RENDERED.report.frames[k];
+        const SPose  EYE     = FIX.eyePose(static_cast<int>(RECORD.telemetryIndex), 0);
+        const SPose  CAMERA  = FIX.headPose(static_cast<int>(RECORD.telemetryIndex)).compose(FIX.camera(0).headToCamera);
+
+        for (const auto& MARKER : FIX.scene.wallMarkers) {
+            const auto PREDICTED = predictBackgroundPixel(EYE, OUT, PANE_WIDTH, PANE_HEIGHT, CAMERA, MARKER.world, 2.0);
+            if (!PREDICTED)
+                continue;
+            if ((*PREDICTED)[0] < 20 || (*PREDICTED)[0] > PANE_WIDTH - 20 || (*PREDICTED)[1] < 20 || (*PREDICTED)[1] > PANE_HEIGHT - 20)
+                continue;
+            const auto MEASURED = findColor(IMAGE, MARKER.color, 60, 0, PANE_WIDTH);
+            if (!MEASURED || MEASURED->count < 40)
+                continue;
+            const double DX = MEASURED->x - (*PREDICTED)[0];
+            const double DY = MEASURED->y - (*PREDICTED)[1];
+            const double D  = std::sqrt(DX * DX + DY * DY);
+            worst           = std::max(worst, D);
+            ++checked;
+            EXPECT_LT(D, 2.5) << "frame " << k << ", marker `" << MARKER.name << "` landed " << D << " px from the prediction made against the derived output frustum";
+        }
+    }
+    ASSERT_GT(checked, 0u);
+    std::cout << "[measured] " << checked << " markers under the real frustum land within " << worst << " px of prediction; a frustum that ignored the recorded asymmetry would move them "
+              << CENTRE_SHIFT_PX << " px\n";
 }

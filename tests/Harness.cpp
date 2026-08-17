@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <unistd.h>
 
@@ -95,7 +96,8 @@ namespace hxctest {
 
     namespace {
 
-        SFixture buildFixture(const std::string& name, double clockOffsetMs, const std::string& alpha = "premultiplied") {
+        SFixture buildFixture(const std::string& name, double clockOffsetMs, const std::string& alpha = "premultiplied", const std::optional<SFov>& eyeFov = std::nullopt,
+                              bool geometryMarkers = false) {
             SFixture fixture;
             fixture.take = scratchRoot() / (name + ".hypxrtake");
 
@@ -114,6 +116,9 @@ namespace hxctest {
             fixture.options.clockOffsetMs = clockOffsetMs;
             fixture.options.alpha         = alpha;
             fixture.options.quiet         = true;
+            if (eyeFov)
+                fixture.options.eyeFov = *eyeFov;
+            fixture.options.geometryMarkers = geometryMarkers;
 
             if (!fs::exists(fixture.take / "manifest.json")) {
                 setLogLevel(eLogLevel::WARN);
@@ -152,6 +157,17 @@ namespace hxctest {
 
     const SFixture& straightAlphaFixture() {
         static const SFixture FIXTURE = buildFixture("straight-alpha", 200.0, "straight");
+        return FIXTURE;
+    }
+
+    const SFixture& realFrustumFixture() {
+        // The frustum the reference take actually recorded, to four places:
+        // strongly asymmetric (the optical axis sits at 62.1% of the width, not
+        // at half) and with an angular aspect of 0.9255 that matches no pane
+        // anybody would ask for. The default fixture cannot catch a framing bug
+        // because its angular aspect, 1.3349, is within 0.12% of the 4:3 pane the
+        // tests render into - so every stretch cancelled and every test passed.
+        static const SFixture FIXTURE = buildFixture("real-frustum", 200.0, "premultiplied", SFov{-0.9425, 0.6981, 0.7679, -0.9599}, true);
         return FIXTURE;
     }
 
