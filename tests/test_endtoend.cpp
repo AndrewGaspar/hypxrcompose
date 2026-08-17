@@ -75,7 +75,10 @@ namespace {
         throw std::runtime_error("no such overlay marker: " + name);
     }
 
-    const SSynthWallMarker& wallMarker(const SSynthScene& scene, const std::string& name) {
+    // By value: the caller binds the result to a `const auto&`, and returning a
+    // reference into the scene there is a dangling-reference warning waiting to
+    // happen for no gain at this size.
+    SSynthWallMarker wallMarker(const SSynthScene& scene, const std::string& name) {
         for (const auto& MARKER : scene.wallMarkers) {
             if (MARKER.name == name)
                 return MARKER;

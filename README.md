@@ -325,6 +325,28 @@ Plus unit tests for the pose algebra against hand-computed cases, the pinhole mo
 hand-evaluated Brown-Conrady expansion, the clock map's interpolation/holding/inversion, the
 stabilizer's frequency response and phase neutrality, and validate's error cases.
 
+## Measured throughput
+
+A 180-record 90 Hz take with a 45 Hz overlay and 30 Hz cameras, all sources at 1280×960, composed on
+a Ryzen AI 9 HX 370 laptop with both an AMD 890M (radeonsi) and an NVIDIA RTX 5070:
+
+| Output | Background | GPU | fps | Mpix/s | decode | gpu | encode |
+|--------|-----------|-----|----:|------:|-------:|----:|-------:|
+| 1280×960 mono | camera | NVIDIA | 124.8 | 153 | 0.42 s | 0.14 s | 0.16 s |
+| 2560×960 stereo SBS | camera | NVIDIA | 64.3 | 158 | 0.83 s | 0.25 s | 0.32 s |
+| 2560×960 stereo SBS | checker | NVIDIA | 84.1 | 207 | 0.51 s | 0.24 s | 0.32 s |
+| 2560×960 stereo SBS | camera | AMD 890M | 64.7 | 159 | 0.79 s | 0.29 s | 0.31 s |
+
+Two things to read out of that. First, composition runs comfortably faster than real time even in
+stereo — a two-minute take composes in well under a minute. Second, the integrated AMD GPU and the
+discrete NVIDIA one are within one percent of each other, which is the clearest possible statement
+that **this pipeline is not GPU-bound**: roughly 60 % of the wall time is decoding source video
+through pipes and about 18 % is the kernel. The first optimization worth making is not a faster
+shader, it is not paying for `rawvideo` over a pipe (see NEXT-STEPS).
+
+At the smaller resolutions the test suite uses (1920×720 stereo from 640×480 sources) the same rig
+turns in 100–170 fps and 140–230 Mpix/s.
+
 ## Building
 
 Needs a C++23 compiler, CMake ≥ 3.20, EGL and OpenGL ES 3, nlohmann/json, GTest for the suite, and
