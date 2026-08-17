@@ -252,3 +252,12 @@ Interpretations table.
    treats it that way.
 7. **Camera timestamp domain** — research 27 open question 5. `timestamp_source` in the header is
    read and warned about when missing, but v1 cannot compensate for a domain it is not told about.
+
+## stereo-check: automated disparity sanity on real renders (validated by hand 2026-08-17)
+A real-bundle stereo verifier, proven manually on the first real SBS render: split panes,
+phase-correlate horizontal bands → require dy == 0 everywhere and dx within tolerance of the
+telemetry-derived expectation: distant-feature shift from the per-eye frustum asymmetry
+(Δtan of the eye fov centers × px-per-tan) plus IPD/depth parallax for content depth taken
+from the quad records. First real measurement: 381–384 px measured vs ~377 px predicted
+(349 frustum + 28 parallax at 1.48 m), dy = 0 in all bands. Ship as
+`hypxrcompose stereo-check <take> <render>` and run it in the synth end-to-end suite too.
