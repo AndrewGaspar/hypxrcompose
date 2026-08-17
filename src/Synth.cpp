@@ -1,0 +1,527 @@
+#include "Synth.hpp"
+#include "Ffmpeg.hpp"
+#include "Log.hpp"
+#include "SynthScene.hpp"
+#include "Timeline.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <nlohmann/json.hpp>
+#include <thread>
+
+using json = nlohmann::json;
+namespace fs = std::filesystem;
+
+namespace hxc {
+
+    namespace {
+
+        struct SRgba {
+            uint8_t r = 0, g = 0, b = 0, a = 255;
+        };
+
+        constexpr SRgba VOID_COLOR{12, 14, 18, 255};
+
+        // Rows are independent, so the image loops split across cores. The camera
+        // pass is the expensive one: a 640x480 frame is 300k rays and a take is
+        // dozens of frames per camera.
+        template <typename F>
+        void parallelRows(int height, F&& body) {
+            unsigned threads = std::thread::hardware_concurrency();
+            if (threads == 0)
+                threads = 1;
+            threads = std::min<unsigned>(threads, static_cast<unsigned>(std::max(1, height)));
+            if (threads == 1) {
+                for (int y = 0; y < height; ++y)
+                    body(y);
+                return;
+            }
+
+            std::vector<std::thread> workers;
+            workers.reserve(threads);
+            for (unsigned t = 0; t < threads; ++t) {
+                workers.emplace_back([&, t] {
+                    for (int y = static_cast<int>(t); y < height; y += static_cast<int>(threads))
+                        body(y);
+                });
+            }
+            for (auto& WORKER : workers)
+                WORKER.join();
+        }
+
+        bool insideSquare(double x, double y, double centreX, double centreY, double size) {
+            return std::abs(x - centreX) <= size * 0.5 && std::abs(y - centreY) <= size * 0.5;
+        }
+
+        SRgba shadeWall(const SSynthScene& scene, double x, double y, int codeIndex) {
+            if (std::abs(x) > scene.wallHalfX || std::abs(y) > scene.wallHalfY)
+                return VOID_COLOR;
+
+            for (const auto& MARKER : scene.wallMarkers) {
+                if (insideSquare(x, y, MARKER.world.x, MARKER.world.y, MARKER.size))
+                    return {static_cast<uint8_t>(MARKER.color[0]), static_cast<uint8_t>(MARKER.color[1]), static_cast<uint8_t>(MARKER.color[2]), 255};
+            }
+
+            if (insideSquare(x, y, scene.codeCentre.x, scene.codeCentre.y, scene.codeSize)) {
+                const int RED = scene.codeBase + (codeIndex % scene.codeModulus) * scene.codeStep;
+                return {static_cast<uint8_t>(std::clamp(RED, 0, 255)), static_cast<uint8_t>(scene.codeGreen), static_cast<uint8_t>(scene.codeBlue), 255};
+            }
+
+            const int  CELL_X = static_cast<int>(std::floor((x + 128.0) / scene.checkerCell));
+            const int  CELL_Y = static_cast<int>(std::floor((y + 128.0) / scene.checkerCell));
+            const bool DARK   = ((CELL_X + CELL_Y) & 1) == 0;
+            return DARK ? SRgba{34, 42, 52, 255} : SRgba{158, 166, 176, 255};
+        }
+
+        // Ray/plane intersection against the wall, in world space.
+        bool traceWall(const SSynthScene& scene, const SVec3& origin, const SVec3& direction, double& x, double& y) {
+            if (std::abs(direction.z) < 1e-12)
+                return false;
+            const double TRAVEL = (scene.wallZ - origin.z) / direction.z;
+            if (!(TRAVEL > 0.0))
+                return false;
+            x = origin.x + direction.x * TRAVEL;
+            y = origin.y + direction.y * TRAVEL;
+            return true;
+        }
+
+        SRgba shadeOverlayQuad(const SSynthScene& scene, double u, double v) {
+            const double HALF_W = scene.quadWidth * 0.5;
+            const double HALF_H = scene.quadHeight * 0.5;
+
+            if (std::abs(u) <= HALF_W && std::abs(v) <= HALF_H) {
+                for (const auto& MARKER : scene.overlayMarkers) {
+                    if (insideSquare(u, v, MARKER.u, MARKER.v, MARKER.size))
+                        return {static_cast<uint8_t>(MARKER.color[0]), static_cast<uint8_t>(MARKER.color[1]), static_cast<uint8_t>(MARKER.color[2]), 255};
+                }
+                // A gradient so the panel is not a flat colour a resampling bug could
+                // hide inside.
+                const double NX = (u + HALF_W) / scene.quadWidth;
+                const double NY = (v + HALF_H) / scene.quadHeight;
+                return {static_cast<uint8_t>(40.0 + 120.0 * NX), static_cast<uint8_t>(60.0 + 90.0 * NY), static_cast<uint8_t>(150.0 - 60.0 * NX), 255};
+            }
+
+            // A half-transparent halo, so the composite exercises real alpha blending
+            // rather than a binary matte.
+            if (std::abs(u) <= HALF_W + scene.quadHalo && std::abs(v) <= HALF_H + scene.quadHalo)
+                return {90, 70, 140, 128};
+
+            return {0, 0, 0, 0};
+        }
+
+        std::string jsonDouble(double value) {
+            return std::format("{:.17g}", value);
+        }
+
+        std::string poseJson(const SPose& pose) {
+            return std::format(R"({{"pos":[{},{},{}],"quat":[{},{},{},{}]}})", jsonDouble(pose.pos.x), jsonDouble(pose.pos.y), jsonDouble(pose.pos.z), jsonDouble(pose.rot.x),
+                               jsonDouble(pose.rot.y), jsonDouble(pose.rot.z), jsonDouble(pose.rot.w));
+        }
+
+        std::string fovJson(const SFov& fov) {
+            return std::format(R"({{"l":{},"r":{},"u":{},"d":{}}})", jsonDouble(fov.l), jsonDouble(fov.r), jsonDouble(fov.u), jsonDouble(fov.d));
+        }
+
+    }
+
+    int runSynth(const SSynthOptions& options) {
+        if (options.out.empty()) {
+            HXC_ERR("synth needs an output path");
+            return 2;
+        }
+        if (options.frames <= 0 || !(options.hz > 0.0)) {
+            HXC_ERR("synth needs a positive frame count and rate");
+            return 2;
+        }
+
+        // ---- the scene ------------------------------------------------------------
+        SSynthScene scene;
+        scene.t0HostNs      = options.t0HostNs;
+        scene.hz            = options.hz;
+        scene.frames        = options.frames;
+        scene.overlayHz     = options.overlayHz > 0.0 ? options.overlayHz : options.hz;
+        scene.overlayWidth  = options.overlayWidth;
+        scene.overlayHeight = options.overlayHeight;
+        scene.wallZ         = options.wallZ;
+        scene.wallHalfX     = 4.0;
+        scene.wallHalfY     = 3.0;
+        scene.checkerCell   = 0.25;
+
+        scene.wallMarkers = {
+            {"green", {0, 255, 0}, {-0.85, 0.30, options.wallZ}, 0.12},
+            {"blue", {0, 0, 255}, {1.15, -0.75, options.wallZ}, 0.12},
+            {"red", {255, 0, 0}, {-0.15, -0.75, options.wallZ}, 0.12},
+        };
+        scene.codeCentre = {0.0, 0.78, options.wallZ};
+
+        scene.overlayQuad     = {{0.30, 0.02, -1.10}, SQuat::fromAxisAngle({0.0, 1.0, 0.0}, -0.14)};
+        scene.overlayMarkers  = {
+            {"centre", {255, 0, 255}, 0.0, 0.0, 0.06},
+            {"corner", {0, 255, 255}, 0.26, 0.14, 0.05},
+        };
+
+        scene.ipd       = options.ipd;
+        scene.eyeFov[0] = {-0.95, 0.86, 0.75, -0.78};
+        scene.eyeFov[1] = {-0.86, 0.95, 0.75, -0.78};
+
+        // ---- the clock ------------------------------------------------------------
+        const int64_t T0       = scene.t0HostNs;
+        const int64_t DURATION = static_cast<int64_t>(std::llround(static_cast<double>(options.frames - 1) * 1e9 / options.hz));
+        const int64_t T_END    = T0 + DURATION;
+
+        std::vector<SClockSample> clockSamples;
+        {
+            const int64_t OFFSET0 = static_cast<int64_t>(std::llround(options.clockOffsetMs * 1e6));
+            // A little deterministic jitter on each sample, because a real offset
+            // estimator is noisy and the compositor must not depend on a clean line.
+            uint64_t      rng     = 0x9E3779B97F4A7C15ULL;
+            const auto    NEXT    = [&rng] {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                return rng;
+            };
+            for (int64_t t = T0 - options.clockIntervalNs; t <= T_END + 2 * options.clockIntervalNs; t += options.clockIntervalNs) {
+                const double SECONDS = static_cast<double>(t - T0) * 1e-9;
+                const int64_t DRIFT  = static_cast<int64_t>(std::llround(options.clockDriftPpm * SECONDS * 1000.0));
+                const int64_t JITTER = static_cast<int64_t>(NEXT() % 40001) - 20000; // +/- 20 us
+                clockSamples.push_back({t, OFFSET0 + DRIFT + JITTER, 1800.0 + static_cast<double>(NEXT() % 400)});
+            }
+        }
+        const CClockMap CLOCK(clockSamples);
+
+        // ---- camera cadence -------------------------------------------------------
+        if (options.cameras) {
+            const double  SPLAY      = options.cameraSplayDeg * M_PI / 180.0;
+            const int64_t PHASE_NS   = 7000000; // deliberately not aligned with the telemetry cadence
+            const int64_t FIRST      = CLOCK.deviceFromHost(T0 + PHASE_NS);
+            const int     COUNT      = static_cast<int>(std::floor(static_cast<double>(DURATION) * 1e-9 * options.cameraHz)) + 1;
+
+            for (int eye = 0; eye < 2; ++eye) {
+                SSynthCamera camera;
+                camera.key    = eye == 0 ? "L" : "R";
+                camera.eye    = eye;
+                camera.width  = options.cameraWidth;
+                camera.height = options.cameraHeight;
+                camera.hz     = options.cameraHz;
+                camera.exposureNs = options.exposureNs;
+
+                const double SIGN         = eye == 0 ? -1.0 : 1.0;
+                camera.headToCamera.pos   = {SIGN * options.cameraBaseline * 0.5, -options.cameraDrop, -options.cameraForward};
+                camera.headToCamera.rot   = SQuat::fromYawPitchRoll(-SIGN * SPLAY, -0.0175, 0.0);
+
+                // Wide enough that the eye frustum sits inside the camera's, with a
+                // little to spare for the splay and the head's translation - but only
+                // a little, so the out-of-coverage fallback still gets exercised at
+                // the extreme corners, exactly as a real passthrough camera does.
+                camera.intrinsics.fx         = 190.0;
+                camera.intrinsics.fy         = 190.0;
+                camera.intrinsics.cx         = static_cast<double>(options.cameraWidth) * 0.5 + 3.5;
+                camera.intrinsics.cy         = static_cast<double>(options.cameraHeight) * 0.5 - 2.5;
+                camera.intrinsics.distortion = {-0.06, 0.008, 0.0009, -0.0006, 0.0};
+
+                for (int j = 0; j < COUNT; ++j)
+                    camera.deviceNs.push_back(FIRST + static_cast<int64_t>(std::llround(static_cast<double>(j) * 1e9 / options.cameraHz)));
+
+                scene.cameras.push_back(std::move(camera));
+            }
+            scene.hasCameras = true;
+        }
+
+        // ---- audio stamps ---------------------------------------------------------
+        if (options.audio) {
+            scene.hasApp             = true;
+            scene.app.sampleRate     = 48000;
+            scene.app.startNs        = T0 + 120000000;
+            scene.app.clickHostNs    = T0 + 300000000;
+            scene.app.clickTrackNs   = scene.app.clickHostNs;
+            scene.app.clickAmplitude = 0.90;
+
+            if (options.mic) {
+                scene.hasMic             = true;
+                scene.mic.sampleRate     = 48000;
+                scene.mic.startNs        = CLOCK.deviceFromHost(T0 + 60000000);
+                scene.mic.clickHostNs    = T0 + 600000000;
+                scene.mic.clickTrackNs   = CLOCK.deviceFromHost(scene.mic.clickHostNs);
+                scene.mic.clickAmplitude = 0.55;
+            }
+        }
+
+        // ---- directories ----------------------------------------------------------
+        std::error_code ec;
+        fs::remove_all(options.out, ec);
+        for (const auto& SUBDIRECTORY : {fs::path{}, fs::path{"overlay"}, fs::path{"audio"}, fs::path{"synth"}, fs::path{"cameras"}}) {
+            if (SUBDIRECTORY == "cameras" && !options.cameras)
+                continue;
+            fs::create_directories(options.out / SUBDIRECTORY, ec);
+        }
+
+        const std::string TAKE_ID = std::format("synth-{}", T0);
+
+        // ---- manifest -------------------------------------------------------------
+        {
+            json manifest;
+            manifest["take_id"] = TAKE_ID;
+            manifest["host"]    = {
+                {"tool", "hypxrcompose synth"},
+                {"tool_version", "1"},
+                {"synthetic", true},
+                {"clock_offset_ms", options.clockOffsetMs},
+                {"clock_drift_ppm", options.clockDriftPpm},
+            };
+            manifest["sources"] = {
+                {"overlay", true},
+                {"app_audio", scene.hasApp},
+                {"cameras", scene.hasCameras},
+                {"mic", scene.hasMic},
+            };
+            manifest["overlay"] = {
+                {"width", scene.overlayWidth}, {"height", scene.overlayHeight}, {"format", "rgba"}, {"encoder", "ffv1"}, {"target_hz", scene.overlayHz}, {"eye_count", 2}, {"alpha", "straight"},
+            };
+            manifest["notes"] = json::array({
+                "synthetic bundle from `hypxrcompose synth`; the scene is described exactly in synth/ground-truth.json",
+                std::format("host<->device offset starts at {:.3f} ms and drifts {:.1f} ppm", options.clockOffsetMs, options.clockDriftPpm),
+                "camera extrinsics deliberately differ from the eye poses (wider baseline, forward offset, outward splay)",
+            });
+
+            std::ofstream stream(options.out / "manifest.json");
+            stream << manifest.dump(2) << "\n";
+        }
+
+        // ---- telemetry and clock --------------------------------------------------
+        {
+            std::ofstream telemetry(options.out / "telemetry.jsonl");
+            // A constant session-lifetime stage correction, exactly the kind research
+            // 27 footnote 2 says must be recorded. v1 records and reports it; it does
+            // not re-derive geometry from it, because the stamped eye poses already
+            // include it.
+            const SPose STAGE_CORRECTION{{0.0, 0.0, 0.0}, SQuat::fromAxisAngle({0.0, 1.0, 0.0}, 0.004)};
+
+            for (int k = 0; k < options.frames; ++k) {
+                const int64_t T_HOST = scene.frameHostNs(k);
+                const SPose   HEAD   = scene.headAt(T_HOST);
+
+                std::string eyes;
+                for (int eye = 0; eye < 2; ++eye) {
+                    const SPose EYE_POSE = HEAD.compose({{(eye == 0 ? -0.5 : 0.5) * scene.ipd, 0.0, 0.0}, SQuat::identity()});
+                    if (eye > 0)
+                        eyes += ",";
+                    eyes += std::format(R"({{"pose":{},"fov":{}}})", poseJson(EYE_POSE), fovJson(scene.eyeFov[static_cast<size_t>(eye)]));
+                }
+
+                telemetry << std::format(R"({{"t_host_ns":{},"frame":{},"eyes":[{}],"head":{},"stage_correction":{},"blend_mode":"alpha"}})", T_HOST, k, eyes, poseJson(HEAD),
+                                         poseJson(STAGE_CORRECTION))
+                          << "\n";
+            }
+
+            std::ofstream clock(options.out / "clock.jsonl");
+            for (const auto& SAMPLE : clockSamples)
+                clock << std::format(R"({{"t_host_ns":{},"offset_ns":{},"rtt_us":{}}})", SAMPLE.tHostNs, SAMPLE.offsetNs, jsonDouble(SAMPLE.rttUs)) << "\n";
+        }
+
+        // ---- ground truth ---------------------------------------------------------
+        {
+            std::ofstream stream(options.out / SSynthScene::RELATIVE_PATH);
+            stream << scene.toJson() << "\n";
+        }
+
+        std::string error;
+
+        // ---- overlay videos -------------------------------------------------------
+        {
+            const int    WIDTH  = scene.overlayWidth;
+            const int    HEIGHT = scene.overlayHeight;
+            const int    COUNT  = static_cast<int>(std::llround(static_cast<double>(options.frames) * scene.overlayHz / scene.hz));
+
+            for (int eye = 0; eye < 2; ++eye) {
+                auto encoder = CSimpleEncoder::open((options.out / "overlay" / std::format("eye{}.mkv", eye)).string(), WIDTH, HEIGHT, scene.overlayHz,
+                                                    {"-c:v", "ffv1", "-pix_fmt", "rgba"}, static_cast<double>(T0) * 1e-9, error);
+                if (!encoder) {
+                    HXC_ERR("{}", error);
+                    return 1;
+                }
+
+                std::vector<uint8_t> frame(static_cast<size_t>(WIDTH) * HEIGHT * 4);
+                for (int k = 0; k < COUNT; ++k) {
+                    const int64_t T_HOST   = T0 + static_cast<int64_t>(std::llround(static_cast<double>(k) * 1e9 / scene.overlayHz));
+                    const SPose   HEAD     = scene.headAt(T_HOST);
+                    const SPose   EYE_POSE = HEAD.compose({{(eye == 0 ? -0.5 : 0.5) * scene.ipd, 0.0, 0.0}, SQuat::identity()});
+                    const SFov&   FOV      = scene.eyeFov[static_cast<size_t>(eye)];
+                    // The quad is a plane through the origin of its own frame, so the
+                    // intersection is solved in quad-local coordinates.
+                    const SVec3   LOCAL_ORIGIN = scene.overlayQuad.pointToLocal(EYE_POSE.pos);
+
+                    parallelRows(HEIGHT, [&](int y) {
+                        for (int x = 0; x < WIDTH; ++x) {
+                            const SVec3 DIRECTION = EYE_POSE.dirToWorld(fovRay(FOV, x, y, WIDTH, HEIGHT));
+                            const SVec3 LOCAL_DIR = scene.overlayQuad.dirToLocal(DIRECTION);
+
+                            SRgba pixel{0, 0, 0, 0};
+                            if (std::abs(LOCAL_DIR.z) > 1e-12) {
+                                const double TRAVEL = -LOCAL_ORIGIN.z / LOCAL_DIR.z;
+                                if (TRAVEL > 0.0)
+                                    pixel = shadeOverlayQuad(scene, LOCAL_ORIGIN.x + LOCAL_DIR.x * TRAVEL, LOCAL_ORIGIN.y + LOCAL_DIR.y * TRAVEL);
+                            }
+
+                            uint8_t* out = frame.data() + (static_cast<size_t>(y) * WIDTH + static_cast<size_t>(x)) * 4;
+                            out[0]       = pixel.r;
+                            out[1]       = pixel.g;
+                            out[2]       = pixel.b;
+                            out[3]       = pixel.a;
+                        }
+                    });
+
+                    if (!encoder->writeFrame(frame.data(), frame.size())) {
+                        HXC_ERR("the overlay encoder for eye {} stopped accepting frames", eye);
+                        return 1;
+                    }
+                }
+                if (!encoder->finish(error)) {
+                    HXC_ERR("{}", error);
+                    return 1;
+                }
+            }
+            if (!options.quiet)
+                HXC_INFO("wrote {} overlay frames per eye at {}x{}", COUNT, WIDTH, HEIGHT);
+        }
+
+        // ---- camera videos --------------------------------------------------------
+        if (scene.hasCameras) {
+            std::ofstream sidecar(options.out / "cameras" / std::format("{}-cameras.jsonl", TAKE_ID));
+
+            json header;
+            header["timestamp_source"] = "SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME";
+            header["cameras"]          = json::array();
+            for (const auto& CAMERA : scene.cameras) {
+                header["cameras"].push_back({
+                    {"cam", CAMERA.key},
+                    {"width", CAMERA.width},
+                    {"height", CAMERA.height},
+                    {"intrinsics",
+                     {{"fx", CAMERA.intrinsics.fx}, {"fy", CAMERA.intrinsics.fy}, {"cx", CAMERA.intrinsics.cx}, {"cy", CAMERA.intrinsics.cy}, {"distortion", CAMERA.intrinsics.distortion}}},
+                    {"extrinsics_head_to_camera",
+                     {{"pos", json::array({CAMERA.headToCamera.pos.x, CAMERA.headToCamera.pos.y, CAMERA.headToCamera.pos.z})},
+                      {"quat", json::array({CAMERA.headToCamera.rot.x, CAMERA.headToCamera.rot.y, CAMERA.headToCamera.rot.z, CAMERA.headToCamera.rot.w})}}},
+                });
+            }
+            sidecar << header.dump() << "\n";
+
+            for (const auto& CAMERA : scene.cameras) {
+                const int WIDTH  = CAMERA.width;
+                const int HEIGHT = CAMERA.height;
+
+                // The per-pixel unprojection depends only on the intrinsics, so it is
+                // computed once for the whole camera rather than per frame. This is
+                // also the only place the *inverse* distortion model runs: the
+                // compositor samples through the forward model, so a disagreement
+                // between the two shows up as misalignment in the composite.
+                std::vector<SVec3> rays(static_cast<size_t>(WIDTH) * HEIGHT);
+                parallelRows(HEIGHT, [&](int y) {
+                    for (int x = 0; x < WIDTH; ++x)
+                        rays[static_cast<size_t>(y) * WIDTH + static_cast<size_t>(x)] = unprojectPinhole(CAMERA.intrinsics, static_cast<double>(x) + 0.5, static_cast<double>(y) + 0.5);
+                });
+
+                auto encoder = CSimpleEncoder::open((options.out / "cameras" / std::format("{}-cam{}.mp4", TAKE_ID, CAMERA.key)).string(), WIDTH, HEIGHT, CAMERA.hz,
+                                                    {"-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv444p"}, static_cast<double>(CAMERA.deviceNs.front()) * 1e-9, error);
+                if (!encoder) {
+                    HXC_ERR("{}", error);
+                    return 1;
+                }
+
+                std::vector<uint8_t> frame(static_cast<size_t>(WIDTH) * HEIGHT * 4);
+                for (size_t j = 0; j < CAMERA.deviceNs.size(); ++j) {
+                    // Mid-exposure, exactly as research 27 section 3 footnote 1
+                    // requires and exactly as the compositor re-derives it.
+                    const int64_t MID_EXPOSURE = CAMERA.deviceNs[j] + CAMERA.exposureNs / 2;
+                    const int64_t HOST         = CLOCK.hostFromDevice(MID_EXPOSURE);
+                    const SPose   CAMERA_POSE  = scene.headAt(HOST).compose(CAMERA.headToCamera);
+
+                    parallelRows(HEIGHT, [&](int y) {
+                        for (int x = 0; x < WIDTH; ++x) {
+                            const size_t INDEX     = static_cast<size_t>(y) * WIDTH + static_cast<size_t>(x);
+                            const SVec3  DIRECTION = CAMERA_POSE.dirToWorld(rays[INDEX]);
+
+                            SRgba  pixel = VOID_COLOR;
+                            double hitX = 0.0, hitY = 0.0;
+                            if (traceWall(scene, CAMERA_POSE.pos, DIRECTION, hitX, hitY))
+                                pixel = shadeWall(scene, hitX, hitY, static_cast<int>(j));
+
+                            uint8_t* out = frame.data() + INDEX * 4;
+                            out[0]       = pixel.r;
+                            out[1]       = pixel.g;
+                            out[2]       = pixel.b;
+                            out[3]       = 255;
+                        }
+                    });
+
+                    if (!encoder->writeFrame(frame.data(), frame.size())) {
+                        HXC_ERR("the camera encoder for {} stopped accepting frames", CAMERA.key);
+                        return 1;
+                    }
+
+                    sidecar << std::format(R"({{"cam":"{}","t_device_ns":{},"exposure_ns":{},"frame":{}}})", CAMERA.key, CAMERA.deviceNs[j], CAMERA.exposureNs, j) << "\n";
+                }
+
+                if (!encoder->finish(error)) {
+                    HXC_ERR("{}", error);
+                    return 1;
+                }
+                if (!options.quiet)
+                    HXC_INFO("wrote {} frames for camera {} at {}x{}", CAMERA.deviceNs.size(), CAMERA.key, WIDTH, HEIGHT);
+            }
+        }
+
+        // ---- audio ----------------------------------------------------------------
+        const auto writeTrack = [&](const SSynthAudio& track, double toneHz, double toneAmplitude, const fs::path& media, const fs::path& sidecar, const char* startKey) -> bool {
+            const int64_t LENGTH_NS = DURATION + 400000000;
+            const size_t  SAMPLES   = static_cast<size_t>(static_cast<double>(LENGTH_NS) * 1e-9 * track.sampleRate);
+
+            std::vector<int16_t> pcm(SAMPLES, 0);
+            for (size_t i = 0; i < SAMPLES; ++i) {
+                const double T     = static_cast<double>(i) / track.sampleRate;
+                const double VALUE = toneAmplitude * std::sin(2.0 * M_PI * toneHz * T);
+                pcm[i]             = static_cast<int16_t>(std::lround(std::clamp(VALUE, -1.0, 1.0) * 32767.0));
+            }
+
+            // A four-sample impulse whose position is the assertion: it must land on
+            // the output timeline at the host instant recorded in the ground truth,
+            // whichever clock domain the track was stamped in.
+            const int64_t OFFSET_NS   = track.clickTrackNs - track.startNs;
+            const int64_t CLICK_INDEX = static_cast<int64_t>(std::llround(static_cast<double>(OFFSET_NS) * 1e-9 * track.sampleRate));
+            for (int64_t i = 0; i < 4; ++i) {
+                const int64_t INDEX = CLICK_INDEX + i;
+                if (INDEX >= 0 && INDEX < static_cast<int64_t>(pcm.size()))
+                    pcm[static_cast<size_t>(INDEX)] = static_cast<int16_t>(std::lround(track.clickAmplitude * 32767.0));
+            }
+
+            if (!encodePcmS16(media.string(), pcm, track.sampleRate, 1, error)) {
+                HXC_ERR("{}", error);
+                return false;
+            }
+
+            json meta;
+            meta[startKey]         = track.startNs;
+            meta["sample_rate_hz"] = track.sampleRate;
+            meta["channels"]       = 1;
+            meta["encoder"]        = "flac";
+            std::ofstream stream(sidecar);
+            stream << meta.dump(2) << "\n";
+            return true;
+        };
+
+        if (scene.hasApp && !writeTrack(scene.app, 440.0, 0.15, options.out / "audio" / "app.flac", options.out / "audio" / "app.json", "start_t_host_ns"))
+            return 1;
+        if (scene.hasMic && !writeTrack(scene.mic, 880.0, 0.10, options.out / "audio" / std::format("{}-mic.flac", TAKE_ID), options.out / "audio" / std::format("{}-mic.json", TAKE_ID),
+                                        "start_t_device_ns"))
+            return 1;
+
+        if (!options.quiet) {
+            HXC_INFO("synthesized {} ({} telemetry records over {:.3f} s)", options.out.string(), options.frames, static_cast<double>(DURATION) * 1e-9);
+            HXC_INFO("clock offset starts at {:.3f} ms, drifting {:.1f} ppm; camera baseline {:.1f} mm against an IPD of {:.1f} mm", options.clockOffsetMs, options.clockDriftPpm,
+                     options.cameraBaseline * 1000.0, options.ipd * 1000.0);
+        }
+        return 0;
+    }
+
+}

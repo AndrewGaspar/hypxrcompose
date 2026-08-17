@@ -34,8 +34,12 @@ add_library(hypxrcompose_core STATIC
     src/Validate.cpp
     src/ComposeGL.cpp
     src/Render.cpp
+    src/SynthScene.cpp
+    src/Synth.cpp
     src/ComposeGL.cpp
     src/Render.cpp
+    src/SynthScene.cpp
+    src/Synth.cpp
     src/Synth.cpp
 )
 target_include_directories(hypxrcompose_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
