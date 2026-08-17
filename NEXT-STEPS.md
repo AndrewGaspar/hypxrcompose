@@ -134,8 +134,99 @@ gap 2 (both are "the pose/depth for a sample is not constant across the frame").
 | **Straight-alpha edge bleed.** | A `"premultiplied"` bundle — what the host producer emits — filters correctly by construction. A `"straight"` one still bleeds unassociated colour at matte edges under bilinear sampling, because association happens after the filter. Associating on upload would fix it, at the cost of a conversion pass. |
 | **Per-frame fov is taken from the nearest telemetry record, not interpolated.** | Correct for `asis` at capture rate. If output rates diverge from capture rates, the frustum should interpolate the way the pose does. |
 | **Colour management is sRGB-only.** | Compositing is now correct: sources decode from sRGB to linear light (in hardware, before filtering), blend premultiplied, and encode once on output. What is still assumed is that *everything is sRGB* — a wide-gamut or HDR overlay tap would need its actual primaries and transfer function in the manifest, and the output would need somewhere to put values above 1.0. |
-| **libav\* linkage.** | v1 talks to `ffmpeg` over pipes deliberately (see README). A v2 that wants hardware decode straight into a GL texture — which is where the throughput ceiling is — should link libav\*; the seam is `src/Ffmpeg.cpp`. |
-| **Throughput.** | On the measured rig the composite is dominated by decode and pipe traffic, not by the GPU. The first optimization is not a faster kernel, it is not paying for `rawvideo` over a pipe twice. |
+| **libav\* linkage.** | v1 talks to `ffmpeg` over pipes deliberately (see README). A v2 that wants hardware decode straight into a GL texture — which is where the throughput ceiling is — should link libav\*; the seam is `src/Ffmpeg.cpp`. See "Throughput" below for why this is now the *first* thing to do rather than the last. |
+
+---
+
+## Throughput — measured on the first real take, and where the ceiling actually is
+
+The reference take: `hypxrtake-20260817-115453-230`, 91.9 s, 4604 telemetry records, 2101 overlay
+frames per eye at 2064×2162 ffv1 RGBA (2.3 + 2.5 GB). The reference render: left eye, 1920×1080,
+`--framing asis`, libx264 crf 18 preset medium, 4137 output frames. The machine: Ryzen AI 9 HX 370,
+12 cores / 24 threads, RTX 5070 Laptop.
+
+| | before | after |
+|---|---|---|
+| `validate` | **≈840 s** (≈14 min) | **1.57 s** cold page cache, **0.63 s** warm |
+| `render` | 70.1 s (1.31× realtime) | 69.5 s (1.32× realtime) |
+
+`validate` was the whole win, and it was pure waste: `ffprobe -show_entries frame=pts_time` *decodes*
+every frame to learn a number the container already holds. Counting packets instead gives the same
+2101 per eye, and the alignment rule is enforced identically either way. `--deep` keeps the decoding
+path for when a file is suspected of being truncated rather than merely large.
+
+`render` did not move, and the reason is worth writing down because it is the opposite of what this
+repo previously assumed.
+
+**The composite is not decode-bound with an idle machine behind it. It is machine-bound.** Phase
+split on the reference render: decode 27.1 s, GPU 18.1 s, encode 19.5 s, and the whole run keeps
+**18 of 24 hardware threads busy** — because ffmpeg's ffv1 decode and x264's encode each already
+thread across everything available. The decisive measurement is one that does not involve this
+tool's own parallelism at all: **running two whole renders side by side takes exactly twice as long
+as running one** (scaling 1.05 of a possible 2.0; four at once, 1.06 of 4.0). There is no idle
+capacity to harvest.
+
+So segment-parallel rendering, which is implemented and correct, does not pay here: measured
+`--jobs 4` = 1.07× *slower* than `--jobs 1`, `--jobs 8` = 1.10× slower. The default is 1. It stays in
+the tool because the finding is about this workload on this machine — it pays wherever the per-frame
+cost is *not* already spread across every core — and because `--segment i/k` is how a long take gets
+split across several machines or resumed after a failure.
+
+What would actually move the number, in order of measured value:
+
+1. **Stop pushing raw RGBA through pipes.** Every output frame moves ~70 MB between processes:
+   17.8 MB out of the decoder, the same again into the GL upload, 8.3 MB back out of the readback,
+   8.3 MB into the encoder. At 45 fps that is several GB/s of pure memory traffic on a laptop part
+   whose bandwidth is shared with the iGPU. This is the ceiling, and it is exactly the libav\*
+   linkage item above: decode into a hardware frame, hand it to GL as a texture, never round-trip
+   through the CPU. Nothing else on this list is worth doing first.
+2. **Take the encode off the CPU.** `--codec hevc_nvenc` measured 1263 → 692 CPU-seconds, roughly
+   halving the machine's load; wall time gained 1.27× on a *contended* machine and nothing on a
+   quiet one, which is the signature of a bottleneck that has moved elsewhere (see 1). `--crf` now
+   maps to NVENC's constant-quality VBR, so quality is comparable rather than the default bitrate
+   target it silently used before. Caveat from the bench: on this laptop the dGPU is not always
+   present (`CUDA_ERROR_NO_DEVICE` when it has powered down), so this cannot be a default.
+3. **Change what capture writes** — see the two capture-side notes below.
+
+### Capture-side: `utvideo` is the decode-fast, disk-heavy trade, and it already works end to end
+
+`manifest.overlay.encoder` already accepts `utvideo` (gbrap), the loader validates it, and the
+compositor decodes it, so this is a producer-side switch with no compositor work at all. Measured on
+the real overlay's own frames, transcoded ffv1 → utvideo:
+
+| | ffv1 (as recorded) | utvideo |
+|---|---|---|
+| decode, 24 threads | 60.3 fps | **257.3 fps** (4.3×) |
+| decode CPU per frame | 320 ms | **46.5 ms** (6.9× less) |
+| size per frame | 1.10 MB | 3.06 MB (2.8× more) |
+
+The CPU figure is the one that matters given the finding above: ffv1 buys its compression with a lot
+of CPU, and — worth knowing — its *threading* is expensive too. Single-threaded ffv1 decode costs
+140 CPU-ms per frame against 320 CPU-ms at 24 threads: 2.3× the CPU for 7.5× the wall. So a take
+recorded as utvideo costs 2.8× the disk during capture and hands most of a core back per decoder.
+For a 92-second take that is 2.3 GB → 6.4 GB per eye, which is the real question for the producer,
+not the compositor.
+
+### Capture-side: the NVENC lossless "filming tier"
+
+Approved as a roadmap item, not built. The idea is that the overlay tap stops being a lossless CPU
+codec and becomes a hardware-encoded pair of streams:
+
+1. *Split the planes.* NVENC cannot carry alpha. So the overlay is written as **two** streams — colour
+   as 4:4:4 and the matte as a luma-only stream — rather than one RGBA stream. They are the same
+   frame count, aligned by the same ordinal rule the contract already specifies, so the bundle grows
+   a second file per eye and nothing else changes semantically.
+2. *Encode losslessly.* `hevc_nvenc` with lossless 4:4:4 keeps the "nothing in a bundle is derived"
+   property that makes old takes replayable by a better compositor. Lossy here would be a
+   capture-side decision that can never be undone, which is the one class of mistake this
+   architecture exists to avoid.
+3. *Decode with NVDEC.* The point is symmetric: a take encoded on the GPU should be decoded on the
+   GPU, straight into a texture, which is item 1 of the throughput list. This is what makes the
+   filming tier worth building — not the capture saving, but that it removes the CPU from both ends.
+
+The compositor work is real but contained: `SOverlayInfo` grows a matte path per eye, the loader
+validates the two streams against each other, and `ComposeGL` samples two textures instead of one.
+The alignment rule, the alpha association, and the linear-light composite are all unchanged.
 
 ---
 

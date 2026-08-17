@@ -211,12 +211,20 @@ side producers need to converge on these, or change them here.
 ### validate
 
 ```
-hypxrcompose validate <take> [--strict] [--json] [--no-media]
+hypxrcompose validate <take> [--strict] [--json] [--no-media] [--deep] [--checksum]
 ```
 
 Runs the same loader `render` runs, with media probing on, and reports every structural and
 referential problem rather than stopping at the first. Exit 0 clean (warnings allowed unless
 `--strict`), 1 on errors, 2 if the bundle could not be opened at all.
+
+Frame counts come from the container's packet index, not from decoding. For every encoder the
+contract allows an overlay to use — ffv1, utvideo, png — one packet is exactly one frame, so the
+count is not an estimate; it is the same number a full decode gives, and the alignment rule is
+enforced identically either way. The difference is that on a 92-second two-eye take the fast path
+takes **1.6 s** and the decoding one took **fourteen minutes**. `--deep` still decodes, for when a
+file is suspected of being truncated rather than merely large, and `--checksum` adds an md5 over
+every decoded frame. A codec outside the known intra-only set is counted from the index but says so.
 
 The referential checks are the interesting ones: overlay frames must have a stamped pose nearby,
 camera sidecar records must match the video's frame count, camera timestamps must map onto the
@@ -265,6 +273,7 @@ hypxrcompose render <take> --out film.mp4
     [--background auto|camera|checker|solid] [--bg-depth M] [--fg-depth M|inf]
     [--stabilize-ms N] [--mic-gain G] [--no-audio] [--no-limiter]
     [--codec NAME] [--crf N] [--gpu SUBSTR] [--frames-dir DIR] [--report FILE] [--limit N]
+    [--jobs N] [--segment i/k] [--decode-threads N]
 ```
 
 `--size` is the size of **one eye's pane**; stereo SBS output is therefore `2W x H`, which keeps each
@@ -273,6 +282,28 @@ eye's geometry undistorted rather than squeezing two eyes into one frame.
 `--report` writes a JSON record of which telemetry record, overlay frame, and camera frame every
 output frame was made of, plus the throughput breakdown. It is the first thing to look at when a
 composite looks wrong.
+
+`--jobs N` cuts the output timeline into N chunks and composes them in parallel worker processes,
+joining the encoded chunks with a stream copy and muxing audio once at the end. **It defaults to 1,
+and on the measured take turning it up made things slower** — the serial pipeline already keeps 18 of
+24 hardware threads busy, so there is nothing for a second worker to take. The numbers, and where the
+time actually goes, are in [NEXT-STEPS.md](NEXT-STEPS.md#throughput--measured-on-the-first-real-take-and-where-the-ceiling-actually-is).
+`--segment i/k` renders one chunk by hand, which is how a long take is split across machines or
+resumed after a failure.
+
+### Stereo signalling
+
+A `--eye stereo-sbs` render says so in the file, so a player or an XR compositor can detect it
+instead of being told. Two signals are written, because no single one is understood everywhere:
+
+| Output | Signal | Read back with | Who detects it |
+|---|---|---|---|
+| `.mkv` / `.webm` | Matroska **StereoMode** = `left_right` | `ffprobe -show_entries stream_tags=stereo_mode` | mpv, and the XR desktop's stereo window auto-tagging |
+| `.mp4` with libx264/libx265 | H.264/HEVC **frame-packing SEI**, arrangement type 3 (side by side) | `ffprobe -show_frames` → `side_data_type=Stereo 3D` | players that read the bitstream; survives a stream copy, so a `--jobs` join keeps it |
+| `.mp4` with any other encoder | none available | — | warns at startup: write `.mkv`, or use libx264/libx265 |
+
+Matroska output gets both. A mono render carries neither — a wrong stereo flag is worse than no flag,
+since anything honouring it will show one picture as two half-width ones.
 
 ## How it works
 
