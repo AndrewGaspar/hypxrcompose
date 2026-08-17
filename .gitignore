@@ -1,0 +1,15 @@
+# Build directories
+/build/
+/build-*/
+/out/
+
+# Scratch takes produced by `hypxrcompose synth`
+*.hypxrtake/
+/takes/
+
+# Editor / tooling
+/.cache/
+/.clangd
+compile_commands.json
+*.o
+*.swp
