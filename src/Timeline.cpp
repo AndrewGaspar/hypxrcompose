@@ -46,11 +46,18 @@ namespace hxc {
             return tDeviceNs;
 
         // Seed with the offset sampled at the device instant read as if it were a
-        // host instant; the error in that seed is offset*drift, which two
-        // corrections annihilate.
+        // host instant, then iterate h <- device - offset(h). The map is a
+        // contraction whenever the offset changes by less than a nanosecond per
+        // nanosecond of host time, which any clock that does not run backwards
+        // satisfies; at realistic drift it converges in one step, and the loop is
+        // bounded so a pathological series cannot spin.
         int64_t host = tDeviceNs - offsetAtHost(tDeviceNs);
-        for (int i = 0; i < 2; ++i)
-            host = tDeviceNs - offsetAtHost(host);
+        for (int i = 0; i < 32; ++i) {
+            const int64_t NEXT = tDeviceNs - offsetAtHost(host);
+            if (NEXT == host)
+                return host;
+            host = NEXT;
+        }
         return host;
     }
 

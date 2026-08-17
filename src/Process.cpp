@@ -56,12 +56,21 @@ namespace hxc {
     }
 
     CSubprocess::~CSubprocess() {
+        // A child still running at destruction is one being abandoned mid-stream -
+        // a decoder the composite stopped reading, or a pipeline being torn down
+        // after an error. Kill it outright before touching the pipes.
+        //
+        // The alternative, closing our end and letting the child discover a broken
+        // pipe, is both noisy and unreliable: it only works if *nobody else* holds a
+        // duplicate of that pipe. Since the pipes are opened O_CLOEXEC no sibling
+        // can hold one any more, but a SIGKILL is decisive regardless and costs
+        // nothing at teardown.
+        if (m_pid > 0 && !m_reaped)
+            ::kill(m_pid, SIGKILL);
         closeIfOpen(m_stdin);
         closeIfOpen(m_stdout);
-        if (m_pid > 0 && !m_reaped) {
-            ::kill(m_pid, SIGTERM);
+        if (m_pid > 0 && !m_reaped)
             wait();
-        }
     }
 
     std::unique_ptr<CSubprocess> CSubprocess::spawn(const std::vector<std::string>& argv, const SOptions& options, std::string& error) {
@@ -74,13 +83,26 @@ namespace hxc {
         if (g_traceCommands)
             HXC_INFO("+ {}", describeArgv(argv));
 
+        // Every pipe is close-on-exec so a later child cannot inherit an earlier
+        // one's pipes. Without this two sibling ffmpeg processes hold duplicates of
+        // each other's fds, so closing our end never reaches the child as EOF or
+        // EPIPE and the pipeline deadlocks. dup2() in the child clears the flag on
+        // the descriptor it installs, so stdin/stdout still cross the exec.
+        static const bool IGNORE_SIGPIPE = [] {
+            // A child that exits early must surface as EPIPE from write(), not as
+            // the death of this process.
+            ::signal(SIGPIPE, SIG_IGN);
+            return true;
+        }();
+        (void)IGNORE_SIGPIPE;
+
         int inPipe[2]  = {-1, -1};
         int outPipe[2] = {-1, -1};
-        if (options.pipeStdin && ::pipe(inPipe) != 0) {
+        if (options.pipeStdin && ::pipe2(inPipe, O_CLOEXEC) != 0) {
             error = std::string("pipe() for stdin failed: ") + std::strerror(errno);
             return nullptr;
         }
-        if (options.pipeStdout && ::pipe(outPipe) != 0) {
+        if (options.pipeStdout && ::pipe2(outPipe, O_CLOEXEC) != 0) {
             error = std::string("pipe() for stdout failed: ") + std::strerror(errno);
             closeIfOpen(inPipe[0]);
             closeIfOpen(inPipe[1]);
@@ -116,8 +138,10 @@ namespace hxc {
                     ::close(NULL_FD);
                 }
             }
-            // A child killed by SIGPIPE when we stop reading is the normal way a
-            // decode ends early, so leave the default disposition in place.
+            // The parent ignores SIGPIPE; the child must not inherit that, or a
+            // decoder whose consumer went away would spin instead of ending.
+            ::signal(SIGPIPE, SIG_DFL);
+
             std::vector<char*> raw;
             raw.reserve(argv.size() + 1);
             for (const auto& ARG : argv)
