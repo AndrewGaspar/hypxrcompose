@@ -50,3 +50,23 @@ target_compile_options(hypxrcompose PRIVATE -Wall -Wextra)
 
 install(TARGETS hypxrcompose RUNTIME DESTINATION bin)
 
+if(HYPXRCOMPOSE_TESTS)
+    find_package(GTest QUIET)
+    if(GTest_FOUND)
+        enable_testing()
+        add_executable(hypxrcompose_tests
+            tests/test_math.cpp
+            tests/test_timeline.cpp
+            tests/test_stabilize.cpp
+            tests/test_validate.cpp
+            tests/test_endtoend.cpp
+            tests/Harness.cpp
+        )
+        target_include_directories(hypxrcompose_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(hypxrcompose_tests PRIVATE hypxrcompose_core GTest::gtest GTest::gtest_main)
+        target_compile_options(hypxrcompose_tests PRIVATE -Wall -Wextra)
+        add_test(NAME hypxrcompose_tests COMMAND hypxrcompose_tests)
+    else()
+        message(STATUS "GTest not found - skipping the hypxrcompose test suite")
+    endif()
+endif()
