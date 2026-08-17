@@ -23,10 +23,24 @@ because the foreground stops being an image sampled from one viewpoint and becom
 
 **What it needs.**
 
-1. *Bundle*: a `monitors/<name>.mp4` per XR monitor with screencopy timing, and a per-frame quad
-   record in `telemetry.jsonl` — pose, extent in metres, visibility/opacity, curvature if any, and
-   which monitor texture each quad shows. **This is capture-side and should be recorded now**, even
-   though nothing consumes it yet.
+1. *Bundle*: **the quad records now exist and are recorded** — `telemetry.jsonl` carries a `quads`
+   array per record with `index`, `name`, `pose`, `size`, `visibility`, `view_space`, `swapchain`,
+   `image`, `array_layer`, and `rect`. `hypxrcompose` parses and validates them today without
+   compositing them, so a v2 starts from checked data. Two semantics must be honoured exactly, and
+   both are easy to get wrong:
+
+   - **`pose` is head-relative.** The layer's STAGE pose at time *t* is `head(t) ∘ pose`. Reading it
+     as a world pose puts every layer in the wrong place the instant the wearer moves.
+   - **`view_space` decides what that means over time.** `true` = head-locked: the layer stays at
+     this head-relative pose. `false` = room-anchored: the layer had a fixed STAGE pose, and what was
+     recorded is that pose relative to the head at *t*, so a replay must re-anchor rather than carry
+     it along. The synthetic bundle contains one of each, and the test suite asserts the
+     room-anchored one re-anchors to a constant STAGE pose across the whole take.
+
+   `swapchain` is stable within a session only, so it identifies a texture *within* a take and must
+   not be persisted across takes. What is still missing is the pixels: a `monitors/<name>.mp4` per XR
+   monitor with screencopy timing, plus the mapping from `(swapchain, image, array_layer, rect)` to a
+   region of one of those files. **That part is capture-side and should be recorded now.**
 2. *Compositor*: a textured-quad rasterizer. The existing kernel is a full-screen inverse warp with
    no geometry stage; grade B needs an actual draw per quad with depth sorting (or back-to-front
    painting, which for a handful of quads is simpler and exact), and the layer blend the session used.
@@ -117,9 +131,9 @@ gap 2 (both are "the pose/depth for a sample is not constant across the frame").
 | **MV-HEVC / spatial video output.** | `--eye stereo-sbs` covers the immediately shareable case. MV-HEVC is a mux-time concern (§5.1) and lands in `Ffmpeg.cpp`'s writer spec, not in the kernel. |
 | **Nearest-neighbour source resampling.** | Output frames pick the nearest source frame in time. At 30 Hz cameras against 45 Hz output that visibly stutters, and the same applies to overlay frames lost to the readback queue. Motion-compensated interpolation is the fix; simple frame blending is not (it doubles edges). Until then, matching `--fps` to the camera rate is the honest option for camera-dominant cuts. |
 | **A dropped overlay frame is held, not synthesized.** | When a record carries `"dropped": true` the composite reuses the nearest surviving overlay frame, reprojected from *its* pose. That is correct rather than merely convenient - the pixels really were rendered from that viewpoint - but a long readback stall shows as a static overlay over a moving background. Grade-B replay (gap 1) removes the problem entirely, since it re-renders rather than resamples. |
-| **The overlay's straight-alpha edges.** | Bilinear sampling of straight-alpha RGBA bleeds background colour at matte edges. Premultiplying on upload would fix it; the manifest key that says which association the file uses (Interpretation 1) has to be settled first. |
+| **Straight-alpha edge bleed.** | A `"premultiplied"` bundle — what the host producer emits — filters correctly by construction. A `"straight"` one still bleeds unassociated colour at matte edges under bilinear sampling, because association happens after the filter. Associating on upload would fix it, at the cost of a conversion pass. |
 | **Per-frame fov is taken from the nearest telemetry record, not interpolated.** | Correct for `asis` at capture rate. If output rates diverge from capture rates, the frustum should interpolate the way the pose does. |
-| **No colour management.** | Everything is treated as 8-bit sRGB-ish and blended in that space. Alpha blending in a non-linear space is wrong at partial alpha, visibly so on the halo edges of a bright overlay. Blending in linear light needs the transfer function the overlay tap actually wrote. |
+| **Colour management is sRGB-only.** | Compositing is now correct: sources decode from sRGB to linear light (in hardware, before filtering), blend premultiplied, and encode once on output. What is still assumed is that *everything is sRGB* — a wide-gamut or HDR overlay tap would need its actual primaries and transfer function in the manifest, and the output would need somewhere to put values above 1.0. |
 | **libav\* linkage.** | v1 talks to `ffmpeg` over pipes deliberately (see README). A v2 that wants hardware decode straight into a GL texture — which is where the throughput ceiling is — should link libav\*; the seam is `src/Ffmpeg.cpp`. |
 | **Throughput.** | On the measured rig the composite is dominated by decode and pipe traffic, not by the GPU. The first optimization is not a faster kernel, it is not paying for `rawvideo` over a pipe twice. |
 
@@ -130,16 +144,20 @@ gap 2 (both are "the pose/depth for a sample is not constant across the frame").
 These are the ones the compositor cannot answer alone; they are also listed in README's
 Interpretations table.
 
-1. **Overlay alpha association** — straight or premultiplied? Please emit `manifest.overlay.alpha`.
+1. ~~**Overlay alpha association**~~ — **settled: `"premultiplied"`, multiplied in linear light with
+   the sRGB encode after.** `"straight"` remains supported, and an absent field still means straight
+   for older bundles.
 2. ~~**Overlay pts epoch**~~ — **settled.** Overlay frames align to telemetry by ordinal: the n-th
    frame is the n-th record without `"dropped": true`. Container pts are a nominal timeline at
    `target_hz` and are never used to align. `manifest.overlay.pts_epoch_ns` is obsolete and warned
    about.
-3. **A head pose per telemetry record** — v1 derives it as the eye midpoint. Emitting `"head"`
-   removes an assumption from the camera extrinsic chain.
+3. ~~**A head pose per telemetry record**~~ — **settled: `head` is recorded per record, in STAGE
+   space at the eyes' instant.** The eye-midpoint derivation survives only as a fallback.
 4. **Camera calibration header shape and `cam` key domain** — v1 accepts several spellings; pick one.
+   The same applies to the quad records' `size`, `visibility`, and `rect` spellings.
 5. **`extrinsics_head_to_camera` axis convention** — v1 requires OpenXR axes (camera looks down −Z).
    Android's `LENS_POSE_ROTATION` is not in that frame; the conversion belongs device-side.
-6. **`stage_correction` semantics** — applied already, or still to apply?
+6. ~~**`stage_correction` semantics**~~ — **settled: informational only, never applied.** v1 already
+   treats it that way.
 7. **Camera timestamp domain** — research 27 open question 5. `timestamp_source` in the header is
    read and warned about when missing, but v1 cannot compensate for a domain it is not told about.

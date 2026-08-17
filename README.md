@@ -54,6 +54,8 @@ This is the format `validate` arbitrates and `render` consumes. Where this docum
                          {"t_host_ns", "frame",
                           "eyes":[{"pose":{"pos":[3],"quat":[4]},
                                    "fov":{"l","r","u","d"}} x eye_count],
+                          "head":{"pos":[3],"quat":[4]},
+                          "quads":[{...} x layers],
                           "stage_correction":{...}|null, "blend_mode",
                           "dropped": true|false (optional, default false)}
   clock.jsonl            {"t_host_ns", "offset_ns", "rtt_us"}   (device = host + offset)
@@ -75,8 +77,8 @@ This is the format `validate` arbitrates and `render` consumes. Where this docum
 
 Conventions, fixed once and depended on everywhere:
 
-- **Space** is OpenXR's: right-handed, +X right, +Y up, −Z forward. Every pose in the bundle lives in
-  the session's `LOCAL_FLOOR`-derived tracking space.
+- **Space** is OpenXR's: right-handed, +X right, +Y up, −Z forward. Eye, head, and camera poses are in
+  the client's **STAGE** space.
 - **A pose** is `pos` + `quat` in `(x, y, z, w)` order, taking local vectors to world:
   `world = rot * local + pos`. Quaternions must be unit to 1e-3.
 - **A field of view** is OpenXR's `XrFovf`: four half-angles in radians, `l` and `d` normally
@@ -91,6 +93,54 @@ Conventions, fixed once and depended on everywhere:
   constant outside them.
 - **Camera timestamps** are the *start* of exposure; the pose that belongs to a frame is the one at
   `t_device_ns + exposure_ns/2` (research 27 §3 footnote 1).
+
+### Head pose and composition layers
+
+Each record carries **`head`**, a pose at the same instant and in the same space as the eyes. Camera
+extrinsics and quad poses are relative to it. When it is absent — only in bundles written before it
+existed — the head falls back to the midpoint of the eyes, which is where OpenXR's VIEW space sits;
+validate says so, and rejects a bundle that carries it on some records but not others.
+
+Each record also carries **`quads`**, one entry per composition layer, in composition order back to
+front:
+
+```
+{"index", "name" (currently always null), "pose", "size" (metres), "visibility",
+ "view_space" (bool), "swapchain", "image", "array_layer", "rect"}
+```
+
+Two semantics here are load-bearing, and getting either wrong puts every layer in the wrong place:
+
+1. **`pose` is head-relative.** The layer's pose in STAGE space at time *t* is `head(t) ∘ pose`.
+2. **`view_space` says what that means over time.** `true` = head-locked: the layer stays at this
+   head-relative pose always. `false` = room-anchored: the layer had a fixed pose in STAGE, and what
+   was recorded is that pose expressed relative to the head at *t*. A replay must re-anchor it rather
+   than carry it along with the head.
+
+`swapchain` is stable within a session only. v1 does not composite quads — it uses the recorded
+matte — but it parses, validates, and carries them, because telemetry not recorded correctly today is
+telemetry v2 cannot use. `validate` warns when a take has no quad records at all: it composes fine,
+but grade-B replay is foreclosed for it forever.
+
+### Alpha association and colour space
+
+`manifest.overlay.alpha` says how the overlay video stores colour:
+
+- **`"premultiplied"`** (what the host producer emits): the multiply happens **in linear light** and
+  the sRGB encode after it, so a stored byte is `srgb_encode(color_linear · alpha)`.
+- **`"straight"`**: the stored byte is `srgb_encode(color_linear)`, unassociated.
+- Absent: treated as `"straight"`, for bundles written before the field existed.
+
+Alpha itself is never encoded; only the colour channels are.
+
+The compositor therefore decodes sRGB → composites in **premultiplied linear** → encodes back. Both
+source textures are uploaded as `GL_SRGB8_ALPHA8`, so the hardware decodes to linear *before*
+filtering — the only place that decode can correctly happen, since filtering encoded values is wrong
+at every edge. The single encode is in the fragment shader, on the way into the render target.
+
+This is not a nicety. Blending a 75 %-alpha layer in encoded space instead of linear light lands
+about 30 levels away from the right answer, and the test suite asserts against both the correct value
+and that specific wrong one.
 
 ### The overlay alignment rule
 
@@ -137,16 +187,17 @@ side producers need to converge on these, or change them here.
 
 | # | Question | What v1 does |
 |---|----------|--------------|
-| 1 | **Overlay alpha association.** `"format": "rgba"` does not say whether colour is premultiplied. OpenXR composition layers default to premultiplied. | Straight (unassociated) alpha by default. An optional `manifest.overlay.alpha` of `"straight"` or `"premultiplied"` overrides it; anything else is an error. **Producers should emit this key explicitly.** |
+| 1 | ~~**Overlay alpha association**~~ — **settled by the producers.** | `manifest.overlay.alpha` is authoritative: `"premultiplied"` (the host producer's output, multiplied in linear light and sRGB-encoded after) or `"straight"`. Absent still defaults to `"straight"` for older bundles. See "Alpha association and colour space". |
 | 2 | ~~**`container pts = t_host_ns`**~~ — **settled by the producers, not an interpretation any more.** | Overlay frames align to telemetry by ordinal (see "The overlay alignment rule"). Container pts are nominal and unused. `manifest.overlay.pts_epoch_ns`, which an earlier reading of the contract used, is now warned about as obsolete. |
-| 3 | **A head pose is needed but not recorded.** Camera extrinsics are head-relative; the contract carries per-eye poses only. | The head is the midpoint of the two eye poses (position mean, rotation slerped halfway), which is where OpenXR's VIEW space sits. An optional per-record `"head"` pose is used when present. **Producers are encouraged to emit it.** |
+| 3 | ~~**A head pose is needed but not recorded**~~ — **settled by the producers.** | Every record carries `head`, in STAGE space at the eyes' instant. The eye-midpoint derivation survives only as a fallback for older bundles, and validate warns when it is used. |
 | 4 | **Camera calibration header shape.** "intrinsics and extrinsics per cam" does not fix the container. | Three shapes are read: a `cameras` array of entries each with a `cam` key, a `cameras` object keyed by camera, or the camera keys at the top level. `timestamp_source` is read from the header or from each entry. |
 | 5 | **Camera keys.** The filenames say `camL`/`camR`; the per-frame `cam` field's domain is unstated. | `"L"`, `"left"`, `"cam0"`, `"caml"`, `"0"`, `"eye0"` and integer `0` all normalize to left/eye 0; the `R` forms to right/eye 1. Anything else is an error. |
 | 6 | **The `<id>-` prefix** on camera and mic files. | Discovery is by suffix (`*-cameras.jsonl`, `*-cam{L,R}.mp4`, `*-mic.flac`), so any prefix works; the bare spellings `mic.flac` and `cameras.jsonl` are also accepted, and the mic pair is looked for under `audio/` and at the take root. |
 | 7 | **Camera video ↔ sidecar correspondence.** | The sidecar is authoritative for timestamps: its records for a given camera, in file order, correspond one-for-one with that camera's video frames in decode order. A count mismatch is an error. |
-| 8 | **`stage_correction`'s shape and semantics.** The contract writes `{...}|null`. | Read as a pose (`pos` + `quat`) and recorded, but **not applied**: the stamped eye poses are taken to already include it, per research 27 §3 footnote 2 ("the *applied value* per frame"). An object of another shape warns. If the producers' semantics turn out to be "the correction that still needs applying", this is the one place that must change. |
+| 8 | ~~**`stage_correction`'s semantics**~~ — **confirmed pinned by the producers: informational only, never applied.** | Read as a pose and recorded; the stamped eye poses already include it. v1's original reading was right. |
 | 9 | **Overlay file names.** The contract says `overlay/eye{0,1}.mkv`; research 27 §4 wrote `overlay/{left,right}.mkv`. | Both are accepted, `eye{0,1}` preferred, with a warning on the older spelling. |
 | 10 | **Distortion vector length.** | 0, 4, or 5 coefficients are read as OpenCV `k1,k2,p1,p2,k3` with missing terms zero; longer vectors warn and the first five are used. |
+| 12 | **Quad record field shapes.** `size`, `visibility`, and `rect` have unstated spellings. | `size` reads as `[w, h]` metres or an object with `width`/`height`; `visibility` as a boolean or a 0..1 opacity; `rect` as `[x, y, w, h]` swapchain pixels or an object. `index` must equal the entry's position in the array, since the array is composition order. |
 | 11 | **Extra files.** | Unknown files and directories are ignored, which is what lets `synth` drop its ground truth at `synth/ground-truth.json` inside a bundle that still validates clean. |
 
 ## Usage
@@ -181,6 +232,12 @@ The generator deliberately makes the easy things hard:
 
 - a nonzero, drifting host↔device clock offset (default +250 ms at +20 ppm) with jitter on each
   sample, so a compositor that forgets to map device time selects visibly wrong frames;
+- two composition layers with both `view_space` values — a room-anchored monitor and a head-locked
+  HUD — recorded head-relative exactly as the producer records them, so a v2 grade-B replayer has a
+  bundle with known-correct answers to develop against;
+- a 75 %-alpha HUD and a 50 %-alpha marker and halo, stored premultiplied in linear light (or
+  straight, with `--alpha straight`), so neither the colour space nor the association can be guessed
+  wrong and still pass;
 - camera extrinsics that are not the eye poses — a wider baseline (84 mm) than the IPD (63 mm), a
   45 mm forward offset, a 12 mm drop, and a 2° outward splay;
 - asymmetric, per-eye-mirrored fields of view;
@@ -319,6 +376,9 @@ synthetic scene's geometry is closed-form. What each one proves:
 | `StabilizedFramingRendersFromTheSmoothedCamera` | The render path uses the smoothed camera, keeps the eye's offset from the head, and warps by direction only at infinite foreground depth. |
 | `AudioClicksLandOnTheOutputTimeline` | Both clock domains place correctly: a host-stamped click and a device-stamped click both land within two samples of their predicted output positions. |
 | `TheOrdinalAlignmentCountIsEnforced` | Flipping one record's `dropped` flag makes the counts disagree, and validate says so. The rule the whole overlay path rests on is not taken on trust. |
+| `PartialAlphaCompositesInLinearLightFromAPremultipliedSource` | A 75 %-alpha layer over a known background composites to the linear-light answer and *not* to the encoded-space one, which the test computes explicitly and requires to be at least 15 levels away. Covers both the colour space and the premultiplied association in one measurement. |
+| `StraightAndPremultipliedBundlesComposeToTheSamePixels` | Two encodings of identical imagery compose alike to within rounding — so the compositor really is reading the manifest field rather than assuming one. |
+| `QuadRecordsRoundTripWithHeadRelativePoses` | Quad records survive parse intact, and `head ∘ pose` re-anchors the room-anchored layer to the same STAGE pose at every record (measured: 4.5 × 10⁻¹³ mm) while the head-locked one's STAGE pose follows the head. A v2 reading these as world poses fails here. |
 | `AHostOnlyTakeComposesOverTheCheckerBackground` | A bundle with no device sources still composes and claims no camera frames. |
 
 Plus unit tests for the pose algebra against hand-computed cases, the pinhole model against a
