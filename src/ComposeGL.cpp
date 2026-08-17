@@ -62,6 +62,22 @@ uniform sampler2D uFgTex;
 
 out vec4 fragColor;
 
+// Compositing is a linear-light operation. Both source textures are uploaded as
+// GL_SRGB8_ALPHA8, so `texture()` returns linear colour (and untouched alpha) and
+// bilinear filtering happens in linear light too, which is the only place it is
+// correct. Colours authored in this shader are written the way they look - that
+// is, sRGB-encoded - so they are decoded before use. The one encode happens at
+// the very end, on the way into the RGBA8 render target.
+vec3 srgbToLinear(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
+
+vec3 linearToSrgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
+}
+
 // The image's row 0 is its top; GL's row 0 is the bottom. Everything below works
 // in the CPU convention and readback() flips on the way out, which is the same
 // arrangement the portal demo's offscreen path uses.
@@ -87,11 +103,12 @@ vec3 sourceLocal(mat3 rotInv, vec3 sourcePos, vec3 dirWorld, float depth) {
     return rotInv * dirWorld;
 }
 
-vec4 sampleCamera(vec3 dirWorld) {
+// Returns linear-light colour.
+vec3 sampleCamera(vec3 dirWorld) {
     vec3  local = sourceLocal(uCamRotInv, uCamPos, dirWorld, uBgDepth);
     float zcv   = -local.z;
     if (zcv <= 1e-6)
-        return uSolid;
+        return srgbToLinear(uSolid.rgb);
 
     float xn = local.x / zcv;
     float yn = -local.y / zcv;
@@ -107,15 +124,17 @@ vec4 sampleCamera(vec3 dirWorld) {
     vec2 pixel = vec2(uCamIntr.x * xd + uCamIntr.z, uCamIntr.y * yd + uCamIntr.w);
     vec2 uv    = pixel / uCamSize;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
-        return uSolid;
+        return srgbToLinear(uSolid.rgb);
 
-    return vec4(texture(uBgTex, uv).rgb, 1.0);
+    // The texture is GL_SRGB8_ALPHA8, so this is already linear.
+    return texture(uBgTex, uv).rgb;
 }
 
 // A world-locked checker for takes with no camera source. It is drawn in
 // direction space, so it shows the output camera's rotation honestly: with
 // --framing stabilized the checker stops shaking, which is the whole point.
-vec4 checkerBackground(vec3 dirWorld) {
+// Returns linear-light colour; the constants below are written as they look.
+vec3 checkerBackground(vec3 dirWorld) {
     vec3  d     = normalize(dirWorld);
     float yaw   = atan(d.x, -d.z);
     float pitch = asin(clamp(d.y, -1.0, 1.0));
@@ -131,19 +150,21 @@ vec4 checkerBackground(vec3 dirWorld) {
         color = vec3(0.28, 0.34, 0.40);
     if (abs(yaw) < 0.006 && abs(pitch) < 0.25)
         color = vec3(0.34, 0.26, 0.22);
-    return vec4(color, 1.0);
+    return srgbToLinear(color);
 }
 
 void main() {
     ivec2 pixel    = panePixel();
     vec3  dirWorld = uOutRot * rayFromFov(uOutFovTan, pixel, uPaneSize);
 
-    vec4 background = uSolid;
+    vec3 background = srgbToLinear(uSolid.rgb);
     if (uBgMode == 1)
         background = checkerBackground(dirWorld);
     else if (uBgMode == 2)
         background = sampleCamera(dirWorld);
 
+    // Linear colour, linear alpha. Whether the colour is already multiplied by
+    // that alpha is what uPremultiplied says.
     vec4 overlay = vec4(0.0);
     if (uHasFg == 1) {
         vec3 local = sourceLocal(uFgRotInv, uFgPos, dirWorld, uFgDepth);
@@ -157,8 +178,12 @@ void main() {
         }
     }
 
+    // The over operator, in premultiplied linear form. A straight-alpha source is
+    // associated here; a premultiplied one already is, and multiplying again would
+    // darken every partially transparent pixel by its own alpha.
     vec3 premultiplied = uPremultiplied == 1 ? overlay.rgb : overlay.rgb * overlay.a;
-    fragColor          = vec4(background.rgb * (1.0 - overlay.a) + premultiplied, 1.0);
+    vec3 composited    = background * (1.0 - overlay.a) + premultiplied;
+    fragColor          = vec4(linearToSrgb(composited), 1.0);
 }
 )GLSL";
 
@@ -307,8 +332,14 @@ void main() {
             // Row 0 of the upload becomes v = 0, so the texture's v axis runs top to
             // bottom in image order, matching the CPU pixel convention the shader
             // computes its uv in.
+            //
+            // GL_SRGB8_ALPHA8, not GL_RGBA8: the hardware then decodes the colour
+            // channels to linear light *before* filtering, which is where the
+            // decode has to happen. Doing it in the shader after a bilinear fetch
+            // would filter encoded values, which is wrong at every edge. Alpha is
+            // left alone by the sRGB format, which is also correct.
             if (slot.width != width || slot.height != height) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB8_ALPHA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
                 slot.width  = width;
                 slot.height = height;
             } else

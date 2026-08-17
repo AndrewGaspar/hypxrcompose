@@ -51,6 +51,7 @@ synth:
       --no-mic             app audio only
       --clock-offset-ms N  host->device offset at the take start (default 250)
       --clock-drift-ppm N  offset drift (default 20)
+      --alpha premultiplied|straight   how the overlay stores colour (default premultiplied)
       --ipd N              interpupillary distance in metres (default 0.063)
       --cam-baseline N     camera separation in metres (default 0.084)
 
@@ -199,7 +200,12 @@ int main(int argc, char** argv) {
                 options.audio = false;
             else if (ARG == "--no-mic")
                 options.mic = false;
-            else if (ARG == "--clock-offset-ms" && parseDouble(value(COUNT, REST, i), number))
+            else if (ARG == "--alpha") {
+                const char* CHOICE = value(COUNT, REST, i);
+                if (!CHOICE)
+                    return 2;
+                options.alpha = CHOICE;
+            } else if (ARG == "--clock-offset-ms" && parseDouble(value(COUNT, REST, i), number))
                 options.clockOffsetMs = number;
             else if (ARG == "--clock-drift-ppm" && parseDouble(value(COUNT, REST, i), number))
                 options.clockDriftPpm = number;

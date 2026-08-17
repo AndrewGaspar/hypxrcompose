@@ -117,6 +117,10 @@ namespace hxc {
             {"centre", hxc::toJson(codeCentre)}, {"size", codeSize}, {"base", codeBase}, {"step", codeStep}, {"modulus", codeModulus}, {"green", codeGreen}, {"blue", codeBlue},
         };
 
+        scene["overlay_alpha"] = overlayAlpha;
+        scene["hud_quad"]      = {
+            {"pose", hxc::toJson(hudQuad)}, {"width", hudWidth}, {"height", hudHeight}, {"color", json::array({hudColor[0], hudColor[1], hudColor[2]})}, {"alpha", hudAlpha},
+        };
         scene["overlay_quad"] = {
             {"pose", hxc::toJson(overlayQuad)}, {"width", quadWidth}, {"height", quadHeight}, {"halo", quadHalo}, {"markers", json::array()},
         };
@@ -127,6 +131,7 @@ namespace hxc {
                 {"u", MARKER.u},
                 {"v", MARKER.v},
                 {"size", MARKER.size},
+                {"alpha", MARKER.alpha},
             });
         }
 
@@ -191,6 +196,14 @@ namespace hxc {
             out.codeGreen    = CODE.at("green").get<int>();
             out.codeBlue     = CODE.at("blue").get<int>();
 
+            out.overlayAlpha  = SCENE.at("overlay_alpha").get<std::string>();
+            const json& HUD   = SCENE.at("hud_quad");
+            out.hudQuad       = poseFrom(HUD.at("pose"));
+            out.hudWidth      = HUD.at("width").get<double>();
+            out.hudHeight     = HUD.at("height").get<double>();
+            out.hudColor      = {HUD.at("color").at(0).get<int>(), HUD.at("color").at(1).get<int>(), HUD.at("color").at(2).get<int>()};
+            out.hudAlpha      = HUD.at("alpha").get<double>();
+
             const json& QUAD = SCENE.at("overlay_quad");
             out.overlayQuad  = poseFrom(QUAD.at("pose"));
             out.quadWidth    = QUAD.at("width").get<double>();
@@ -203,6 +216,7 @@ namespace hxc {
                 parsed.u     = MARKER.at("u").get<double>();
                 parsed.v     = MARKER.at("v").get<double>();
                 parsed.size  = MARKER.at("size").get<double>();
+                parsed.alpha = MARKER.at("alpha").get<double>();
                 out.overlayMarkers.push_back(parsed);
             }
 

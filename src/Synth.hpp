@@ -80,6 +80,12 @@ namespace hxc {
         double  cameraDrop      = 0.012;
         double  cameraSplayDeg  = 2.0;
 
+        // How the overlay video stores its colour. The host producer premultiplies
+        // in linear light and encodes afterwards, so that is the primary case; the
+        // straight spelling is generated too, because both are supported and only a
+        // generator that can write both can prove the compositor tells them apart.
+        std::string alpha       = "premultiplied";
+
         double  wallZ           = -2.0;
         int64_t t0HostNs        = 14400LL * 1000000000LL; // a plausible CLOCK_MONOTONIC: four hours of uptime
 

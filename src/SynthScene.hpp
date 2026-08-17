@@ -33,6 +33,10 @@ namespace hxc {
         double             u    = 0.0;
         double             v    = 0.0;
         double             size = 0.05;
+        // Unassociated alpha. A marker below 1 is what makes the composite prove it
+        // blends in linear light: the same blend done in encoded space lands
+        // dozens of levels away.
+        double             alpha = 1.0;
 
         SVec3              world(const SPose& quad) const {
             return quad.pointToWorld({u, v, 0.0});
@@ -94,11 +98,25 @@ namespace hxc {
         int    codeGreen    = 200;
         int    codeBlue     = 40;
 
+        // How the overlay video stores its colour: "premultiplied" (the host
+        // producer's default - colour multiplied by alpha in linear light, then
+        // sRGB-encoded) or "straight".
+        std::string                      overlayAlpha = "premultiplied";
+
+        // The room-anchored "monitor" layer, in STAGE space. Composition index 0.
         SPose                            overlayQuad;
         double                           quadWidth  = 0.70;
         double                           quadHeight = 0.42;
         double                           quadHalo   = 0.04;
         std::vector<SSynthOverlayMarker> overlayMarkers;
+
+        // The head-locked "HUD" layer, recorded head-relative and staying there.
+        // Composition index 1, in front of the monitor.
+        SPose                            hudQuad;
+        double                           hudWidth  = 0.16;
+        double                           hudHeight = 0.10;
+        std::array<int, 3>               hudColor{255, 200, 0};
+        double                           hudAlpha  = 0.75;
 
         double                 ipd = 0.063;
         std::array<SFov, 2>    eyeFov{};

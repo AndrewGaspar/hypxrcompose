@@ -214,6 +214,22 @@ namespace hxc {
         return fovProject(fov, local, width, height, px, py);
     }
 
+    double srgbToLinear(double encoded) {
+        if (encoded <= 0.0)
+            return 0.0;
+        if (encoded >= 1.0)
+            return 1.0;
+        return encoded <= 0.04045 ? encoded / 12.92 : std::pow((encoded + 0.055) / 1.055, 2.4);
+    }
+
+    double linearToSrgb(double linear) {
+        if (linear <= 0.0)
+            return 0.0;
+        if (linear >= 1.0)
+            return 1.0;
+        return linear <= 0.0031308 ? linear * 12.92 : 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055;
+    }
+
     std::string toString(const SVec3& v) {
         return std::format("({:.6f}, {:.6f}, {:.6f})", v.x, v.y, v.z);
     }

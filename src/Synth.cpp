@@ -87,28 +87,61 @@ namespace hxc {
             return true;
         }
 
-        SRgba shadeOverlayQuad(const SSynthScene& scene, double u, double v) {
+        // Premultiplied linear colour plus linear alpha - the space compositing is
+        // defined in, and the space the producer's overlay tap works in before it
+        // encodes.
+        struct SLinearRgba {
+            double r = 0.0, g = 0.0, b = 0.0, a = 0.0;
+        };
+
+        SLinearRgba fromSrgb(double red, double green, double blue, double alpha) {
+            return {srgbToLinear(red / 255.0) * alpha, srgbToLinear(green / 255.0) * alpha, srgbToLinear(blue / 255.0) * alpha, alpha};
+        }
+
+        SLinearRgba fromSrgb(const std::array<int, 3>& color, double alpha) {
+            return fromSrgb(color[0], color[1], color[2], alpha);
+        }
+
+        // The over operator on premultiplied linear values.
+        SLinearRgba over(const SLinearRgba& front, const SLinearRgba& back) {
+            const double KEEP = 1.0 - front.a;
+            return {front.r + back.r * KEEP, front.g + back.g * KEEP, front.b + back.b * KEEP, front.a + back.a * KEEP};
+        }
+
+        // Encodes a premultiplied linear pixel the way the manifest says the file
+        // stores it. "premultiplied" encodes the associated colour directly;
+        // "straight" divides the association back out first, which is exactly the
+        // step a compositor that mistook one for the other would skip.
+        SRgba encodeOverlay(const SLinearRgba& pixel, bool premultiplied) {
+            const auto CHANNEL = [&](double value) {
+                const double LINEAR = premultiplied ? value : (pixel.a > 0.0 ? value / pixel.a : 0.0);
+                return static_cast<uint8_t>(std::lround(std::clamp(linearToSrgb(LINEAR), 0.0, 1.0) * 255.0));
+            };
+            return {CHANNEL(pixel.r), CHANNEL(pixel.g), CHANNEL(pixel.b), static_cast<uint8_t>(std::lround(std::clamp(pixel.a, 0.0, 1.0) * 255.0))};
+        }
+
+        SLinearRgba shadeOverlayQuad(const SSynthScene& scene, double u, double v) {
             const double HALF_W = scene.quadWidth * 0.5;
             const double HALF_H = scene.quadHeight * 0.5;
 
             if (std::abs(u) <= HALF_W && std::abs(v) <= HALF_H) {
                 for (const auto& MARKER : scene.overlayMarkers) {
                     if (insideSquare(u, v, MARKER.u, MARKER.v, MARKER.size))
-                        return {static_cast<uint8_t>(MARKER.color[0]), static_cast<uint8_t>(MARKER.color[1]), static_cast<uint8_t>(MARKER.color[2]), 255};
+                        return fromSrgb(MARKER.color, MARKER.alpha);
                 }
                 // A gradient so the panel is not a flat colour a resampling bug could
                 // hide inside.
                 const double NX = (u + HALF_W) / scene.quadWidth;
                 const double NY = (v + HALF_H) / scene.quadHeight;
-                return {static_cast<uint8_t>(40.0 + 120.0 * NX), static_cast<uint8_t>(60.0 + 90.0 * NY), static_cast<uint8_t>(150.0 - 60.0 * NX), 255};
+                return fromSrgb(40.0 + 120.0 * NX, 60.0 + 90.0 * NY, 150.0 - 60.0 * NX, 1.0);
             }
 
             // A half-transparent halo, so the composite exercises real alpha blending
             // rather than a binary matte.
             if (std::abs(u) <= HALF_W + scene.quadHalo && std::abs(v) <= HALF_H + scene.quadHalo)
-                return {90, 70, 140, 128};
+                return fromSrgb(90, 70, 140, 0.5);
 
-            return {0, 0, 0, 0};
+            return {};
         }
 
         std::string jsonDouble(double value) {
@@ -156,11 +189,25 @@ namespace hxc {
         };
         scene.codeCentre = {0.0, 0.78, options.wallZ};
 
+        scene.overlayAlpha    = options.alpha;
         scene.overlayQuad     = {{0.30, 0.02, -1.10}, SQuat::fromAxisAngle({0.0, 1.0, 0.0}, -0.14)};
         scene.overlayMarkers  = {
-            {"centre", {255, 0, 255}, 0.0, 0.0, 0.06},
-            {"corner", {0, 255, 255}, 0.26, 0.14, 0.05},
+            {"centre", {255, 0, 255}, 0.0, 0.0, 0.06, 1.0},
+            {"corner", {0, 255, 255}, 0.26, 0.14, 0.05, 1.0},
+            // Half-alpha, and the reason the composite can be shown to blend in
+            // linear light: the same blend done on encoded values lands tens of
+            // levels away from this one.
+            {"halfalpha", {240, 60, 30}, -0.24, -0.13, 0.10, 0.5},
         };
+        // Head-locked, and far enough out of the way that nothing else in the frame
+        // moves under it as the head sweeps.
+        scene.hudQuad = {{-0.52, 0.26, -0.55}, SQuat::identity()};
+
+        const bool PREMULTIPLIED = scene.overlayAlpha == "premultiplied";
+        if (scene.overlayAlpha != "premultiplied" && scene.overlayAlpha != "straight") {
+            HXC_ERR("--alpha takes premultiplied or straight, not `{}`", scene.overlayAlpha);
+            return 2;
+        }
 
         scene.ipd       = options.ipd;
         scene.eyeFov[0] = {-0.95, 0.86, 0.75, -0.78};
@@ -312,12 +359,15 @@ namespace hxc {
                 {"mic", scene.hasMic},
             };
             manifest["overlay"] = {
-                {"width", scene.overlayWidth}, {"height", scene.overlayHeight}, {"format", "rgba"}, {"encoder", "ffv1"}, {"target_hz", scene.overlayHz}, {"eye_count", 2}, {"alpha", "straight"},
+                {"width", scene.overlayWidth},   {"height", scene.overlayHeight}, {"format", "rgba"}, {"encoder", "ffv1"},
+                {"target_hz", scene.overlayHz},  {"eye_count", 2},                {"alpha", scene.overlayAlpha},
             };
             manifest["notes"] = json::array({
                 "synthetic bundle from `hypxrcompose synth`; the scene is described exactly in synth/ground-truth.json",
                 std::format("host<->device offset starts at {:.3f} ms and drifts {:.1f} ppm", options.clockOffsetMs, options.clockDriftPpm),
                 "camera extrinsics deliberately differ from the eye poses (wider baseline, forward offset, outward splay)",
+                std::format("overlay colour is stored {}; the multiply happens in linear light and the sRGB encode after it", scene.overlayAlpha),
+                "quads: index 0 is a room-anchored monitor, index 1 a head-locked HUD; both poses are recorded head-relative",
                 std::format("overlay: {} of {} records carry pixels; dropped {} to decimation ({:.0f} Hz session -> {:.0f} Hz overlay) and {} to the readback queue",
                             scene.overlayFrames.size(), options.frames, decimated, scene.hz, scene.overlayHz, readbackDropped),
             });
@@ -347,9 +397,21 @@ namespace hxc {
                     eyes += std::format(R"({{"pose":{},"fov":{}}})", poseJson(EYE_POSE), fovJson(scene.eyeFov[static_cast<size_t>(eye)]));
                 }
 
+                // Composition layers, back to front, with their poses expressed
+                // head-relative exactly as the producer records them. The monitor is
+                // room-anchored, so its recorded pose is head(t) inverse composed
+                // with its fixed STAGE pose and therefore changes every record; the
+                // HUD is head-locked, so its recorded pose is constant.
+                const SPose MONITOR_RELATIVE = HEAD.inverse().compose(scene.overlayQuad);
+                const auto  quadJson         = [&](int index, const SPose& pose, double width, double height, bool viewSpace, int swapchain) {
+                    return std::format(R"({{"index":{},"name":null,"pose":{},"size":[{},{}],"visibility":1.0,"view_space":{},"swapchain":{},"image":{},"array_layer":0,"rect":[0,0,{},{}]}})", index,
+                                       poseJson(pose), jsonDouble(width), jsonDouble(height), viewSpace ? "true" : "false", swapchain, k % 3, scene.overlayWidth, scene.overlayHeight);
+                };
+
                 const bool CAPTURED = CAPTURED_RECORDS.count(k) > 0;
-                telemetry << std::format(R"({{"t_host_ns":{},"frame":{},"eyes":[{}],"head":{},"stage_correction":{},"blend_mode":"alpha","dropped":{}}})", T_HOST, k, eyes, poseJson(HEAD),
-                                         poseJson(STAGE_CORRECTION), CAPTURED ? "false" : "true")
+                telemetry << std::format(R"({{"t_host_ns":{},"frame":{},"eyes":[{}],"head":{},"quads":[{},{}],"stage_correction":{},"blend_mode":"alpha","dropped":{}}})", T_HOST, k, eyes,
+                                         poseJson(HEAD), quadJson(0, MONITOR_RELATIVE, scene.quadWidth, scene.quadHeight, false, 7),
+                                         quadJson(1, scene.hudQuad, scene.hudWidth, scene.hudHeight, true, 9), poseJson(STAGE_CORRECTION), CAPTURED ? "false" : "true")
                           << "\n";
             }
 
@@ -394,27 +456,45 @@ namespace hxc {
                     const SPose   HEAD     = scene.headAt(T_HOST);
                     const SPose   EYE_POSE = HEAD.compose({{(eye == 0 ? -0.5 : 0.5) * scene.ipd, 0.0, 0.0}, SQuat::identity()});
                     const SFov&   FOV      = scene.eyeFov[static_cast<size_t>(eye)];
-                    // The quad is a plane through the origin of its own frame, so the
-                    // intersection is solved in quad-local coordinates.
+                    // Two layers, composited back to front exactly as the session
+                    // would have: the room-anchored monitor at index 0 and the
+                    // head-locked HUD at index 1. The HUD's pose is head-relative, so
+                    // its world pose follows the head; the monitor's does not.
+                    const SPose   HUD_WORLD    = HEAD.compose(scene.hudQuad);
                     const SVec3   LOCAL_ORIGIN = scene.overlayQuad.pointToLocal(EYE_POSE.pos);
+                    const SVec3   HUD_ORIGIN   = HUD_WORLD.pointToLocal(EYE_POSE.pos);
 
                     parallelRows(HEIGHT, [&](int y) {
                         for (int x = 0; x < WIDTH; ++x) {
                             const SVec3 DIRECTION = EYE_POSE.dirToWorld(fovRay(FOV, x, y, WIDTH, HEIGHT));
-                            const SVec3 LOCAL_DIR = scene.overlayQuad.dirToLocal(DIRECTION);
 
-                            SRgba pixel{0, 0, 0, 0};
+                            SLinearRgba monitor;
+                            const SVec3 LOCAL_DIR = scene.overlayQuad.dirToLocal(DIRECTION);
                             if (std::abs(LOCAL_DIR.z) > 1e-12) {
                                 const double TRAVEL = -LOCAL_ORIGIN.z / LOCAL_DIR.z;
                                 if (TRAVEL > 0.0)
-                                    pixel = shadeOverlayQuad(scene, LOCAL_ORIGIN.x + LOCAL_DIR.x * TRAVEL, LOCAL_ORIGIN.y + LOCAL_DIR.y * TRAVEL);
+                                    monitor = shadeOverlayQuad(scene, LOCAL_ORIGIN.x + LOCAL_DIR.x * TRAVEL, LOCAL_ORIGIN.y + LOCAL_DIR.y * TRAVEL);
                             }
 
+                            SLinearRgba hud;
+                            const SVec3 HUD_DIR = HUD_WORLD.dirToLocal(DIRECTION);
+                            if (std::abs(HUD_DIR.z) > 1e-12) {
+                                const double TRAVEL = -HUD_ORIGIN.z / HUD_DIR.z;
+                                if (TRAVEL > 0.0) {
+                                    const double U = HUD_ORIGIN.x + HUD_DIR.x * TRAVEL;
+                                    const double V = HUD_ORIGIN.y + HUD_DIR.y * TRAVEL;
+                                    if (std::abs(U) <= scene.hudWidth * 0.5 && std::abs(V) <= scene.hudHeight * 0.5)
+                                        hud = fromSrgb(scene.hudColor, scene.hudAlpha);
+                                }
+                            }
+
+                            const SRgba PIXEL = encodeOverlay(over(hud, monitor), PREMULTIPLIED);
+
                             uint8_t* out = frame.data() + (static_cast<size_t>(y) * WIDTH + static_cast<size_t>(x)) * 4;
-                            out[0]       = pixel.r;
-                            out[1]       = pixel.g;
-                            out[2]       = pixel.b;
-                            out[3]       = pixel.a;
+                            out[0]       = PIXEL.r;
+                            out[1]       = PIXEL.g;
+                            out[2]       = PIXEL.b;
+                            out[3]       = PIXEL.a;
                         }
                     });
 

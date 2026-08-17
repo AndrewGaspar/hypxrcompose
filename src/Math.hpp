@@ -187,6 +187,17 @@ namespace hxc {
     bool reprojectToCamera(const SPose& outputCamera, const SVec3& dirWorld, double depth, const SPose& cameraPose, const SCameraIntrinsics& intr, double& px, double& py);
     bool reprojectToFov(const SPose& outputCamera, const SVec3& dirWorld, double depth, const SPose& sourcePose, const SFov& fov, int width, int height, double& px, double& py);
 
+    // The sRGB transfer function, on 0..1 values. Compositing is a *linear-light*
+    // operation: blending encoded values is wrong at any partial alpha, and
+    // visibly so - a 50% blend done in encoded space lands roughly a third of the
+    // way from where it belongs. The overlay tap premultiplies in linear light and
+    // encodes afterwards, so a stored byte is srgb_encode(color_linear * alpha),
+    // and the compositor has to undo the encode before it can do anything with it.
+    //
+    // Alpha itself is never encoded; only the colour channels are.
+    double srgbToLinear(double encoded);
+    double linearToSrgb(double linear);
+
     // Formatting helpers for diagnostics.
     std::string toString(const SVec3& v);
     std::string toString(const SQuat& q);
