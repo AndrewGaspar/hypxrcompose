@@ -36,11 +36,6 @@ add_library(hypxrcompose_core STATIC
     src/Render.cpp
     src/SynthScene.cpp
     src/Synth.cpp
-    src/ComposeGL.cpp
-    src/Render.cpp
-    src/SynthScene.cpp
-    src/Synth.cpp
-    src/Synth.cpp
 )
 target_include_directories(hypxrcompose_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(hypxrcompose_core PUBLIC PkgConfig::deps)
@@ -48,4 +43,10 @@ if(nlohmann_json_FOUND)
     target_link_libraries(hypxrcompose_core PUBLIC nlohmann_json::nlohmann_json)
 endif()
 target_compile_options(hypxrcompose_core PRIVATE -Wall -Wextra)
+
+add_executable(hypxrcompose src/main.cpp)
+target_link_libraries(hypxrcompose PRIVATE hypxrcompose_core)
+target_compile_options(hypxrcompose PRIVATE -Wall -Wextra)
+
+install(TARGETS hypxrcompose RUNTIME DESTINATION bin)
 
