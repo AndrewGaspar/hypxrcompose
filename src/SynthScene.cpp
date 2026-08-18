@@ -72,7 +72,7 @@ namespace hxc {
     // must remove. Every frequency is irrational relative to the frame rates in
     // play so nothing lands on a convenient sample boundary by accident.
     SPose SSynthScene::headAt(int64_t tHostNs) const {
-        const double T = static_cast<double>(tHostNs - t0HostNs) * 1e-9;
+        const double T = static_cast<double>(tHostNs - t0HostNs) * 1e-9 * motionSpeed;
 
         SPose pose;
         pose.pos.x = 0.060 * std::sin(TWO_PI * 0.31 * T) + 0.010 * std::sin(TWO_PI * 4.70 * T + 1.1);
@@ -135,6 +135,7 @@ namespace hxc {
             });
         }
 
+        scene["motion_speed"] = motionSpeed;
         scene["eyes"] = {{"ipd", ipd}, {"fov", json::array({hxc::toJson(eyeFov[0]), hxc::toJson(eyeFov[1])})}};
 
         scene["cameras"]     = json::array();
@@ -221,6 +222,7 @@ namespace hxc {
             }
 
             out.ipd       = SCENE.at("eyes").at("ipd").get<double>();
+            out.motionSpeed = SCENE.value("motion_speed", 1.0);
             out.eyeFov[0] = fovFrom(SCENE.at("eyes").at("fov").at(0));
             out.eyeFov[1] = fovFrom(SCENE.at("eyes").at("fov").at(1));
 

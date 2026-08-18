@@ -118,6 +118,12 @@ namespace hxc {
         std::array<int, 3>               hudColor{255, 200, 0};
         double                           hudAlpha  = 0.75;
 
+        // Multiplies the rate of the head's motion. 1.0 is a person sitting
+        // still-ish; larger values are what a test needs when it has to tell
+        // "the pose at capture" from "the pose at output" - at rest those two
+        // are the same answer and prove nothing.
+        double                 motionSpeed = 1.0;
+
         double                 ipd = 0.063;
         std::array<SFov, 2>    eyeFov{};
 

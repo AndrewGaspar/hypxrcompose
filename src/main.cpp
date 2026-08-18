@@ -67,6 +67,7 @@ synth:
                            N pixels taller than the image top and bottom, with the
                            principal point in that array's coordinates (what
                            Android does)
+      --head-speed N       multiply the head's motion rate (default 1.0)
       --no-distortion      cameras publish no distortion coefficients, so the
                            sidecar carries `"distortion": null` (what the Meta
                            cameras do - they pre-undistort)
@@ -86,7 +87,16 @@ render:
       --size WxH           per-eye pane size; stereo SBS output is 2W x H
       --fps N              output rate (default: the take's target_hz)
       --background auto|camera|checker|solid
-      --bg-depth M         assumed background distance in metres (default 2.0)
+      --bg-depth M         assumed background distance in metres (default 1.0,
+                           measured stillest on a seated desk take; raise it for
+                           a take shot across a room)
+      --bg-align auto|recorded         (default auto)
+                           auto: aim each camera's optical axis along the output's
+                             forward, keeping the extrinsic's roll. The recorded
+                             extrinsic is measured against the IMU, not the head,
+                             so applying it verbatim slides the passthrough off
+                             the frame
+                           recorded: use the extrinsic exactly as stamped
       --fg-depth M|inf     assumed overlay distance (default inf = rotation only)
       --stabilize-ms N     Gaussian sigma for --framing stabilized (default 200)
       --no-audio           video only
@@ -256,6 +266,8 @@ int main(int argc, char** argv) {
                 options.geometryMarkers = true;
             else if (ARG == "--no-distortion")
                 options.noDistortion = true;
+            else if (ARG == "--head-speed" && parseDouble(value(COUNT, REST, i), number))
+                options.headSpeed = number;
             else if (ARG == "--camera-active-array-pad" && parseInt(value(COUNT, REST, i), integer))
                 options.cameraActiveArrayPad = static_cast<int>(integer);
             else if (ARG == "--eye-fov") {
@@ -337,6 +349,16 @@ int main(int argc, char** argv) {
                     options.frustum = eFrustumMode::RECORDED;
                 else {
                     HXC_ERR("--frustum takes presentation or recorded");
+                    return 2;
+                }
+            } else if (ARG == "--bg-align") {
+                const std::string CHOICE = value(COUNT, REST, i) ?: "";
+                if (CHOICE == "auto")
+                    options.backgroundAlign = eBackgroundAlign::AUTO;
+                else if (CHOICE == "recorded")
+                    options.backgroundAlign = eBackgroundAlign::RECORDED;
+                else {
+                    HXC_ERR("--bg-align takes auto or recorded");
                     return 2;
                 }
             } else if (ARG == "--background") {

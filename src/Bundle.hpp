@@ -200,6 +200,22 @@ namespace hxc {
         int64_t tDeviceNs  = 0;
         int64_t exposureNs = 0;
         int64_t frame      = 0;
+        // The device's XR-time stamp for this capture, when it reports one.
+        //
+        // PRECEDENCE: `t_xr_ns` wins over `t_device_ns`. The clock series in
+        // clock.jsonl maps host time against XR time, so an XR stamp needs no
+        // domain assumption, while `t_device_ns` is whatever
+        // `t_device_ns_domain` says - CLOCK_MONOTONIC on the first real take -
+        // and is only the same thing by luck. On that take the two differ by a
+        // constant 104 ns, so the choice buys nothing today; it is made now
+        // because the take where they diverge is the one nobody will debug.
+        int64_t tXrNs      = 0;
+        bool    hasXrNs    = false;
+
+        // The stamp to sample the head pose at, mid-exposure.
+        int64_t captureDeviceNs() const {
+            return (hasXrNs ? tXrNs : tDeviceNs) + exposureNs / 2;
+        }
     };
 
     struct SCamera {

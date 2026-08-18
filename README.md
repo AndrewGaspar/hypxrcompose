@@ -349,6 +349,23 @@ should be read off that rather than off the telemetry.
 output frame was made of, plus the throughput breakdown. It is the first thing to look at when a
 composite looks wrong.
 
+### The camera background
+
+Three things happen to a passthrough camera on the way into a composite, and all three are visible in
+`validate`/`render` output. Its intrinsics are **rebased** from the sensor's active array into image
+coordinates. It is **aimed**: `--bg-align auto` (the default) points its optical axis along the
+output's forward, keeping the extrinsic's roll, because the recorded swing is measured against the
+IMU rather than the head and applying it verbatim slides the passthrough off the frame — at the cost
+of re-registering the background by that angle, so `--bg-align recorded` is right once a real
+`imu_to_head` exists. And it is **reprojected from when it was captured**: the head pose at the
+frame's own `t_xr_ns` (preferred over `t_device_ns`, whose domain is whatever the header declares),
+not at the output instant, which is what stops the room lagging the overlay between a 30 Hz capture
+and a 45 Hz output.
+
+What is left is `--bg-depth`: one assumed distance for the whole background, defaulting to 1.0 m
+because that measured stillest on a seated desk take. Raise it for a take shot across a room. Residual
+swim is proportional to the error in it; per-pixel depth is the v2 fix.
+
 `--jobs N` cuts the output timeline into N chunks and composes them in parallel worker processes,
 joining the encoded chunks with a stream copy and muxing audio once at the end. **It defaults to 1,
 and on the measured take turning it up made things slower** — the serial pipeline already keeps 18 of

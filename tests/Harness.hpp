@@ -64,6 +64,11 @@ namespace hxctest {
         SPose                 outputCamera(int frame, int eye, eFrustumMode mode = eFrustumMode::PRESENTATION) const;
         SPose                 headPose(int frame) const;
         const SSynthCamera&   camera(int eye) const;
+        // The extrinsic the renderer will actually compose with, which under the
+        // default `--bg-align auto` is not the one the scene recorded: the swing
+        // is dropped so the optical axis lands along the output's forward, and
+        // only the roll survives.
+        SPose                 cameraExtrinsic(int eye, eBackgroundAlign align = eBackgroundAlign::AUTO) const;
         // Where the generator put camera frame `index` on the host timeline.
         int64_t               cameraHostNs(int eye, size_t index) const;
 
@@ -89,6 +94,10 @@ namespace hxctest {
     // A bundle whose camera intrinsics are stated against a sensor active array
     // taller than the delivered image, the way Android reports them.
     const SFixture& sensorArrayFixture();
+    // A take with brisk head motion and a slow camera: the only conditions under
+    // which "reprojected from capture time" and "reprojected from output time"
+    // give visibly different answers.
+    const SFixture& briskMotionFixture();
 
     // The v1 background model, evaluated exactly: where must the output pixel be
     // for its assumed-depth ray to sample the camera pixel that shows `world`?

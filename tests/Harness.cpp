@@ -94,6 +94,13 @@ namespace hxctest {
         return static_cast<size_t>(scene.overlayFrames[ORDINAL]);
     }
 
+    SPose SFixture::cameraExtrinsic(int eye, eBackgroundAlign align) const {
+        SPose extrinsic = camera(eye).headToCamera;
+        if (align == eBackgroundAlign::AUTO)
+            extrinsic.rot = twistAbout(extrinsic.rot, {0.0, 0.0, 1.0});
+        return extrinsic;
+    }
+
     SPose SFixture::outputCamera(int frame, int eye, eFrustumMode mode) const {
         SPose camera = eyePose(frame, eye);
         if (mode == eFrustumMode::PRESENTATION)
@@ -104,7 +111,7 @@ namespace hxctest {
     namespace {
 
         SFixture buildFixture(const std::string& name, double clockOffsetMs, const std::string& alpha = "premultiplied", const std::optional<SFov>& eyeFov = std::nullopt,
-                              bool geometryMarkers = false, int cameraActiveArrayPad = 0) {
+                              bool geometryMarkers = false, int cameraActiveArrayPad = 0, double headSpeed = 1.0, double cameraHz = 0.0) {
             SFixture fixture;
             fixture.take = scratchRoot() / (name + ".hypxrtake");
 
@@ -127,6 +134,9 @@ namespace hxctest {
                 fixture.options.eyeFov = *eyeFov;
             fixture.options.geometryMarkers      = geometryMarkers;
             fixture.options.cameraActiveArrayPad = cameraActiveArrayPad;
+            fixture.options.headSpeed            = headSpeed;
+            if (cameraHz > 0.0)
+                fixture.options.cameraHz = cameraHz;
 
             if (!fs::exists(fixture.take / "manifest.json")) {
                 setLogLevel(eLogLevel::WARN);
@@ -165,6 +175,15 @@ namespace hxctest {
 
     const SFixture& straightAlphaFixture() {
         static const SFixture FIXTURE = buildFixture("straight-alpha", 200.0, "straight");
+        return FIXTURE;
+    }
+
+    const SFixture& briskMotionFixture() {
+        // A head moving ten times as fast against a 5 Hz camera, so a frame's
+        // capture instant and the output instant it is composited at are far
+        // enough apart for the two reprojection models to disagree visibly. At
+        // rest they agree, and a test that cannot tell them apart is not a test.
+        static const SFixture FIXTURE = buildFixture("brisk-motion", 200.0, "premultiplied", std::nullopt, false, 0, 10.0, 5.0);
         return FIXTURE;
     }
 

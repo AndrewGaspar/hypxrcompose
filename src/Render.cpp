@@ -475,6 +475,24 @@ namespace hxc {
             int64_t                       cameraFrame  = -1;
         };
 
+        // The extrinsic rotation to actually use, per pane, decided once.
+        //
+        // `auto` keeps only the roll: the swing - where the lens is pointing
+        // relative to the head - is dropped, so the optical axis ends up along
+        // the output's forward direction and the camera image lands centred.
+        // That is a deliberate lie about the rig, and it is the right one until
+        // the producer can say where the IMU sits relative to the head, because
+        // the recorded swing is measured against the IMU frame and applying it as
+        // though it were head-relative aims the passthrough somewhere the wearer
+        // is not looking.
+        const auto extrinsicFor = [&](const SCamera& meta) {
+            if (options.backgroundAlign == eBackgroundAlign::RECORDED)
+                return meta.headToCamera;
+            SPose aligned = meta.headToCamera;
+            aligned.rot   = twistAbout(meta.headToCamera.rot, {0.0, 0.0, 1.0});
+            return aligned;
+        };
+
         // A range that does not start at zero starts its decoders partway along
         // too. The frame to start at is not a guess: it is the same
         // nearestIndex() the loop below would have arrived at by walking there,
@@ -549,7 +567,7 @@ namespace hxc {
 
             const auto&  META      = *SOURCES.cameraMeta;
             const size_t RECORD    = std::min(static_cast<size_t>(*nearestIndex(telemetryTimes, outputHostNs(PLAN, beginFrame))), headPoses.size() - 1);
-            const SPose  CAMERA    = interpolatePose(telemetryTimes, headPoses, META.hostNs.front()).compose(META.headToCamera);
+            const SPose  CAMERA    = interpolatePose(telemetryTimes, headPoses, META.hostNs.front()).compose(extrinsicFor(META));
             SPose        output    = eyePoses[static_cast<size_t>(SOURCES.eye)][RECORD];
             if (options.frustum == eFrustumMode::PRESENTATION)
                 output.rot = headPoses[RECORD].rot;
@@ -739,7 +757,13 @@ namespace hxc {
                         // The pose chain, in one line: the head where it was at the
                         // frame's mid-exposure instant, composed with the lens's
                         // factory extrinsic.
-                        draw.cameraPose       = interpolatePose(telemetryTimes, headPoses, CAMERA_HOST).compose(sources.cameraMeta->headToCamera);
+                        // The head where it was at this frame's own capture
+                        // instant - not at the output instant - composed with the
+                        // lens extrinsic. The shader then reprojects from there
+                        // into the output camera over the assumed-depth surface,
+                        // which is what stops the room swimming as the head moves
+                        // between a 30 Hz capture and a 45 Hz output.
+                        draw.cameraPose       = interpolatePose(telemetryTimes, headPoses, CAMERA_HOST).compose(extrinsicFor(*sources.cameraMeta));
                         draw.intrinsics       = sources.cameraMeta->intrinsics;
                         draw.backgroundWidth  = sources.cameraMeta->video.width;
                         draw.backgroundHeight = sources.cameraMeta->video.height;

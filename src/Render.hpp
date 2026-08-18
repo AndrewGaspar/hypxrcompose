@@ -57,6 +57,23 @@ namespace hxc {
         RECORDED,
     };
 
+    // What to do with the recorded camera extrinsic's rotation.
+    enum class eBackgroundAlign {
+        // Point every camera's optical axis along the output's forward direction,
+        // keeping the roll the extrinsic recorded. The recorded rotation carries a
+        // constant off-axis term - on the first real take ~10.9 degrees of pitch
+        // plus a yaw component - which slides the passthrough off the frame: the
+        // camera's 72.9-degree horizontal field is WIDER than the output's 69.8,
+        // so full coverage is available and what costs it is aim, not field. The
+        // term is rigid and constant, so it is removed once from the extrinsic
+        // rather than fitted per frame.
+        AUTO,
+        // Use the extrinsic exactly as recorded. Correct once a real
+        // imu_to_head constant exists to resolve it against - see NEXT-STEPS -
+        // and the right mode for checking what the device actually reported.
+        RECORDED,
+    };
+
     enum class eBackgroundChoice {
         AUTO,    // camera when the take has one, checker when it does not
         CAMERA,
@@ -71,6 +88,7 @@ namespace hxc {
         eEyeSelection         eye     = eEyeSelection::LEFT;
         eFraming              framing = eFraming::ASIS;
         eFrustumMode          frustum = eFrustumMode::PRESENTATION;
+        eBackgroundAlign      backgroundAlign = eBackgroundAlign::AUTO;
         eBackgroundChoice     background = eBackgroundChoice::AUTO;
 
         // Per-eye pane size. Stereo SBS output is therefore 2*width x height, which
@@ -80,7 +98,14 @@ namespace hxc {
         int                   height = 0;
         double                fps    = 0.0; // 0 means "manifest target_hz, else the telemetry rate"
 
-        double                backgroundDepth = 2.0;
+        // The single distance the background is assumed to sit at. Measured on
+        // the first real camera take: the composite is stillest around 0.9 m -
+        // desk distance, which is where a seated session's content actually is -
+        // and 1.0 is that rounded. At 2.0, the old default, switching camera
+        // source frames jumped nearly six times as much. It is a scene property,
+        // not a constant, so a take shot across a room wants a larger value; the
+        // real answer is per-pixel depth, which is NEXT-STEPS gap 3.
+        double                backgroundDepth = 1.0;
         // Infinite by default: with the output camera at the recorded eye pose the
         // overlay reprojection is exact at any depth, and with a stabilized camera a
         // rotation-only warp is the honest choice absent depth data.

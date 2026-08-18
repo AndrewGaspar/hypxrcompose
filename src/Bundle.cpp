@@ -1178,6 +1178,8 @@ namespace hxc {
                             continue;
                         wantInt(record, "exposure_ns", WHERE, diags, frame.exposureNs, false);
                         wantInt(record, "frame", WHERE, diags, frame.frame, false);
+                        if (member(record, "t_xr_ns"))
+                            frame.hasXrNs = wantInt(record, "t_xr_ns", WHERE, diags, frame.tXrNs, false);
                         // PINNED: -1 is the producer's "the device did not report
                         // an exposure" sentinel, not a malformed value. Mid-exposure
                         // sampling then has nothing to offset by, so the frame is
@@ -1258,10 +1260,24 @@ namespace hxc {
 
                 // Mid-exposure sampling, per research 27 section 3 footnote 1: the
                 // sensor timestamp is the start of exposure, so the pose that
-                // belongs to the frame is the one half an exposure later.
+                // belongs to the frame is the one half an exposure later. Which
+                // stamp that is read from is SCameraFrame::captureDeviceNs's
+                // business - XR time when the device reports it.
                 camera.hostNs.reserve(camera.frames.size());
                 for (const auto& FRAME : camera.frames)
-                    camera.hostNs.push_back(bundle.clock.hostFromDevice(FRAME.tDeviceNs + FRAME.exposureNs / 2));
+                    camera.hostNs.push_back(bundle.clock.hostFromDevice(FRAME.captureDeviceNs()));
+
+                if (!camera.frames.empty()) {
+                    const size_t WITH_XR = static_cast<size_t>(std::count_if(camera.frames.begin(), camera.frames.end(), [](const SCameraFrame& f) { return f.hasXrNs; }));
+                    if (WITH_XR == camera.frames.size())
+                        bundle.loaderNotes.push_back(std::format("camera {}: timed by `t_xr_ns`, which shares the clock series' domain", camera.key));
+                    else if (WITH_XR == 0)
+                        bundle.loaderNotes.push_back(std::format("camera {}: timed by `t_device_ns` (domain `{}`); no `t_xr_ns` was reported, so the clock series is assumed to map that domain",
+                                                                 camera.key, camera.timestampSource.empty() ? std::string("unstated") : camera.timestampSource));
+                    else
+                        diags.warn(fs::path(camera.videoPath).filename().string(), "{} of {} frames carry `t_xr_ns` and the rest do not; the take mixes two timing domains", WITH_XR,
+                                   camera.frames.size());
+                }
 
                 if (!camera.hostNs.empty() && !bundle.telemetryHostNs.empty()) {
                     const bool DISJOINT = camera.hostNs.back() < bundle.firstHostNs() || camera.hostNs.front() > bundle.lastHostNs();

@@ -184,6 +184,17 @@ namespace hxc {
         return std::isfinite(px) && std::isfinite(py);
     }
 
+    SQuat twistAbout(const SQuat& q, const SVec3& axis) {
+        const SVec3  A         = axis.normalized();
+        const double PROJECTED = q.x * A.x + q.y * A.y + q.z * A.z;
+        SQuat        twist{A.x * PROJECTED, A.y * PROJECTED, A.z * PROJECTED, q.w};
+        if (twist.norm() < 1e-9)
+            return SQuat::identity();
+        twist = twist.normalized();
+        // Keep the shortest turn, so a roll of -1 degree does not come back as 359.
+        return twist.w < 0.0 ? SQuat{-twist.x, -twist.y, -twist.z, -twist.w} : twist;
+    }
+
     bool SCameraIntrinsics::rebaseToImage(int width, int height) {
         const double AW = activeArray[2], AH = activeArray[3];
         if (!(AW > 0.0) || !(AH > 0.0) || width <= 0 || height <= 0)

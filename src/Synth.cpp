@@ -232,6 +232,7 @@ namespace hxc {
         // eye sees further, so the optical axis sits off-centre in opposite
         // directions. Keeping the mirror exact is what makes a stereo pair's two
         // panes agree about scale.
+        scene.motionSpeed = options.headSpeed;
         scene.eyeFov[0] = options.eyeFov;
         scene.eyeFov[1] = {-options.eyeFov.r, -options.eyeFov.l, options.eyeFov.u, options.eyeFov.d};
 

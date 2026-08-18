@@ -204,6 +204,54 @@ Measured on that same take: **20.9% coverage, x [33%, 84%], y [0%, 47%]** — "3
 almost exactly the report. Under the presentation frustum the same frames give 50%, and 59% with the
 rebase.
 
+**Aimed, not cropped: `--bg-align auto` (default).** The coverage that remained after the rebase was
+an aiming residue, not a field limit — but the field is tighter than it looks, so both halves are
+worth stating. The output frustum is ±0.6981 **radians**, i.e. **80.0° horizontal by 64.4° vertical**;
+the camera is **73.0° by 57.9°**. The camera is therefore *narrower* than the output in both axes and
+full coverage is not available: the ceiling is ~88% per axis in tangent space, ~77% of the area.
+Within that ceiling, what was costing coverage was aim. `--bg-align auto` drops the swing from the
+recorded extrinsic — keeping its roll — so each camera's optical axis points along the output's
+forward. Measured on the real take, left pane at 1440×1080:
+
+| | coverage | x | y (top-down) |
+|---|---|---|---|
+| recorded extrinsic, 2.0 m | 59.2% | 4–97% | **0–76%** (top-biased) |
+| `--bg-align auto`, 2.0 m | **64.8%** | 8–92% | **8–93%** (centred) |
+| `--bg-align auto`, 1.0 m (defaults) | 59.6% | 9–91% | 11–93% |
+
+**It is a trade, and the suite measures both halves.** Dropping the swing re-registers the background
+against the world by exactly the angle discarded. On the synthetic take, where the extrinsic *is*
+ground truth, that is a defect: a world feature drifts **8.4 px** under `auto` against **0.46 px**
+under `recorded`, while the optical axis moves from 8.3 px off-centre to 0.7 px. On the real take the
+recorded swing is measured against the IMU rather than the head and is therefore wrong to begin with,
+so replacing it with "forward" is the better guess — but it *is* a guess, and `--bg-align recorded`
+is the mode to return to the moment a real `imu_to_head` exists.
+
+**Swim, part 1: temporal — already correct, and now timed off the right clock.** The camera image was
+already reprojected from the head pose at the frame's own capture instant rather than at the output
+instant, which is what keeps the room from lagging the overlay across a 30 Hz capture against a 45 Hz
+output. What changed is which stamp that instant is read from: `t_xr_ns` now takes precedence over
+`t_device_ns`, because the clock series maps host time against XR time while `t_device_ns` carries
+whatever `t_device_ns_domain` says — `CLOCK_MONOTONIC` on this take. On the real bundle the two differ
+by a **constant 104 ns**, so the change buys nothing today; it is made now because the take where they
+diverge is the one nobody will debug. `validate` says which path engaged.
+
+**Swim, part 2: depth — the default moves from 2.0 m to 1.0 m.** With the assumed-depth model, residual
+swim is proportional to depth error, and it shows up as a jump exactly when the compositor switches
+camera source frame: world-locked content should not move at a source change. Measuring that excess
+against the real take:
+
+| `--bg-depth` | 0.5 | 0.75 | **1.0** | 1.5 | 2.0 | 3.0 | 5.0 |
+|---|---|---|---|---|---|---|---|
+| excess jump at a source change | −0.23 | −0.07 | **+0.03** | +0.13 | +0.17 | +0.23 | +0.26 |
+
+It crosses zero at **~0.9 m** — desk distance, which is where a seated session's content is — so the
+default is now 1.0 m. At the old 2.0 m the jump was nearly six times larger. This is a scene property
+rather than a constant: a take shot across a room wants a larger value, and the coverage table above
+shows the cost of choosing a near depth (a closer assumed surface means more parallax between the lens
+and the eye, so the image shifts further). The real answer is per-pixel depth from the stereo pair,
+which is gap 3 above.
+
 **Still open: the 10.87° extrinsic pitch.** With both fixes the passthrough still sits high — nothing
 below 76% of the pane — and that residue is entirely the recorded `extrinsics_head_to_camera`
 rotation, 10.87° about +X (camera looking *up* relative to the head). Two things are worth knowing
@@ -224,7 +272,7 @@ the extrinsic into head/display space before writing it, or the bundle grows an
 `imu_to_head`/`reference_pose` field. Until then the ~11° is being applied as though the IMU and the
 head origin were coincident, which is the most likely remaining cause of the high framing.
 
-A coverage line is printed on every camera render — where the camera's corners project into pane
+`--bg-align auto` papers over this term rather than resolving it. A coverage line is printed on every camera render — where the camera's corners project into pane
 coordinates, and the resulting coverage — so this class of problem is visible without a headset.
 
 ---

@@ -104,6 +104,14 @@ namespace hxc {
     // negative so the path never takes the long way round.
     SQuat slerp(const SQuat& q0, const SQuat& q1, double t);
 
+    // The part of `q` that turns about `axis` - the "twist" of a swing-twist
+    // decomposition, q = swing * twist. For a camera whose local axis is its
+    // optical axis, this is exactly the roll: the rest of the rotation is where
+    // the lens is pointing, and the twist is how the image is turned about that
+    // direction. Returns identity when the twist is undefined (a 180-degree
+    // swing), which is the harmless answer.
+    SQuat twistAbout(const SQuat& q, const SVec3& axis);
+
     struct SPose {
         SVec3 pos;
         SQuat rot;

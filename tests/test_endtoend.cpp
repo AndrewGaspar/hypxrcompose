@@ -219,8 +219,13 @@ TEST(EndToEnd, OverlayMarkersLandWherePredicted) {
 TEST(EndToEnd, BackgroundMarkersLandWherePredicted) {
     const auto& FIX      = fixture();
     const auto  RENDERED = renderCase("background-asis", [](SRenderOptions& o) {
-        o.eye        = eEyeSelection::LEFT;
-        o.background = eBackgroundChoice::CAMERA;
+        o.eye             = eEyeSelection::LEFT;
+        o.background      = eBackgroundChoice::CAMERA;
+        // The synth's extrinsic is ground truth, so `recorded` is the correct
+        // model here; `auto` deliberately discards the swing and is measured
+        // separately in BgAlignAutoTradesRegistrationForCoverage.
+        o.backgroundAlign = eBackgroundAlign::RECORDED;
+        o.backgroundDepth = 2.0;
     });
 
     const double FPS   = RENDERED.report.fps;
@@ -234,7 +239,7 @@ TEST(EndToEnd, BackgroundMarkersLandWherePredicted) {
         const size_t CAMERA_FRAME = predictCameraFrame(FIX, 0, k, FPS);
         ASSERT_EQ(RENDERED.report.frames[k].cameraFrame[0], static_cast<int64_t>(CAMERA_FRAME)) << "output frame " << k;
 
-        const SPose CAMERA_POSE = FIX.scene.headAt(FIX.cameraHostNs(0, CAMERA_FRAME)).compose(FIX.camera(0).headToCamera);
+        const SPose CAMERA_POSE = FIX.scene.headAt(FIX.cameraHostNs(0, CAMERA_FRAME)).compose(FIX.cameraExtrinsic(0, eBackgroundAlign::RECORDED));
 
         for (const char* NAME : {"green", "red", "blue"}) {
             const auto& MARKER    = wallMarker(FIX.scene, NAME);
@@ -268,7 +273,7 @@ TEST(EndToEnd, TheAcceptedParallaxErrorIsSmallAndMeasurable) {
     const SFov&  FOV = FIX.scene.eyeFov[0];
 
     const size_t CAMERA_FRAME = predictCameraFrame(FIX, 0, 20, FPS);
-    const SPose  CAMERA_POSE  = FIX.scene.headAt(FIX.cameraHostNs(0, CAMERA_FRAME)).compose(FIX.camera(0).headToCamera);
+    const SPose  CAMERA_POSE  = FIX.scene.headAt(FIX.cameraHostNs(0, CAMERA_FRAME)).compose(FIX.cameraExtrinsic(0, eBackgroundAlign::RECORDED));
 
     double worst = 0.0;
     for (const auto& MARKER : FIX.scene.wallMarkers) {
@@ -299,8 +304,13 @@ TEST(EndToEnd, TheAcceptedParallaxErrorIsSmallAndMeasurable) {
 TEST(EndToEnd, TheClockOffsetSelectsTheRightCameraFrame) {
     const auto& FIX      = fixture();
     const auto  RENDERED = renderCase("clock", [](SRenderOptions& o) {
-        o.eye        = eEyeSelection::LEFT;
-        o.background = eBackgroundChoice::CAMERA;
+        o.eye             = eEyeSelection::LEFT;
+        o.background      = eBackgroundChoice::CAMERA;
+        // The synth's extrinsic is ground truth, so `recorded` is the correct
+        // model here; `auto` deliberately discards the swing and is measured
+        // separately in BgAlignAutoTradesRegistrationForCoverage.
+        o.backgroundAlign = eBackgroundAlign::RECORDED;
+        o.backgroundDepth = 2.0;
     });
 
     const double FPS            = RENDERED.report.fps;
@@ -320,7 +330,7 @@ TEST(EndToEnd, TheClockOffsetSelectsTheRightCameraFrame) {
         // was sampled, so this reads the answer out of the composite itself.
         const SImage IMAGE       = RENDERED.frame(k);
         const SPose  EYE         = FIX.outputCamera(static_cast<int>(FIX.outputRecord(k, FPS)), 0);
-        const SPose  CAMERA_POSE = FIX.scene.headAt(FIX.cameraHostNs(0, CHOSEN)).compose(FIX.camera(0).headToCamera);
+        const SPose  CAMERA_POSE = FIX.scene.headAt(FIX.cameraHostNs(0, CHOSEN)).compose(FIX.cameraExtrinsic(0, eBackgroundAlign::RECORDED));
         const auto   PATCH       = predictBackgroundPixel(EYE, RENDERED.report.paneFov.at(0), PANE_WIDTH, PANE_HEIGHT, CAMERA_POSE, FIX.scene.codeCentre, 2.0);
         ASSERT_TRUE(PATCH.has_value());
 
@@ -487,18 +497,20 @@ TEST(EndToEnd, ChangingTheAssumedBackgroundDepthMovesTheImageByThePredictedParal
     const auto AT_TWO = renderCase("depth-2", [](SRenderOptions& o) {
         o.eye             = eEyeSelection::LEFT;
         o.background      = eBackgroundChoice::CAMERA;
+        o.backgroundAlign = eBackgroundAlign::RECORDED;
         o.backgroundDepth = 2.0;
     });
     const auto AT_TEN = renderCase("depth-10", [](SRenderOptions& o) {
         o.eye             = eEyeSelection::LEFT;
         o.background      = eBackgroundChoice::CAMERA;
+        o.backgroundAlign = eBackgroundAlign::RECORDED;
         o.backgroundDepth = 10.0;
     });
 
     const size_t K            = 20;
     const SPose  EYE          = FIX.outputCamera(static_cast<int>(FIX.outputRecord(K, AT_TWO.report.fps)), 0);
     const size_t CAMERA_FRAME = predictCameraFrame(FIX, 0, K, AT_TWO.report.fps);
-    const SPose  CAMERA_POSE  = FIX.scene.headAt(FIX.cameraHostNs(0, CAMERA_FRAME)).compose(FIX.camera(0).headToCamera);
+    const SPose  CAMERA_POSE  = FIX.scene.headAt(FIX.cameraHostNs(0, CAMERA_FRAME)).compose(FIX.cameraExtrinsic(0, eBackgroundAlign::RECORDED));
     const auto&  MARKER       = wallMarker(FIX.scene, "green");
 
     const auto PREDICTED_TWO = predictBackgroundPixel(EYE, AT_TWO.report.paneFov.at(0), PANE_WIDTH, PANE_HEIGHT, CAMERA_POSE, MARKER.world, 2.0);
@@ -1356,7 +1368,12 @@ TEST(EndToEnd, MarkersLandWherePredictedUnderTheRealFrustum) {
     const auto& FIX = realFrustumFixture();
 
     const auto RENDERED = renderCase(
-        "real-frustum-predict", [](SRenderOptions& options) { options.background = eBackgroundChoice::CAMERA; }, FIX, true);
+        "real-frustum-predict", [](SRenderOptions& options) {
+            options.background      = eBackgroundChoice::CAMERA;
+            options.backgroundAlign = eBackgroundAlign::RECORDED;
+            options.backgroundDepth = 2.0;
+        },
+        FIX, true);
     ASSERT_FALSE(RENDERED.report.paneFov.empty());
     const SFov& OUT = RENDERED.report.paneFov[0];
 
@@ -1371,7 +1388,7 @@ TEST(EndToEnd, MarkersLandWherePredictedUnderTheRealFrustum) {
         const SImage IMAGE   = RENDERED.frame(k);
         const auto&  RECORD  = RENDERED.report.frames[k];
         const SPose  EYE     = FIX.eyePose(static_cast<int>(RECORD.telemetryIndex), 0);
-        const SPose  CAMERA  = FIX.headPose(static_cast<int>(RECORD.telemetryIndex)).compose(FIX.camera(0).headToCamera);
+        const SPose  CAMERA  = FIX.headPose(static_cast<int>(RECORD.telemetryIndex)).compose(FIX.cameraExtrinsic(0, eBackgroundAlign::RECORDED));
 
         for (const auto& MARKER : FIX.scene.wallMarkers) {
             const auto PREDICTED = predictBackgroundPixel(EYE, OUT, PANE_WIDTH, PANE_HEIGHT, CAMERA, MARKER.world, 2.0);
@@ -1457,7 +1474,12 @@ TEST(EndToEnd, BackgroundMarkersLandWherePredictedWhenIntrinsicsCarryASensorCrop
 
     const double FPS      = FIX.scene.overlayHz;
     const auto   RENDERED = renderCase(
-        "sensor-array", [](SRenderOptions& options) { options.background = eBackgroundChoice::CAMERA; }, FIX, true);
+        "sensor-array", [](SRenderOptions& options) {
+            options.background      = eBackgroundChoice::CAMERA;
+            options.backgroundAlign = eBackgroundAlign::RECORDED;
+            options.backgroundDepth = 2.0;
+        },
+        FIX, true);
 
     size_t checked = 0;
     double worst   = 0.0;
@@ -1465,7 +1487,7 @@ TEST(EndToEnd, BackgroundMarkersLandWherePredictedWhenIntrinsicsCarryASensorCrop
         const SImage IMAGE  = RENDERED.frame(k);
         const SPose  EYE    = FIX.outputCamera(static_cast<int>(FIX.outputRecord(k, FPS)), 0);
         const size_t FRAME  = predictCameraFrame(FIX, 0, k, FPS);
-        const SPose  CAMERA = FIX.scene.headAt(FIX.cameraHostNs(0, FRAME)).compose(FIX.camera(0).headToCamera);
+        const SPose  CAMERA = FIX.scene.headAt(FIX.cameraHostNs(0, FRAME)).compose(FIX.cameraExtrinsic(0, eBackgroundAlign::RECORDED));
 
         for (const auto& MARKER : FIX.scene.wallMarkers) {
             const auto PREDICTED = predictBackgroundPixel(EYE, RENDERED.report.paneFov.at(0), PANE_WIDTH, PANE_HEIGHT, CAMERA, MARKER.world, 2.0);
@@ -1482,4 +1504,147 @@ TEST(EndToEnd, BackgroundMarkersLandWherePredictedWhenIntrinsicsCarryASensorCrop
     }
     ASSERT_GT(checked, 0u);
     std::cout << "[measured] with intrinsics stated against a padded sensor array, markers land within " << worst << " px of prediction\n";
+}
+
+// ---------------------------------------------------------------------------
+// 17. The background is aimed, and it is reprojected from when it was captured.
+// ---------------------------------------------------------------------------
+
+// The camera image must be reprojected from the head pose at the frame's own
+// CAPTURE instant, not from the pose at the output instant. A 30 Hz camera
+// against a 45 Hz output means the two are up to half a camera period apart, and
+// during that the head moves - which is the room lagging or leading the overlay
+// that the wearer sees as swim.
+TEST(EndToEnd, TheBackgroundIsReprojectedFromTheHeadPoseAtCaptureTime) {
+    const auto&  FIX      = briskMotionFixture();
+    const double FPS      = FIX.scene.overlayHz;
+    const auto   RENDERED = renderCase(
+        "capture-time", [](SRenderOptions& options) {
+            options.background      = eBackgroundChoice::CAMERA;
+            options.backgroundAlign = eBackgroundAlign::RECORDED;
+            options.backgroundDepth = 2.0;
+        },
+        FIX, true);
+
+    // The default alignment aims the camera, so the prediction has to use the
+    // same aimed extrinsic - otherwise this measures the aiming, not the timing.
+    const SPose extrinsic = FIX.cameraExtrinsic(0, eBackgroundAlign::RECORDED);
+
+    // Scan the take rather than sampling three frames: how far apart the two
+    // models are depends on where the head happens to be in its motion, and the
+    // frames worth asserting on are the ones where they disagree.
+    size_t checked = 0;
+    double worstToCapture = 0.0, bestSeparation = 0.0;
+    for (size_t k = 4; k < std::min<size_t>(RENDERED.report.frames.size(), 44); ++k) {
+        const SImage IMAGE  = RENDERED.frame(k);
+        const SPose  EYE    = FIX.outputCamera(static_cast<int>(FIX.outputRecord(k, FPS)), 0);
+        const size_t FRAME  = predictCameraFrame(FIX, 0, k, FPS);
+
+        // The two rival models: the head where it was when the shutter opened,
+        // and the head where it is now. The compositor must be using the former.
+        const SPose CAPTURE = FIX.scene.headAt(FIX.cameraHostNs(0, FRAME)).compose(extrinsic);
+        const SPose OUTPUT  = FIX.scene.headAt(FIX.outputHostNs(k, FPS)).compose(extrinsic);
+
+        for (const auto& MARKER : FIX.scene.wallMarkers) {
+            const auto AT_CAPTURE = predictBackgroundPixel(EYE, RENDERED.report.paneFov.at(0), PANE_WIDTH, PANE_HEIGHT, CAPTURE, MARKER.world, 2.0);
+            const auto AT_OUTPUT  = predictBackgroundPixel(EYE, RENDERED.report.paneFov.at(0), PANE_WIDTH, PANE_HEIGHT, OUTPUT, MARKER.world, 2.0);
+            if (!AT_CAPTURE || !AT_OUTPUT)
+                continue;
+            if ((*AT_CAPTURE)[0] < 20 || (*AT_CAPTURE)[0] > PANE_WIDTH - 20 || (*AT_CAPTURE)[1] < 20 || (*AT_CAPTURE)[1] > PANE_HEIGHT - 20)
+                continue;
+            const auto MEASURED = findColor(IMAGE, MARKER.color, 60, 0, PANE_WIDTH);
+            if (!MEASURED || MEASURED->count < 30)
+                continue;
+
+            const double TO_CAPTURE = std::hypot(MEASURED->x - (*AT_CAPTURE)[0], MEASURED->y - (*AT_CAPTURE)[1]);
+            const double SEPARATION = std::hypot((*AT_CAPTURE)[0] - (*AT_OUTPUT)[0], (*AT_CAPTURE)[1] - (*AT_OUTPUT)[1]);
+
+            // Only sightings where the two models actually part company can
+            // testify. They part by the head's TRANSLATION between capture and
+            // output - not its rotation, because the ray from the lens to a world
+            // point is the same ray whichever way the lens is turned - so the
+            // separation is a couple of pixels even with a briskly moving head,
+            // and the gate is set where the measurement can still resolve it.
+            if (SEPARATION < 1.5)
+                continue;
+            bestSeparation = std::max(bestSeparation, SEPARATION);
+            worstToCapture = std::max(worstToCapture, TO_CAPTURE);
+            ++checked;
+            EXPECT_LT(TO_CAPTURE, 2.5) << "marker `" << MARKER.name << "` in frame " << k << " is " << TO_CAPTURE << " px from the capture-time prediction";
+            EXPECT_LT(TO_CAPTURE, SEPARATION * 0.75) << "marker `" << MARKER.name << "` in frame " << k << " sits nearer the output-time model than the capture-time one, which is the swim itself";
+        }
+    }
+    ASSERT_GT(checked, 5u) << "no frame had the two models far enough apart to tell them apart; the fixture is not moving enough";
+    std::cout << "[measured] over " << checked << " marker sightings where the two models differ by up to " << bestSeparation << " px, the background sits within " << worstToCapture
+              << " px of the capture-time one\n";
+}
+
+// `--bg-align auto` is a deliberate trade, and this measures both halves of it.
+//
+// It points each camera's optical axis along the output's forward, so the
+// passthrough lands centred instead of sliding off the frame - that is the half
+// the wearer asked for. The other half is that it discards the recorded swing,
+// so the background is re-registered against the world by exactly that angle.
+// On a synthetic take, where the extrinsic IS ground truth, that shows up as a
+// registration error; on the real take the recorded swing is measured against
+// the IMU rather than the head, so it is wrong to begin with and dropping it is
+// the better guess. Both facts belong in the record.
+TEST(EndToEnd, BgAlignAutoTradesRegistrationForCoverage) {
+    const auto&  FIX = fixture();
+    const double FPS = FIX.scene.overlayHz;
+
+    const auto measure = [&](eBackgroundAlign align) {
+        const auto RENDERED = renderCase(
+            align == eBackgroundAlign::AUTO ? "align-auto" : "align-recorded",
+            [align](SRenderOptions& options) {
+                options.background      = eBackgroundChoice::CAMERA;
+                options.backgroundAlign = align;
+                options.backgroundDepth = 2.0;
+            },
+            FIX, true);
+
+        const size_t K      = 20;
+        const size_t RECORD = FIX.outputRecord(K, FPS);
+        const SPose  EYE    = FIX.outputCamera(static_cast<int>(RECORD), 0);
+        const SFov&  FOV    = RENDERED.report.paneFov.at(0);
+
+        // Where the camera's optical axis lands: the coverage half.
+        const SPose CAMERA = FIX.headPose(static_cast<int>(RECORD)).compose(FIX.cameraExtrinsic(0, align));
+        double      ax = 0.0, ay = 0.0;
+        EXPECT_TRUE(fovProject(FOV, EYE.dirToLocal(CAMERA.dirToWorld({0.0, 0.0, -1.0})), PANE_WIDTH, PANE_HEIGHT, ax, ay));
+
+        // Where a known world feature lands versus the truth: the registration
+        // half. predictBackgroundPixel does not depend on the camera's rotation -
+        // a ray from the lens to the marker is a ray whichever way the lens is
+        // turned - so this prediction is the same for both modes, and any
+        // difference in the *measured* position is re-registration.
+        const size_t FRAME    = predictCameraFrame(FIX, 0, K, FPS);
+        const SPose  TRUE_CAM = FIX.scene.headAt(FIX.cameraHostNs(0, FRAME)).compose(FIX.cameraExtrinsic(0, eBackgroundAlign::RECORDED));
+        const auto&  MARKER   = wallMarker(FIX.scene, "green");
+        const auto   TRUTH    = predictBackgroundPixel(EYE, FOV, PANE_WIDTH, PANE_HEIGHT, TRUE_CAM, MARKER.world, 2.0);
+        const auto   MEASURED = findColor(RENDERED.frame(K), MARKER.color, 60, 0, PANE_WIDTH);
+        double       drift    = -1.0;
+        if (TRUTH && MEASURED && MEASURED->count > 30)
+            drift = std::hypot(MEASURED->x - (*TRUTH)[0], MEASURED->y - (*TRUTH)[1]);
+
+        return std::tuple{std::hypot(ax - PANE_WIDTH * 0.5, ay - PANE_HEIGHT * 0.5), drift};
+    };
+
+    const auto [AUTO_OFF, AUTO_DRIFT]         = measure(eBackgroundAlign::AUTO);
+    const auto [RECORDED_OFF, RECORDED_DRIFT] = measure(eBackgroundAlign::RECORDED);
+
+    ASSERT_GT(AUTO_DRIFT, 0.0);
+    ASSERT_GT(RECORDED_DRIFT, 0.0);
+
+    // Coverage: auto centres the camera, recorded does not.
+    EXPECT_LT(AUTO_OFF, 2.0) << "auto must put the optical axis at the pane centre, not " << AUTO_OFF << " px away";
+    EXPECT_GT(RECORDED_OFF, AUTO_OFF + 3.0) << "the fixture's extrinsic should be aimed off-axis, or this proves nothing";
+
+    // Registration: recorded is right on a take whose extrinsic is ground truth,
+    // and auto is wrong by about the swing it threw away.
+    EXPECT_LT(RECORDED_DRIFT, 2.5) << "with a ground-truth extrinsic, `recorded` must land the world where it is";
+    EXPECT_GT(AUTO_DRIFT, RECORDED_DRIFT + 2.0) << "auto is supposed to re-register the background; if it does not, it is not doing anything";
+
+    std::cout << "[measured] --bg-align auto: optical axis " << AUTO_OFF << " px from centre (recorded " << RECORDED_OFF << "), world feature drifts " << AUTO_DRIFT
+              << " px (recorded " << RECORDED_DRIFT << ") - coverage bought, registration spent\n";
 }
