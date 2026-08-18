@@ -951,14 +951,36 @@ namespace hxc {
         }
 
         // ---- cameras ------------------------------------------------------------
+        if (!bundle.sources.cameras) {
+            // A take can carry a calibration sidecar and still declare no camera
+            // source: the first real joined take does exactly that, because the
+            // cameras disconnected mid-session and captured nothing. That is not
+            // a contradiction to complain about - the manifest is right, there
+            // are no camera pixels - but it is worth saying out loud, because
+            // "cameras: absent" on its own invites the question of where the
+            // sidecar went.
+            auto orphans = globSuffix(root / "cameras", "cameras.jsonl");
+            if (orphans.empty())
+                orphans = globSuffix(root, "cameras.jsonl");
+            if (!orphans.empty())
+                bundle.loaderNotes.push_back(std::format("{} is present but manifest.sources.cameras is false; the take has calibration but no camera frames, so nothing composites from it",
+                                                         orphans.front().filename().string()));
+        }
+
         if (bundle.sources.cameras) {
             const fs::path CAMERA_DIR = root / "cameras";
             auto           headers    = globSuffix(CAMERA_DIR, "cameras.jsonl");
+            // PINNED by the first real joined takes: the join drops the sidecar at
+            // the take ROOT while the videos it describes stay under cameras/.
+            // Only the `cameras.jsonl` suffix is looked for at the root - a bare
+            // `.jsonl` sweep there would swallow telemetry.jsonl and clock.jsonl.
+            if (headers.empty())
+                headers = globSuffix(root, "cameras.jsonl");
             if (headers.empty())
                 headers = globSuffix(CAMERA_DIR, ".jsonl");
 
             if (headers.empty())
-                diags.error("cameras/", "manifest.sources.cameras is true but no `*-cameras.jsonl` is present");
+                diags.error("cameras/", "manifest.sources.cameras is true but no `*-cameras.jsonl` is present, at the take root or under cameras/");
             else {
                 if (headers.size() > 1)
                     diags.warn("cameras/", "{} camera sidecars present; using {}", headers.size(), headers.front().filename().string());
@@ -1004,6 +1026,43 @@ namespace hxc {
                                 entries.emplace_back(it.key(), &it.value());
                         }
                     }
+
+                    // FOURTH SHAPE, and the one the producer actually writes: the
+                    // header nests the other way round. Instead of one object per
+                    // camera holding its intrinsics and extrinsics, there are two
+                    // parallel maps - `intrinsics: {L:{...}, R:{...}}` and
+                    // `extrinsics_head_to_camera: {L:{...}, R:{...}}` - with
+                    // `axes`, `timestamp_source`, `t_device_ns_domain` and
+                    // `clock_anchor` shared once at the top level. Each camera's
+                    // entry is assembled from the two maps plus the shared fields,
+                    // so everything downstream sees the shape it already knew.
+                    std::vector<json>        assembled;
+                    std::vector<std::string> assembledKeys;
+                    if (entries.empty()) {
+                        const json* INTRINSICS_MAP = member(header, "intrinsics");
+                        const json* EXTRINSICS_MAP = member(header, "extrinsics_head_to_camera");
+                        if (INTRINSICS_MAP && INTRINSICS_MAP->is_object() && EXTRINSICS_MAP && EXTRINSICS_MAP->is_object()) {
+                            for (auto it = INTRINSICS_MAP->begin(); it != INTRINSICS_MAP->end(); ++it) {
+                                if (!it.value().is_object())
+                                    continue;
+                                json entry          = json::object();
+                                entry["intrinsics"] = it.value();
+                                if (const json* EXTRINSICS = member(*EXTRINSICS_MAP, it.key().c_str()))
+                                    entry["extrinsics_head_to_camera"] = *EXTRINSICS;
+                                for (const char* SHARED : {"timestamp_source", "axes", "t_device_ns_domain", "clock_anchor"}) {
+                                    if (const json* VALUE = member(header, SHARED))
+                                        entry[SHARED] = *VALUE;
+                                }
+                                assembled.push_back(std::move(entry));
+                                assembledKeys.push_back(it.key());
+                            }
+                            // Addresses are taken only after the vector has stopped
+                            // growing, or they would dangle.
+                            for (size_t i = 0; i < assembled.size(); ++i)
+                                entries.emplace_back(assembledKeys[i], &assembled[i]);
+                        }
+                    }
+
                     if (entries.empty())
                         diags.error(HEADER_WHERE, "no camera calibration entries found; expected either a `cameras` array/object or per-cam objects each holding `intrinsics` and "
                                                   "`extrinsics_head_to_camera`");
@@ -1037,7 +1096,16 @@ namespace hxc {
                             if (!(camera.intrinsics.fx > 0.0) || !(camera.intrinsics.fy > 0.0))
                                 diags.error(INTR_WHERE, "fx/fy must be positive pixel focal lengths, found {}/{}", camera.intrinsics.fx, camera.intrinsics.fy);
                             std::vector<double> distortion;
-                            if (wantDoubleArray(*INTRINSICS, "distortion", 0, INTR_WHERE, diags, distortion)) {
+                            // PINNED: `distortion: null` means "no distortion
+                            // coefficients", not "field missing" and not an error.
+                            // The Meta cameras pre-undistort, publish nothing, and
+                            // the producer forwards that faithfully as a null. An
+                            // empty coefficient list is exactly the right model:
+                            // the pinhole projection with all terms zero.
+                            const json* DISTORTION = member(*INTRINSICS, "distortion");
+                            if (DISTORTION && DISTORTION->is_null())
+                                camera.intrinsics.distortion.clear();
+                            else if (wantDoubleArray(*INTRINSICS, "distortion", 0, INTR_WHERE, diags, distortion)) {
                                 if (distortion.size() > 5)
                                     diags.warn(INTR_WHERE, "`distortion` holds {} coefficients; v1 reads the first five as OpenCV's k1,k2,p1,p2,k3", distortion.size());
                                 camera.intrinsics.distortion = distortion;
@@ -1061,6 +1129,10 @@ namespace hxc {
 
                     // Per-frame records.
                     SCap cap;
+                    // The -1 exposure sentinel gets its own budget: it is a
+                    // property of the device, so it tends to be on every record,
+                    // and it must not crowd out the malformed-record diagnostics.
+                    SCap exposureCap;
                     for (size_t i = 1; i < camLines.size(); ++i) {
                         const std::string WHERE = std::format("{}:{}", SIDECAR.filename().string(), camLines[i].number);
                         json              record;
@@ -1095,7 +1167,16 @@ namespace hxc {
                             continue;
                         wantInt(record, "exposure_ns", WHERE, diags, frame.exposureNs, false);
                         wantInt(record, "frame", WHERE, diags, frame.frame, false);
-                        if (frame.exposureNs < 0 && cap.allow())
+                        // PINNED: -1 is the producer's "the device did not report
+                        // an exposure" sentinel, not a malformed value. Mid-exposure
+                        // sampling then has nothing to offset by, so the frame is
+                        // treated as instantaneous - which is what a camera whose
+                        // exposure is unknown is already being assumed to be.
+                        if (frame.exposureNs == -1) {
+                            frame.exposureNs = 0;
+                            if (exposureCap.allow())
+                                diags.warn(WHERE, "`exposure_ns` is -1, the device's \"unknown\" sentinel; sampling this frame's pose at its stamp rather than half an exposure later");
+                        } else if (frame.exposureNs < 0 && cap.allow())
                             diags.error(WHERE, "`exposure_ns` is negative ({})", frame.exposureNs);
                         if (!target->frames.empty() && frame.tDeviceNs <= target->frames.back().tDeviceNs && cap.allow())
                             diags.error(WHERE, "`t_device_ns` {} does not advance past camera {}'s previous {}", frame.tDeviceNs, target->key, target->frames.back().tDeviceNs);
@@ -1246,16 +1327,21 @@ namespace hxc {
         }
 
         if (bundle.sources.mic) {
-            // INTERPRETATION: the contract writes `...-mic.flac` with an unstated
-            // prefix. Both the prefixed and the bare spelling are accepted, under
-            // audio/ (where app.flac lives) or under the take root.
+            // PINNED by the first real joined takes: the join drops the device's
+            // mic at the take ROOT as `<take>-mic.wav` (pcm_s16le) beside its
+            // `-mic.json`, not under audio/ and not as FLAC. Both containers and
+            // both locations are accepted - audio/*.flac is what the contract
+            // originally wrote and older bundles still carry it - and the prefix
+            // is free-form either way.
             std::vector<fs::path> candidates;
             for (const auto& DIRECTORY : {root / "audio", root}) {
-                for (const auto& FOUND : globSuffix(DIRECTORY, "mic.flac"))
-                    candidates.push_back(FOUND);
+                for (const char* SUFFIX : {"mic.flac", "mic.wav"}) {
+                    for (const auto& FOUND : globSuffix(DIRECTORY, SUFFIX))
+                        candidates.push_back(FOUND);
+                }
             }
             if (candidates.empty())
-                diags.error("audio/*-mic.flac", "missing, but manifest.sources.mic is true");
+                diags.error("*-mic.wav", "missing, but manifest.sources.mic is true; looked for `*-mic.wav` and `*-mic.flac` at the take root and under audio/");
             else {
                 if (candidates.size() > 1)
                     diags.warn("audio/", "{} mic tracks present; using {}", candidates.size(), candidates.front().filename().string());

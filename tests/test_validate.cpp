@@ -240,11 +240,16 @@ TEST(Validate, ACameraSidecarThatDisagreesWithItsVideoIsRejected) {
     fs::copy(fixture().take, ROOT, fs::copy_options::recursive, ec);
     ASSERT_FALSE(ec) << ec.message();
 
-    // Drop the last per-frame record for camera L.
+    // Drop the last per-frame record for camera L. The sidecar is at the take
+    // root - where the join puts it - but cameras/ is still accepted, so look in
+    // both rather than assuming either.
     fs::path sidecar;
-    for (const auto& ENTRY : fs::directory_iterator(ROOT / "cameras")) {
-        if (ENTRY.path().extension() == ".jsonl")
-            sidecar = ENTRY.path();
+    for (const auto& DIRECTORY : {ROOT, ROOT / "cameras"}) {
+        std::error_code iterEc;
+        for (const auto& ENTRY : fs::directory_iterator(DIRECTORY, iterEc)) {
+            if (ENTRY.path().filename().string().ends_with("cameras.jsonl"))
+                sidecar = ENTRY.path();
+        }
     }
     ASSERT_FALSE(sidecar.empty());
 
@@ -549,4 +554,226 @@ TEST(Validate, StrictTurnsWarningsIntoAFailure) {
     options.strict = true;
     EXPECT_EQ(runValidate(options), 1);
     setLogLevel(eLogLevel::INFO);
+}
+
+// ---------------------------------------------------------------------------
+// Producer reality: the shapes the first real joined takes actually carried.
+//
+// Each of these needed a hand shim before a real bundle would load. They are
+// pinned here so the next first-contact is not another four shims - and so the
+// older shapes, which existing bundles still carry, keep working beside them.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+    fs::path copyFixture(const std::string& name) {
+        const fs::path ROOT = scratchRoot() / name;
+        std::error_code ec;
+        fs::remove_all(ROOT, ec);
+        fs::copy(fixture().take, ROOT, fs::copy_options::recursive, ec);
+        return ec ? fs::path{} : ROOT;
+    }
+
+    fs::path findSidecar(const fs::path& root) {
+        for (const auto& DIRECTORY : {root, root / "cameras"}) {
+            std::error_code ec;
+            for (const auto& ENTRY : fs::directory_iterator(DIRECTORY, ec)) {
+                if (ENTRY.path().filename().string().ends_with("cameras.jsonl"))
+                    return ENTRY.path();
+            }
+        }
+        return {};
+    }
+
+    std::vector<std::string> readLines(const fs::path& path) {
+        std::vector<std::string> lines;
+        std::ifstream            stream(path);
+        std::string              line;
+        while (std::getline(stream, line))
+            lines.push_back(line);
+        return lines;
+    }
+
+    void writeLines(const fs::path& path, const std::vector<std::string>& lines) {
+        std::ofstream stream(path, std::ios::trunc);
+        for (const auto& LINE : lines)
+            stream << LINE << "\n";
+    }
+
+}
+
+// The join drops the mic at the take root as a WAV, and the sidecar for the
+// cameras at the root too - while the videos it describes stay under cameras/.
+// The synthetic bundle is written that way, so every other test in this suite
+// already exercises it; this one states it.
+TEST(Validate, TheJoinLayoutLoadsWithTheMicWavAndCameraSidecarAtTheRoot) {
+    const fs::path ROOT = fixture().take;
+
+    bool micWavAtRoot = false, sidecarAtRoot = false;
+    std::error_code ec;
+    for (const auto& ENTRY : fs::directory_iterator(ROOT, ec)) {
+        const std::string NAME = ENTRY.path().filename().string();
+        micWavAtRoot  = micWavAtRoot || NAME.ends_with("-mic.wav");
+        sidecarAtRoot = sidecarAtRoot || NAME.ends_with("-cameras.jsonl");
+    }
+    EXPECT_TRUE(micWavAtRoot) << "synth must emit the producer's layout, or first contact drifts again";
+    EXPECT_TRUE(sidecarAtRoot);
+
+    const auto DIAGS = loadAndCollect(ROOT);
+    EXPECT_FALSE(DIAGS.hasErrors()) << describe(DIAGS);
+}
+
+// The older spellings still load: mic under audio/, camera sidecar under
+// cameras/. Bundles recorded before the join existed carry them.
+TEST(Validate, TheOlderMicAndCameraSidecarLocationsStillLoad) {
+    const fs::path ROOT = copyFixture("legacy-locations");
+    ASSERT_FALSE(ROOT.empty());
+
+    std::error_code ec;
+    for (const auto& ENTRY : fs::directory_iterator(ROOT, ec)) {
+        const std::string NAME = ENTRY.path().filename().string();
+        if (NAME.ends_with("-mic.wav") || NAME.ends_with("-mic.json"))
+            fs::rename(ENTRY.path(), ROOT / "audio" / NAME, ec);
+    }
+    const fs::path SIDECAR = findSidecar(ROOT);
+    ASSERT_FALSE(SIDECAR.empty());
+    fs::rename(SIDECAR, ROOT / "cameras" / SIDECAR.filename(), ec);
+    ASSERT_FALSE(ec) << ec.message();
+
+    const auto DIAGS = loadAndCollect(ROOT);
+    EXPECT_FALSE(DIAGS.hasErrors()) << describe(DIAGS);
+}
+
+// The calibration header's original shape - one object per camera, each holding
+// its own intrinsics and extrinsics - beside the producer's inverse nesting.
+TEST(Validate, TheOlderPerCameraHeaderShapeStillLoads) {
+    const fs::path ROOT = copyFixture("legacy-header");
+    ASSERT_FALSE(ROOT.empty());
+    const fs::path SIDECAR = findSidecar(ROOT);
+    ASSERT_FALSE(SIDECAR.empty());
+
+    auto lines = readLines(SIDECAR);
+    ASSERT_FALSE(lines.empty());
+    json header = json::parse(lines.front());
+    ASSERT_TRUE(header.contains("intrinsics")) << "the fixture should be carrying the producer's shape";
+
+    // Turn the two parallel maps inside out into a `cameras` array.
+    json rebuilt      = json::object();
+    rebuilt["cameras"] = json::array();
+    for (auto it = header["intrinsics"].begin(); it != header["intrinsics"].end(); ++it) {
+        rebuilt["cameras"].push_back({
+            {"cam", it.key()},
+            {"intrinsics", it.value()},
+            {"extrinsics_head_to_camera", header["extrinsics_head_to_camera"][it.key()]},
+            {"timestamp_source", header.value("timestamp_source", std::string{})},
+        });
+    }
+    lines.front() = rebuilt.dump();
+    writeLines(SIDECAR, lines);
+
+    const auto DIAGS = loadAndCollect(ROOT);
+    EXPECT_FALSE(DIAGS.hasErrors()) << describe(DIAGS);
+}
+
+// `exposure_ns: -1` is the device saying it does not know, not a broken record.
+// It warns once or twice rather than per frame, and the frame is then sampled at
+// its stamp instead of half an exposure later.
+TEST(Validate, AnUnknownExposureSentinelIsToleratedRatherThanRejected) {
+    const fs::path ROOT = copyFixture("exposure-sentinel");
+    ASSERT_FALSE(ROOT.empty());
+    const fs::path SIDECAR = findSidecar(ROOT);
+    ASSERT_FALSE(SIDECAR.empty());
+
+    auto   lines   = readLines(SIDECAR);
+    size_t patched = 0;
+    for (size_t i = 1; i < lines.size(); ++i) {
+        json record = json::parse(lines[i]);
+        record["exposure_ns"] = -1;
+        lines[i]              = record.dump();
+        ++patched;
+    }
+    ASSERT_GT(patched, 0u);
+    writeLines(SIDECAR, lines);
+
+    CDiagnostics diags;
+    const auto   BUNDLE = SBundle::load(ROOT, diags, SLoadOptions{.probeMedia = false, .probeDepth = eProbeDepth::INDEX, .checksum = false, .probeCache = nullptr});
+    ASSERT_TRUE(BUNDLE.has_value());
+    EXPECT_FALSE(diags.hasErrors()) << describe(diags);
+    EXPECT_TRUE(hasDiagnostic(diags, false, "sentinel")) << describe(diags);
+    // Rate limited: a per-record warning on a real take is thousands of lines.
+    size_t sentinelWarnings = 0;
+    for (const auto& D : diags.all()) {
+        if (D.message.find("sentinel") != std::string::npos)
+            ++sentinelWarnings;
+    }
+    EXPECT_LE(sentinelWarnings, 6u) << "the sentinel warning must be capped, not emitted per frame";
+
+    ASSERT_FALSE(BUNDLE->cameras.empty());
+    for (const auto& FRAME : BUNDLE->cameras.front().frames)
+        EXPECT_EQ(FRAME.exposureNs, 0) << "an unknown exposure becomes zero, so mid-exposure sampling is a no-op";
+}
+
+// `distortion: null` is "this camera publishes no coefficients", which is what
+// the Meta cameras do because they pre-undistort.
+TEST(Validate, NullDistortionMeansNoDistortion) {
+    const fs::path ROOT = copyFixture("null-distortion");
+    ASSERT_FALSE(ROOT.empty());
+    const fs::path SIDECAR = findSidecar(ROOT);
+    ASSERT_FALSE(SIDECAR.empty());
+
+    auto lines  = readLines(SIDECAR);
+    json header = json::parse(lines.front());
+    for (auto it = header["intrinsics"].begin(); it != header["intrinsics"].end(); ++it)
+        it.value()["distortion"] = nullptr;
+    lines.front() = header.dump();
+    writeLines(SIDECAR, lines);
+
+    CDiagnostics diags;
+    const auto   BUNDLE = SBundle::load(ROOT, diags, SLoadOptions{.probeMedia = false, .probeDepth = eProbeDepth::INDEX, .checksum = false, .probeCache = nullptr});
+    ASSERT_TRUE(BUNDLE.has_value());
+    EXPECT_FALSE(diags.hasErrors()) << describe(diags);
+    ASSERT_FALSE(BUNDLE->cameras.empty());
+    for (const auto& CAM : BUNDLE->cameras)
+        EXPECT_TRUE(CAM.intrinsics.distortion.empty()) << "camera " << CAM.key << " should carry no coefficients";
+}
+
+// Unknown keys are ignored, everywhere, by policy. A producer that adds a field
+// must not break a reader that has never heard of it.
+TEST(Validate, UnknownKeysAreIgnoredEverywhere) {
+    const fs::path ROOT = copyFixture("unknown-keys");
+    ASSERT_FALSE(ROOT.empty());
+
+    const auto sprinkle = [](const fs::path& path, bool everyLine) {
+        auto lines = readLines(path);
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (!everyLine && i > 0)
+                break;
+            if (lines[i].empty())
+                continue;
+            json node = json::parse(lines[i]);
+            if (!node.is_object())
+                continue;
+            node["hypxr_unknown_scalar"] = 17;
+            node["hypxr_unknown_object"] = {{"nested", true}};
+            node["hypxr_unknown_array"]  = json::array({1, 2, 3});
+            lines[i]                     = node.dump();
+        }
+        writeLines(path, lines);
+    };
+
+    sprinkle(ROOT / "telemetry.jsonl", true);
+    sprinkle(ROOT / "clock.jsonl", true);
+    sprinkle(findSidecar(ROOT), true);
+    {
+        std::ifstream stream(ROOT / "manifest.json");
+        json          manifest;
+        stream >> manifest;
+        manifest["hypxr_unknown_top_level"] = "ignored";
+        manifest["overlay"]["hypxr_unknown_nested"] = 3;
+        std::ofstream out(ROOT / "manifest.json", std::ios::trunc);
+        out << manifest.dump(2) << "\n";
+    }
+
+    const auto DIAGS = loadAndCollect(ROOT);
+    EXPECT_FALSE(DIAGS.hasErrors()) << describe(DIAGS);
 }

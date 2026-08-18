@@ -469,8 +469,9 @@ TEST(EndToEnd, AFeatureAtInfinityLandsAtTheSamePaneCoordinateInBothEyes) {
             // wide that the mark often falls outside one of them, which is itself
             // a symptom of the frames not agreeing.
             EXPECT_GT(ANALYTIC, 20.0) << "recorded: the per-eye frusta should put infinity in visibly different places; if they do not, this test has stopped contrasting anything";
-            if (frames > 0)
+            if (frames > 0) {
                 EXPECT_NEAR(*worst, ANALYTIC, std::max(3.0, ANALYTIC * 0.05));
+            }
             std::cout << "[measured] recorded: the panes' frusta put the same infinite feature " << ANALYTIC << " px apart" << (frames > 0 ? std::format(" (measured {:.1f})", *worst) : std::string())
                       << " - the constant disparity that broke fusion\n";
         }

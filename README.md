@@ -65,15 +65,51 @@ This is the format `validate` arbitrates and `render` consumes. Where this docum
   audio/app.json         {"start_t_host_ns", "sample_rate_hz", "channels", ...}
   cameras/<id>-camL.mp4  device passthrough cameras
   cameras/<id>-camR.mp4
-  cameras/<id>-cameras.jsonl
-                         line 1: calibration header — per camera, `intrinsics`
-                         {fx,fy,cx,cy,distortion[]} and `extrinsics_head_to_camera` {pos,quat},
-                         plus "timestamp_source"
+  <id>-cameras.jsonl     at the take ROOT (the join puts it there; cameras/ also accepted)
+                         line 1: calibration header — two parallel maps keyed by camera,
+                         `intrinsics` {L:{fx,fy,cx,cy,distortion},R:{...}} and
+                         `extrinsics_head_to_camera` {L:{pos,quat},R:{...}}, with
+                         "axes"/"timestamp_source"/"t_device_ns_domain"/"clock_anchor"
+                         shared once at the top level
                          then one object per frame:
-                         {"cam", "t_device_ns", "exposure_ns", "frame"}
-  audio/<id>-mic.flac    device microphone
-  audio/<id>-mic.json    {"start_t_device_ns", "sample_rate_hz", "channels", ...}
+                         {"cam", "t_device_ns", "exposure_ns", "frame", ...}
+  <id>-mic.wav           device microphone, at the take ROOT, pcm_s16le
+  <id>-mic.json          {"start_t_device_ns", "t_device_ns_domain", "sample_rate_hz",
+                          "channels", "clock_anchor", ...}
 ```
+
+### What the reader tolerates, and why
+
+The layout above is what the **producer actually writes** — confirmed against the first real joined
+takes, and what `synth` now emits, so first contact with a real bundle stops being a bug report.
+Four earlier guesses were wrong and each needed a hand shim before a real take would load; all four
+are now parsed natively, and the older spellings are still accepted because bundles carrying them
+exist:
+
+| Field or file | Producer reality | Also accepted |
+|---|---|---|
+| Device mic | `<id>-mic.wav` + `.json` at the take **root** | `audio/*-mic.flac`, and either container in either place |
+| Camera sidecar | `<id>-cameras.jsonl` at the take **root**, videos under `cameras/` | the sidecar under `cameras/` |
+| Calibration header | `intrinsics: {L,R}` + `extrinsics_head_to_camera: {L,R}` as parallel maps, shared fields at the top | a `cameras` array, a `cameras` object, or per-cam objects at the top level |
+| `distortion` | `null` — the Meta cameras pre-undistort and publish no coefficients | an array of 0/4/5 coefficients |
+| `exposure_ns` | `-1` when the device does not report one | any non-negative duration |
+
+`distortion: null` is read as "no distortion", which is the pinhole model with every term zero — not
+as a missing field and not as an error. `exposure_ns: -1` is the device's *unknown* sentinel: the
+frame is then sampled at its stamp rather than half an exposure later, with one rate-limited warning
+rather than one per frame.
+
+**Unknown keys are ignored, everywhere, as policy.** Every reader here looks up the keys it needs and
+steps over the rest, at every level — manifest, telemetry records, clock samples, calibration header,
+per-frame records. A producer may add fields without breaking a reader that has never heard of them.
+The real takes already rely on this: calibration entries carry `camera_id`/`camera_source`/`position`
+strings and a duplicate `intrinsics` array beside the named fields, and per-frame records carry
+`capture`, `pts_us` and `t_xr_ns`. The synthetic bundle emits all of those, so the policy is
+exercised by the suite rather than merely promised here.
+
+A take may also declare `sources.cameras: false` and still ship a calibration sidecar — the first
+real joined take does, because the cameras disconnected mid-session and captured nothing. That is
+reported as a note, not an error: the manifest is right, there are no camera pixels.
 
 Conventions, fixed once and depended on everywhere:
 

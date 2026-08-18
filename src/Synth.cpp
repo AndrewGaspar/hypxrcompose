@@ -323,7 +323,7 @@ namespace hxc {
                 camera.intrinsics.fy         = 190.0;
                 camera.intrinsics.cx         = static_cast<double>(options.cameraWidth) * 0.5 + 3.5;
                 camera.intrinsics.cy         = static_cast<double>(options.cameraHeight) * 0.5 - 2.5;
-                camera.intrinsics.distortion = {-0.06, 0.008, 0.0009, -0.0006, 0.0};
+                camera.intrinsics.distortion = options.noDistortion ? std::vector<double>{} : std::vector<double>{-0.06, 0.008, 0.0009, -0.0006, 0.0};
 
                 for (int j = 0; j < COUNT; ++j)
                     camera.deviceNs.push_back(FIRST + static_cast<int64_t>(std::llround(static_cast<double>(j) * 1e9 / options.cameraHz)));
@@ -546,23 +546,64 @@ namespace hxc {
 
         // ---- camera videos --------------------------------------------------------
         if (scene.hasCameras) {
-            std::ofstream sidecar(options.out / "cameras" / std::format("{}-cameras.jsonl", TAKE_ID));
+            // THE PRODUCER'S LAYOUT AND SHAPE, deliberately. The join drops the
+            // sidecar at the take ROOT while the videos stay under cameras/, and
+            // the header nests inversely: two parallel maps keyed by camera, with
+            // the fields that are the same for every camera stated once. Emitting
+            // what the device actually emits is the only way first contact with a
+            // real take stops being a bug report - the previous shape here was a
+            // guess, and four hand shims were needed to make the first joined
+            // bundles load.
+            std::ofstream sidecar(options.out / std::format("{}-cameras.jsonl", TAKE_ID));
 
             json header;
-            header["timestamp_source"] = "SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME";
-            header["cameras"]          = json::array();
+            header["record"]                    = "hypxrtake-cameras";
+            header["record_version"]            = 1;
+            header["take"]                      = TAKE_ID;
+            header["intrinsics"]                = json::object();
+            header["extrinsics_head_to_camera"] = json::object();
             for (const auto& CAMERA : scene.cameras) {
-                header["cameras"].push_back({
-                    {"cam", CAMERA.key},
-                    {"width", CAMERA.width},
-                    {"height", CAMERA.height},
-                    {"intrinsics",
-                     {{"fx", CAMERA.intrinsics.fx}, {"fy", CAMERA.intrinsics.fy}, {"cx", CAMERA.intrinsics.cx}, {"cy", CAMERA.intrinsics.cy}, {"distortion", CAMERA.intrinsics.distortion}}},
-                    {"extrinsics_head_to_camera",
-                     {{"pos", json::array({CAMERA.headToCamera.pos.x, CAMERA.headToCamera.pos.y, CAMERA.headToCamera.pos.z})},
-                      {"quat", json::array({CAMERA.headToCamera.rot.x, CAMERA.headToCamera.rot.y, CAMERA.headToCamera.rot.z, CAMERA.headToCamera.rot.w})}}},
-                });
+                json intrinsics;
+                // The extra descriptive strings and the duplicate coefficient
+                // array are the producer's, and a reader must step over them.
+                intrinsics["camera_id"]     = CAMERA.key == "L" ? "50" : "51";
+                intrinsics["camera_source"] = "0";
+                intrinsics["position"]      = CAMERA.key == "L" ? "0" : "1";
+                intrinsics["fx"]            = CAMERA.intrinsics.fx;
+                intrinsics["fy"]            = CAMERA.intrinsics.fy;
+                intrinsics["cx"]            = CAMERA.intrinsics.cx;
+                intrinsics["cy"]            = CAMERA.intrinsics.cy;
+                intrinsics["skew"]          = 0;
+                intrinsics["intrinsics"]    = json::array({CAMERA.intrinsics.fx, CAMERA.intrinsics.fy, CAMERA.intrinsics.cx, CAMERA.intrinsics.cy, 0});
+                // `null`, not `[]`, when there are none: the Meta cameras
+                // pre-undistort and publish nothing, and the producer forwards
+                // that faithfully.
+                if (CAMERA.intrinsics.distortion.empty()) {
+                    intrinsics["distortion"]       = nullptr;
+                    intrinsics["distortion_model"] = nullptr;
+                } else {
+                    intrinsics["distortion"]       = CAMERA.intrinsics.distortion;
+                    intrinsics["distortion_model"] = "opencv";
+                }
+                intrinsics["effective_size"]          = json::array({CAMERA.width, CAMERA.height});
+                intrinsics["rolling_shutter_skew_ns"] = -1;
+                header["intrinsics"][CAMERA.key]      = intrinsics;
+
+                header["extrinsics_head_to_camera"][CAMERA.key] = {
+                    {"pos", json::array({CAMERA.headToCamera.pos.x, CAMERA.headToCamera.pos.y, CAMERA.headToCamera.pos.z})},
+                    {"quat", json::array({CAMERA.headToCamera.rot.x, CAMERA.headToCamera.rot.y, CAMERA.headToCamera.rot.z, CAMERA.headToCamera.rot.w})},
+                    {"quat_order", "xyzw"},
+                    {"axes", "openxr"},
+                    {"reference", "GYROSCOPE"},
+                };
             }
+            // Shared once, not repeated per camera.
+            header["axes"]               = "openxr";
+            header["timestamp_source"]   = "SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME";
+            header["t_device_ns_domain"] = "CLOCK_MONOTONIC";
+            header["frame_alignment"]    = "ordinal";
+            header["frame_rate"]         = 30;
+            header["notes"]              = json::array();
             sidecar << header.dump() << "\n";
 
             for (const auto& CAMERA : scene.cameras) {
@@ -618,7 +659,13 @@ namespace hxc {
                         return 1;
                     }
 
-                    sidecar << std::format(R"({{"cam":"{}","t_device_ns":{},"exposure_ns":{},"frame":{}}})", CAMERA.key, CAMERA.deviceNs[j], CAMERA.exposureNs, j) << "\n";
+                    // `capture`, `pts_us` and `t_xr_ns` are the producer's extra
+                    // per-frame keys. Nothing here reads them; they are emitted so
+                    // that "unknown keys are ignored" is exercised rather than
+                    // merely asserted in prose.
+                    sidecar << std::format(R"({{"cam":"{}","t_device_ns":{},"exposure_ns":{},"frame":{},"capture":{},"pts_us":{},"t_xr_ns":{}}})", CAMERA.key, CAMERA.deviceNs[j],
+                                           CAMERA.exposureNs, j, j, CAMERA.deviceNs[j] / 1000, CAMERA.deviceNs[j])
+                            << "\n";
                 }
 
                 if (!encoder->finish(error)) {
@@ -662,7 +709,17 @@ namespace hxc {
             meta[startKey]         = track.startNs;
             meta["sample_rate_hz"] = track.sampleRate;
             meta["channels"]       = 1;
-            meta["encoder"]        = "flac";
+            if (media.extension() == ".wav") {
+                // The device mic's sidecar, as the join writes it.
+                meta["record"]             = "hypxrtake-mic";
+                meta["record_version"]     = 1;
+                meta["source"]             = "wivrn-mic-tee";
+                meta["format"]             = "pcm_s16le";
+                meta["container"]          = "wav";
+                meta["t_device_ns_domain"] = "xr_time";
+                meta["clock_anchor"]       = {{"xr_time_ns", track.startNs}, {"monotonic_ns", track.startNs}, {"boottime_ns", track.startNs}};
+            } else
+                meta["encoder"] = "flac";
             std::ofstream stream(sidecar);
             stream << meta.dump(2) << "\n";
             return true;
@@ -670,8 +727,8 @@ namespace hxc {
 
         if (scene.hasApp && !writeTrack(scene.app, 440.0, 0.15, options.out / "audio" / "app.flac", options.out / "audio" / "app.json", "start_t_host_ns"))
             return 1;
-        if (scene.hasMic && !writeTrack(scene.mic, 880.0, 0.10, options.out / "audio" / std::format("{}-mic.flac", TAKE_ID), options.out / "audio" / std::format("{}-mic.json", TAKE_ID),
-                                        "start_t_device_ns"))
+        // At the take root, as a WAV: the producer's layout, not audio/*.flac.
+        if (scene.hasMic && !writeTrack(scene.mic, 880.0, 0.10, options.out / std::format("{}-mic.wav", TAKE_ID), options.out / std::format("{}-mic.json", TAKE_ID), "start_t_device_ns"))
             return 1;
 
         if (!options.quiet) {

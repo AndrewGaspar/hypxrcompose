@@ -80,6 +80,8 @@ namespace hxc {
 
         for (const auto& NOTE : bundle.notes)
             out += std::format("  note      : {}\n", NOTE);
+        for (const auto& NOTE : bundle.loaderNotes)
+            out += std::format("  note      : {}\n", NOTE);
 
         return out;
     }

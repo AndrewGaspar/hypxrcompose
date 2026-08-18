@@ -85,6 +85,11 @@ namespace hxc {
         // collinear, which cannot show anisotropy at all. Off by default so the
         // shared fixtures keep the imagery every other test was written against.
         bool    geometryMarkers  = false;
+        // Emit cameras that publish no distortion coefficients, which the sidecar
+        // then spells `"distortion": null` - what the Meta cameras do, because
+        // they pre-undistort. Off by default so the distortion model stays under
+        // test.
+        bool    noDistortion     = false;
         // Deliberately wider than the IPD: this is the parallax error research 27
         // section 5.1 accepts in v1, and making it real here means the test can
         // measure it.

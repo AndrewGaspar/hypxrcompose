@@ -267,6 +267,11 @@ namespace hxc {
         std::optional<SAudioTrack>   appAudio;
         std::optional<SAudioTrack>   mic;
         std::vector<std::string>     notes;
+        // Things the loader observed that are worth telling the operator but are
+        // not complaints - a camera sidecar sitting in a take that declares no
+        // camera source, say. Diagnostics are for what is wrong; these are for
+        // what is merely surprising.
+        std::vector<std::string>     loaderNotes;
 
         int64_t                      firstHostNs() const {
             return telemetryHostNs.empty() ? 0 : telemetryHostNs.front();

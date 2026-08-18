@@ -62,6 +62,9 @@ synth:
                            asymmetric by default, as a real headset's is
       --geometry-markers   four extra opaque markers on the overlay quad, at the
                            corners of a rectangle, for measuring output scale
+      --no-distortion      cameras publish no distortion coefficients, so the
+                           sidecar carries `"distortion": null` (what the Meta
+                           cameras do - they pre-undistort)
 
 render:
       --out FILE           output video (required)
@@ -246,6 +249,8 @@ int main(int argc, char** argv) {
                 options.cameraBaseline = number;
             else if (ARG == "--geometry-markers")
                 options.geometryMarkers = true;
+            else if (ARG == "--no-distortion")
+                options.noDistortion = true;
             else if (ARG == "--eye-fov") {
                 const std::string SPEC = value(COUNT, REST, i) ?: "";
                 double            v[4] = {0, 0, 0, 0};
