@@ -90,6 +90,13 @@ namespace hxc {
         // they pre-undistort. Off by default so the distortion model stays under
         // test.
         bool    noDistortion     = false;
+        // Declare the camera intrinsics against a sensor active array taller than
+        // the delivered image by this many pixels top and bottom, with the
+        // principal point stated in that array's coordinates - which is what
+        // Android does and what the first real camera take carried. A loader that
+        // does not rebase to image coordinates puts the principal point this many
+        // pixels too low and throws away the bottom of every frame.
+        int     cameraActiveArrayPad = 0;
         // Deliberately wider than the IPD: this is the parallax error research 27
         // section 5.1 accepts in v1, and making it real here means the test can
         // measure it.

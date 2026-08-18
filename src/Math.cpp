@@ -184,6 +184,35 @@ namespace hxc {
         return std::isfinite(px) && std::isfinite(py);
     }
 
+    bool SCameraIntrinsics::rebaseToImage(int width, int height) {
+        const double AW = activeArray[2], AH = activeArray[3];
+        if (!(AW > 0.0) || !(AH > 0.0) || width <= 0 || height <= 0)
+            return false;
+        const double EW = static_cast<double>(width), EH = static_cast<double>(height);
+        if (std::abs(AW - EW) < 0.5 && std::abs(AH - EH) < 0.5 && std::abs(activeArray[0]) < 0.5 && std::abs(activeArray[1]) < 0.5)
+            return false;
+
+        // Android crops the active array to the output's aspect ratio about its
+        // centre, then scales that region onto the output. Doing the same here
+        // is what turns "intrinsics of the sensor" into "intrinsics of this
+        // video".
+        double cropW = AW, cropH = AH;
+        if (AW / AH > EW / EH)
+            cropW = AH * EW / EH;
+        else
+            cropH = AW * EH / EW;
+
+        const double OFFSET_X = activeArray[0] + (AW - cropW) * 0.5;
+        const double OFFSET_Y = activeArray[1] + (AH - cropH) * 0.5;
+        const double SCALE    = EW / cropW;
+
+        cx = (cx - OFFSET_X) * SCALE;
+        cy = (cy - OFFSET_Y) * SCALE;
+        fx *= SCALE;
+        fy *= SCALE;
+        return true;
+    }
+
     std::array<double, 5> SCameraIntrinsics::distortion5() const {
         std::array<double, 5> out{0.0, 0.0, 0.0, 0.0, 0.0};
         for (size_t i = 0; i < out.size() && i < distortion.size(); ++i)

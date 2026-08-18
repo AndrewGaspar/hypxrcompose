@@ -218,8 +218,22 @@ namespace hxc {
         double              fx = 0.0, fy = 0.0, cx = 0.0, cy = 0.0;
         // OpenCV order: k1, k2, p1, p2, k3. Shorter vectors are zero-extended.
         std::vector<double> distortion;
+        // The sensor region fx/fy/cx/cy are expressed in, when that is not the
+        // delivered image. Android states intrinsics against the sensor's ACTIVE
+        // ARRAY and then hands out a stream cropped and scaled from it, so the
+        // two frames differ and the numbers cannot be used as they stand. Zero
+        // width or height means "no active array declared", i.e. the intrinsics
+        // are already in image coordinates.
+        std::array<double, 4> activeArray{}; // x, y, w, h
 
         std::array<double, 5> distortion5() const;
+        // Re-expresses fx/fy/cx/cy in the coordinates of a `width` x `height`
+        // image delivered from `activeArray`, following Android's own pipeline:
+        // the active array is cropped, centred, to the output's aspect, and then
+        // scaled to the output's size. A no-op when no active array was declared
+        // or when it already matches the image. Returns true when it changed
+        // something.
+        bool                  rebaseToImage(int width, int height);
         // Horizontal/vertical field of view implied by fx/fy and the image size,
         // ignoring distortion. Diagnostics only.
         double                hfovDegrees(int width) const;

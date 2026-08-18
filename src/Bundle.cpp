@@ -1093,6 +1093,17 @@ namespace hxc {
                             wantNumber(*INTRINSICS, "fy", INTR_WHERE, diags, camera.intrinsics.fy);
                             wantNumber(*INTRINSICS, "cx", INTR_WHERE, diags, camera.intrinsics.cx);
                             wantNumber(*INTRINSICS, "cy", INTR_WHERE, diags, camera.intrinsics.cy);
+                            // The sensor region those numbers are stated against.
+                            // `pre_correction_active_array` is the one that goes
+                            // with un-distortion-corrected intrinsics; the plain
+                            // `active_array` is the fallback.
+                            std::vector<double> activeArray;
+                            for (const char* KEY : {"pre_correction_active_array", "active_array"}) {
+                                if (member(*INTRINSICS, KEY) && wantDoubleArray(*INTRINSICS, KEY, 4, INTR_WHERE, diags, activeArray) && activeArray.size() == 4) {
+                                    camera.intrinsics.activeArray = {activeArray[0], activeArray[1], activeArray[2], activeArray[3]};
+                                    break;
+                                }
+                            }
                             if (!(camera.intrinsics.fx > 0.0) || !(camera.intrinsics.fy > 0.0))
                                 diags.error(INTR_WHERE, "fx/fy must be positive pixel focal lengths, found {}/{}", camera.intrinsics.fx, camera.intrinsics.fy);
                             std::vector<double> distortion;
@@ -1218,6 +1229,24 @@ namespace hxc {
                     }
                     if (DECLARED_W > 0 && (DECLARED_W != camera.video.width || DECLARED_H != camera.video.height))
                         diags.error(fs::path(camera.videoPath).filename().string(), "is {}x{} but the sidecar declares {}x{}", camera.video.width, camera.video.height, DECLARED_W, DECLARED_H);
+
+                    // THE PRINCIPAL POINT IS NOT IN IMAGE COORDINATES until this
+                    // runs. Android states intrinsics against the sensor's active
+                    // array and then delivers a stream cropped and scaled from it.
+                    // On the first real camera take the array is 1280x1280 and the
+                    // video is 1280x960, so cy = 638.6 - dead centre of the array -
+                    // was being applied to a 960-tall image, where it means 66.5%
+                    // down. The compositor therefore believed the camera saw 36.4
+                    // degrees above its axis and only 20.3 below, and threw away the
+                    // bottom of every frame. Rebasing puts the principal point back
+                    // at 49.9% of the image and the field back to a symmetric
+                    // 28.9/29.0 degrees.
+                    const double BEFORE_CX = camera.intrinsics.cx, BEFORE_CY = camera.intrinsics.cy;
+                    if (camera.intrinsics.rebaseToImage(camera.video.width, camera.video.height))
+                        bundle.loaderNotes.push_back(std::format("camera {}: intrinsics were stated against a {:.0f}x{:.0f} sensor active array and the video is {}x{}; "
+                                                                 "principal point rebased from ({:.1f}, {:.1f}) to ({:.1f}, {:.1f})",
+                                                                 camera.key, camera.intrinsics.activeArray[2], camera.intrinsics.activeArray[3], camera.video.width, camera.video.height, BEFORE_CX,
+                                                                 BEFORE_CY, camera.intrinsics.cx, camera.intrinsics.cy));
                     if (camera.video.ptsNs.size() != camera.frames.size())
                         diags.error(fs::path(camera.videoPath).filename().string(), "holds {} frames but the sidecar lists {} records for camera {}; the sidecar is authoritative for "
                                                                                     "timestamps, so the two must correspond one-for-one in decode order",

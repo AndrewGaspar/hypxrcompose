@@ -104,7 +104,7 @@ namespace hxctest {
     namespace {
 
         SFixture buildFixture(const std::string& name, double clockOffsetMs, const std::string& alpha = "premultiplied", const std::optional<SFov>& eyeFov = std::nullopt,
-                              bool geometryMarkers = false) {
+                              bool geometryMarkers = false, int cameraActiveArrayPad = 0) {
             SFixture fixture;
             fixture.take = scratchRoot() / (name + ".hypxrtake");
 
@@ -125,7 +125,8 @@ namespace hxctest {
             fixture.options.quiet         = true;
             if (eyeFov)
                 fixture.options.eyeFov = *eyeFov;
-            fixture.options.geometryMarkers = geometryMarkers;
+            fixture.options.geometryMarkers      = geometryMarkers;
+            fixture.options.cameraActiveArrayPad = cameraActiveArrayPad;
 
             if (!fs::exists(fixture.take / "manifest.json")) {
                 setLogLevel(eLogLevel::WARN);
@@ -164,6 +165,14 @@ namespace hxctest {
 
     const SFixture& straightAlphaFixture() {
         static const SFixture FIXTURE = buildFixture("straight-alpha", 200.0, "straight");
+        return FIXTURE;
+    }
+
+    const SFixture& sensorArrayFixture() {
+        // 120 px of pad top and bottom, so a loader that ignores the active array
+        // puts the principal point 120 px low - the same class of error, and the
+        // same direction, as the 160 px the first real take carried.
+        static const SFixture FIXTURE = buildFixture("sensor-array", 200.0, "premultiplied", std::nullopt, false, 120);
         return FIXTURE;
     }
 

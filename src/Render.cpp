@@ -534,6 +534,54 @@ namespace hxc {
             }
         }
 
+        // ---- where the passthrough will actually land ------------------------------
+        //
+        // A camera whose field nearly matches the output's should nearly fill the
+        // frame. When it does not - the first real camera take came back "3/4
+        // black, only the top centre has passthrough" - the useful thing to know
+        // is *where* it lands and *why*, and the answer is a projection of the
+        // camera's own corners into pane coordinates. Cheap, so it is printed on
+        // every camera render rather than hidden behind a flag.
+        for (int pane = 0; pane < PANE_COUNT; ++pane) {
+            const auto& SOURCES = panes[static_cast<size_t>(pane)];
+            if (!SOURCES.cameraMeta || SOURCES.cameraMeta->hostNs.empty() || !logEnabled(eLogLevel::INFO))
+                continue;
+
+            const auto&  META      = *SOURCES.cameraMeta;
+            const size_t RECORD    = std::min(static_cast<size_t>(*nearestIndex(telemetryTimes, outputHostNs(PLAN, beginFrame))), headPoses.size() - 1);
+            const SPose  CAMERA    = interpolatePose(telemetryTimes, headPoses, META.hostNs.front()).compose(META.headToCamera);
+            SPose        output    = eyePoses[static_cast<size_t>(SOURCES.eye)][RECORD];
+            if (options.frustum == eFrustumMode::PRESENTATION)
+                output.rot = headPoses[RECORD].rot;
+
+            const SFov&  FOV = PLAN.paneFov[static_cast<size_t>(pane)];
+            const double W = META.video.width, H = META.video.height;
+            double       minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+            bool         any  = false;
+            for (const auto& CORNER : {std::pair{0.0, 0.0}, std::pair{W, 0.0}, std::pair{0.0, H}, std::pair{W, H}}) {
+                // Camera pixel -> camera-local ray -> world -> output-local -> pane.
+                const SVec3 LOCAL{(CORNER.first - META.intrinsics.cx) / META.intrinsics.fx, -(CORNER.second - META.intrinsics.cy) / META.intrinsics.fy, -1.0};
+                const SVec3 WORLD = CAMERA.dirToWorld(LOCAL);
+                double      px = 0.0, py = 0.0;
+                if (!fovProject(FOV, output.dirToLocal(WORLD), paneWidth, paneHeight, px, py))
+                    continue;
+                any  = true;
+                minX = std::min(minX, px);
+                maxX = std::max(maxX, px);
+                minY = std::min(minY, py);
+                maxY = std::max(maxY, py);
+            }
+            if (!any)
+                continue;
+
+            const double VISIBLE_W = std::max(0.0, std::min(maxX, static_cast<double>(paneWidth)) - std::max(minX, 0.0));
+            const double VISIBLE_H = std::max(0.0, std::min(maxY, static_cast<double>(paneHeight)) - std::max(minY, 0.0));
+            const double COVERAGE  = 100.0 * (VISIBLE_W * VISIBLE_H) / (paneWidth * paneHeight);
+            HXC_INFO("pane {} camera {}: {}x{} at fx={:.1f} cx={:.1f} cy={:.1f} projects to pane x [{:.0f}, {:.0f}] y [{:.0f}, {:.0f}] of {}x{} - about {:.0f}% coverage{}", pane, META.key,
+                     META.video.width, META.video.height, META.intrinsics.fx, META.intrinsics.cx, META.intrinsics.cy, minX, maxX, minY, maxY, paneWidth, paneHeight, COVERAGE,
+                     COVERAGE < 60.0 ? ". Well under half the frame usually means the intrinsics and the image disagree about their coordinate frame, or the extrinsic rotation is large" : "");
+        }
+
         // ---- audio ----------------------------------------------------------------
         SWriterSpec spec;
         spec.outPath     = outPath;

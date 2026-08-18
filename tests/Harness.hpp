@@ -86,6 +86,9 @@ namespace hxctest {
     // A bundle whose eyes carry the reference take's real frustum: asymmetric,
     // and with an angular aspect that deliberately does not match the test pane.
     const SFixture& realFrustumFixture();
+    // A bundle whose camera intrinsics are stated against a sensor active array
+    // taller than the delivered image, the way Android reports them.
+    const SFixture& sensorArrayFixture();
 
     // The v1 background model, evaluated exactly: where must the output pixel be
     // for its assumed-depth ray to sample the camera pixel that shows `world`?

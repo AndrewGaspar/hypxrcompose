@@ -62,6 +62,11 @@ synth:
                            asymmetric by default, as a real headset's is
       --geometry-markers   four extra opaque markers on the overlay quad, at the
                            corners of a rectangle, for measuring output scale
+      --camera-active-array-pad N
+                           state camera intrinsics against a sensor active array
+                           N pixels taller than the image top and bottom, with the
+                           principal point in that array's coordinates (what
+                           Android does)
       --no-distortion      cameras publish no distortion coefficients, so the
                            sidecar carries `"distortion": null` (what the Meta
                            cameras do - they pre-undistort)
@@ -251,6 +256,8 @@ int main(int argc, char** argv) {
                 options.geometryMarkers = true;
             else if (ARG == "--no-distortion")
                 options.noDistortion = true;
+            else if (ARG == "--camera-active-array-pad" && parseInt(value(COUNT, REST, i), integer))
+                options.cameraActiveArrayPad = static_cast<int>(integer);
             else if (ARG == "--eye-fov") {
                 const std::string SPEC = value(COUNT, REST, i) ?: "";
                 double            v[4] = {0, 0, 0, 0};

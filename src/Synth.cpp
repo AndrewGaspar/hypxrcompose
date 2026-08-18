@@ -585,6 +585,14 @@ namespace hxc {
                     intrinsics["distortion"]       = CAMERA.intrinsics.distortion;
                     intrinsics["distortion_model"] = "opencv";
                 }
+                // Stated against the sensor's active array, not against the
+                // image: cx/cy carry the crop offset, exactly as Android reports
+                // them. `rebaseToImage` is what undoes it on the way in.
+                const int PAD                         = options.cameraActiveArrayPad;
+                intrinsics["cy"]                      = CAMERA.intrinsics.cy + PAD;
+                intrinsics["intrinsics"]              = json::array({CAMERA.intrinsics.fx, CAMERA.intrinsics.fy, CAMERA.intrinsics.cx, CAMERA.intrinsics.cy + PAD, 0});
+                intrinsics["active_array"]            = json::array({0, 0, CAMERA.width, CAMERA.height + 2 * PAD});
+                intrinsics["pre_correction_active_array"] = json::array({0, 0, CAMERA.width, CAMERA.height + 2 * PAD});
                 intrinsics["effective_size"]          = json::array({CAMERA.width, CAMERA.height});
                 intrinsics["rolling_shutter_skew_ns"] = -1;
                 header["intrinsics"][CAMERA.key]      = intrinsics;

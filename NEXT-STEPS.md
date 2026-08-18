@@ -184,6 +184,51 @@ the default again.
 
 ---
 
+## Camera background: what the first real camera take convicted, and what is still open
+
+Live report on the first camera render: *"passthrough is not covering the full scene - it's like 3/4
+black, only the top center has passthrough."* Two terms, one fixed and one open.
+
+**Convicted and fixed: the principal point was in the wrong coordinate frame.** Android states
+intrinsics against the sensor's `active_array` — 1280×1280 here — and delivers a 1280×960 stream
+cropped from it. `cy = 638.6` is the centre of the array and 66.5% down the image, so the compositor
+believed the camera saw 36.4° above its optical axis and 20.3° below, and discarded the bottom of
+every frame. `fx == fy` exactly, and the array is 1:1 against a 4:3 output, which is what proves it
+is a centre crop rather than a squash. Rebasing puts the principal point at 49.9% of the image and
+the field at a symmetric 28.9°/29.0°. Measured on the real take, left pane at 1440×1080: camera
+coverage **50.1% → 59.2%**, vertical extent **63.6% → 75.9%** of the pane.
+
+**Also convicted, and already fixed by the presentation framing:** the render the wearer saw predates
+it and used the per-eye recorded frusta, whose padding makes the pane cover ~3.6× the solid angle.
+Measured on that same take: **20.9% coverage, x [33%, 84%], y [0%, 47%]** — "3/4 black, top centre",
+almost exactly the report. Under the presentation frustum the same frames give 50%, and 59% with the
+rebase.
+
+**Still open: the 10.87° extrinsic pitch.** With both fixes the passthrough still sits high — nothing
+below 76% of the pane — and that residue is entirely the recorded `extrinsics_head_to_camera`
+rotation, 10.87° about +X (camera looking *up* relative to the head). Two things are worth knowing
+before anyone "fixes" it:
+
+- It is not a sign error in this code. Inverting the rotation does not centre the image, it mirrors
+  the bias (measured: coverage moves from y [0%, 76%] to y [24%, 100%]). A sign error would centre it.
+- It is not a double axes conversion either. The producer already converts Android → OpenXR — the
+  raw `lens_pose_rotation` is a 169° rotation about −X, which is that 180° flip composed with ~11° —
+  and applying a second fix-up here would point the camera backwards, giving zero coverage rather
+  than the 59% measured.
+
+What remains is the reference frame. The extrinsic carries `"reference": "GYROSCOPE"`, and Android's
+`LENS_POSE_REFERENCE` says exactly that: `LENS_POSE_ROTATION`/`TRANSLATION` are relative to the
+**gyroscope/IMU** frame, not to the display or head origin that OpenXR head poses use. The rigid
+offset between the two is a device constant this bundle does not carry. Either the producer resolves
+the extrinsic into head/display space before writing it, or the bundle grows an
+`imu_to_head`/`reference_pose` field. Until then the ~11° is being applied as though the IMU and the
+head origin were coincident, which is the most likely remaining cause of the high framing.
+
+A coverage line is printed on every camera render — where the camera's corners project into pane
+coordinates, and the resulting coverage — so this class of problem is visible without a headset.
+
+---
+
 ## Throughput — measured on the first real take, and where the ceiling actually is
 
 The reference take: `hypxrtake-20260817-115453-230`, 91.9 s, 4604 telemetry records, 2101 overlay

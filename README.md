@@ -90,9 +90,20 @@ exist:
 |---|---|---|
 | Device mic | `<id>-mic.wav` + `.json` at the take **root** | `audio/*-mic.flac`, and either container in either place |
 | Camera sidecar | `<id>-cameras.jsonl` at the take **root**, videos under `cameras/` | the sidecar under `cameras/` |
+| `fx`/`fy`/`cx`/`cy` | stated against the sensor's **active array**, not the delivered image | no `active_array`, i.e. already image coordinates |
 | Calibration header | `intrinsics: {L,R}` + `extrinsics_head_to_camera: {L,R}` as parallel maps, shared fields at the top | a `cameras` array, a `cameras` object, or per-cam objects at the top level |
 | `distortion` | `null` — the Meta cameras pre-undistort and publish no coefficients | an array of 0/4/5 coefficients |
 | `exposure_ns` | `-1` when the device does not report one | any non-negative duration |
+
+**Intrinsics are in sensor coordinates, and are rebased on load.** Android states `fx/fy/cx/cy`
+against the sensor's `active_array` and then hands out a stream cropped and scaled from it, so the
+numbers do not apply to the video as they stand. On the first real camera take the array is
+1280×1280 and the video is 1280×960, so `cy = 638.6` — dead centre of the array — meant 66.5% down
+the image, and the compositor believed the camera saw 36.4° above its axis and only 20.3° below. It
+threw away the bottom of every frame; the wearer reported "3/4 black, only the top centre has
+passthrough". `SCameraIntrinsics::rebaseToImage` replays Android's own pipeline (crop the array to
+the output's aspect about its centre, then scale) and puts the principal point back at 49.9% of the
+image, with a symmetric 28.9°/29.0° field. `validate` reports the rebase as a note.
 
 `distortion: null` is read as "no distortion", which is the pinhole model with every term zero — not
 as a missing field and not as an error. `exposure_ns: -1` is the device's *unknown* sentinel: the

@@ -1394,3 +1394,92 @@ TEST(EndToEnd, MarkersLandWherePredictedUnderTheRealFrustum) {
     std::cout << "[measured] " << checked << " markers under the real frustum land within " << worst << " px of prediction; a frustum that ignored the recorded asymmetry would move them "
               << CENTRE_SHIFT_PX << " px\n";
 }
+
+// ---------------------------------------------------------------------------
+// 16. Camera intrinsics live in the sensor's coordinates, not the image's.
+//
+// From a live viewing of the first real camera take: "passthrough is not
+// covering the full scene - it's 3/4 black, only the top centre has
+// passthrough". The convicted term was the principal point: Android states
+// intrinsics against the sensor's ACTIVE ARRAY and then delivers a stream
+// cropped from it, so cy = 638.6 - dead centre of a 1280x1280 array - was being
+// applied to a 1280x960 image, where it means 66.5% down.
+// ---------------------------------------------------------------------------
+
+TEST(EndToEnd, IntrinsicsAreRebasedFromTheSensorArrayToTheImage) {
+    // The first real camera take's own numbers.
+    SCameraIntrinsics intr;
+    intr.fx = intr.fy = 867.154175;
+    intr.cx           = 641.459106;
+    intr.cy           = 638.635071;
+    intr.activeArray  = {0, 0, 1280, 1280};
+
+    ASSERT_TRUE(intr.rebaseToImage(1280, 960));
+    EXPECT_NEAR(intr.cx, 641.459106, 1e-9) << "no horizontal crop, so cx must not move";
+    EXPECT_NEAR(intr.cy, 478.635071, 1e-9) << "the 1280x1280 array is cropped to 1280x960 about its centre, so cy loses 160";
+    EXPECT_NEAR(intr.fx, 867.154175, 1e-9) << "a pure crop does not rescale the focal length";
+    EXPECT_NEAR(intr.fy, 867.154175, 1e-9);
+
+    // The correction is self-proving: it puts the principal point back at the
+    // centre of the image, and makes the vertical field symmetric.
+    EXPECT_NEAR(intr.cy / 960.0, 0.5, 0.005);
+    const double UP   = std::atan(intr.cy / intr.fy) * 180.0 / M_PI;
+    const double DOWN = std::atan((960.0 - intr.cy) / intr.fy) * 180.0 / M_PI;
+    EXPECT_NEAR(UP, DOWN, 0.5) << "a camera sees about as far up as down; " << UP << " vs " << DOWN;
+
+    // A pure scale rescales everything; no active array is a no-op.
+    SCameraIntrinsics scaled;
+    scaled.fx = scaled.fy = 800.0;
+    scaled.cx = scaled.cy = 640.0;
+    scaled.activeArray    = {0, 0, 1280, 960};
+    ASSERT_TRUE(scaled.rebaseToImage(640, 480));
+    EXPECT_NEAR(scaled.fx, 400.0, 1e-9);
+    EXPECT_NEAR(scaled.cx, 320.0, 1e-9);
+
+    SCameraIntrinsics bare;
+    bare.fx = bare.fy = 500.0;
+    bare.cx = bare.cy = 320.0;
+    EXPECT_FALSE(bare.rebaseToImage(640, 480)) << "no active array declared means the intrinsics are already the image's";
+}
+
+// End to end: a bundle whose intrinsics are stated against a padded sensor array
+// must compose exactly like one whose intrinsics are already in image
+// coordinates. Without the rebase the markers miss by the crop offset.
+TEST(EndToEnd, BackgroundMarkersLandWherePredictedWhenIntrinsicsCarryASensorCrop) {
+    const auto& FIX = sensorArrayFixture();
+
+    // The bundle declares the crop; the loader must have taken it back out.
+    ASSERT_FALSE(FIX.bundle.cameras.empty());
+    const auto& CAM = FIX.bundle.cameras.front();
+    EXPECT_NEAR(CAM.intrinsics.cy, FIX.scene.cameras.front().intrinsics.cy, 1e-6)
+        << "the loader must rebase the principal point back to image coordinates; it is off by the crop offset";
+    EXPECT_GT(CAM.intrinsics.activeArray[3], CAM.video.height) << "the fixture is supposed to be carrying a padded active array";
+
+    const double FPS      = FIX.scene.overlayHz;
+    const auto   RENDERED = renderCase(
+        "sensor-array", [](SRenderOptions& options) { options.background = eBackgroundChoice::CAMERA; }, FIX, true);
+
+    size_t checked = 0;
+    double worst   = 0.0;
+    for (size_t k : {size_t{10}, size_t{25}}) {
+        const SImage IMAGE  = RENDERED.frame(k);
+        const SPose  EYE    = FIX.outputCamera(static_cast<int>(FIX.outputRecord(k, FPS)), 0);
+        const size_t FRAME  = predictCameraFrame(FIX, 0, k, FPS);
+        const SPose  CAMERA = FIX.scene.headAt(FIX.cameraHostNs(0, FRAME)).compose(FIX.camera(0).headToCamera);
+
+        for (const auto& MARKER : FIX.scene.wallMarkers) {
+            const auto PREDICTED = predictBackgroundPixel(EYE, RENDERED.report.paneFov.at(0), PANE_WIDTH, PANE_HEIGHT, CAMERA, MARKER.world, 2.0);
+            if (!PREDICTED || (*PREDICTED)[0] < 20 || (*PREDICTED)[0] > PANE_WIDTH - 20 || (*PREDICTED)[1] < 20 || (*PREDICTED)[1] > PANE_HEIGHT - 20)
+                continue;
+            const auto MEASURED = findColor(IMAGE, MARKER.color, 60, 0, PANE_WIDTH);
+            if (!MEASURED || MEASURED->count < 30)
+                continue;
+            const double D = std::hypot(MEASURED->x - (*PREDICTED)[0], MEASURED->y - (*PREDICTED)[1]);
+            worst          = std::max(worst, D);
+            ++checked;
+            EXPECT_LT(D, 2.5) << "marker `" << MARKER.name << "` in frame " << k << " landed " << D << " px away; an un-rebased principal point would move it much further";
+        }
+    }
+    ASSERT_GT(checked, 0u);
+    std::cout << "[measured] with intrinsics stated against a padded sensor array, markers land within " << worst << " px of prediction\n";
+}
