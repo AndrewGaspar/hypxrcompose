@@ -353,11 +353,14 @@ composite looks wrong.
 
 Three things happen to a passthrough camera on the way into a composite, and all three are visible in
 `validate`/`render` output. Its intrinsics are **rebased** from the sensor's active array into image
-coordinates. It is **aimed**: `--bg-align auto` (the default) points its optical axis along the
-output's forward, keeping the extrinsic's roll, because the recorded swing is measured against the
-IMU rather than the head and applying it verbatim slides the passthrough off the frame — at the cost
-of re-registering the background by that angle, so `--bg-align recorded` is right once a real
-`imu_to_head` exists. And it is **reprojected from when it was captured**: the head pose at the
+coordinates. Its **extrinsic is recomputed from the device's raw pose** whenever the header
+carries `extrinsics_android_raw`: Android documents that quaternion as sensor-to-camera, so a
+head-to-camera needs the conjugate, and every take recorded so far stored it without one — which
+mirrors the cameras' cant, storing a lens that points 10.9° down as pointing 10.9° up. `validate`
+reports the repair and the disagreement angle. (The `GYROSCOPE` label on the extrinsic is enum reuse;
+the frame is the head's, so no device constant is needed.) `--bg-align auto` is available to point
+each camera along the output's forward, but it is a **framing** choice — it re-registers the
+background against the world by the angle it discards — and `recorded` is the default and the truth. And it is **reprojected from when it was captured**: the head pose at the
 frame's own `t_xr_ns` (preferred over `t_device_ns`, whose domain is whatever the header declares),
 not at the output instant, which is what stops the room lagging the overlay between a 30 Hz capture
 and a 45 Hz output.

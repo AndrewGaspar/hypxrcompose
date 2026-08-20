@@ -563,6 +563,7 @@ namespace hxc {
             header["take"]                      = TAKE_ID;
             header["intrinsics"]                = json::object();
             header["extrinsics_head_to_camera"] = json::object();
+            header["extrinsics_android_raw"]    = json::object();
             for (const auto& CAMERA : scene.cameras) {
                 json intrinsics;
                 // The extra descriptive strings and the duplicate coefficient
@@ -598,12 +599,29 @@ namespace hxc {
                 intrinsics["rolling_shutter_skew_ns"] = -1;
                 header["intrinsics"][CAMERA.key]      = intrinsics;
 
+                // The derived field, and the raw it is derived from. A reader
+                // should prefer the raw - that is the whole point of the policy -
+                // so the two are written to disagree when the fixture asks for the
+                // legacy mirroring, and to agree otherwise.
+                const SQuat RAW    = androidRawFromHeadToCamera(CAMERA.headToCamera.rot);
+                const SQuat STORED = options.legacyMirroredExtrinsics ? repairMirroredHeadToCamera(CAMERA.headToCamera.rot) : CAMERA.headToCamera.rot;
+
                 header["extrinsics_head_to_camera"][CAMERA.key] = {
                     {"pos", json::array({CAMERA.headToCamera.pos.x, CAMERA.headToCamera.pos.y, CAMERA.headToCamera.pos.z})},
-                    {"quat", json::array({CAMERA.headToCamera.rot.x, CAMERA.headToCamera.rot.y, CAMERA.headToCamera.rot.z, CAMERA.headToCamera.rot.w})},
+                    {"quat", json::array({STORED.x, STORED.y, STORED.z, STORED.w})},
                     {"quat_order", "xyzw"},
                     {"axes", "openxr"},
+                    // The label the device uses, kept because it is what a real
+                    // header says - and because it is misleading: the frame is the
+                    // head's, not the gyroscope's.
                     {"reference", "GYROSCOPE"},
+                };
+                header["extrinsics_android_raw"][CAMERA.key] = {
+                    {"lens_pose_translation", json::array({CAMERA.headToCamera.pos.x, CAMERA.headToCamera.pos.y, CAMERA.headToCamera.pos.z})},
+                    {"lens_pose_rotation", json::array({RAW.x, RAW.y, RAW.z, RAW.w})},
+                    {"quat_order", "xyzw"},
+                    {"axes", "android_sensor"},
+                    {"lens_pose_reference", "GYROSCOPE"},
                 };
             }
             // Shared once, not repeated per camera.

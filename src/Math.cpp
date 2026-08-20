@@ -184,6 +184,35 @@ namespace hxc {
         return std::isfinite(px) && std::isfinite(py);
     }
 
+    namespace {
+        // A half turn about +X: the flip between Android's camera convention and
+        // OpenXR's, where a camera looks down -Z.
+        const SQuat X_HALF_TURN{1.0, 0.0, 0.0, 0.0};
+    }
+
+    SQuat headToCameraFromAndroidRaw(const SQuat& rawSensorToCamera) {
+        return (rawSensorToCamera.conjugate() * X_HALF_TURN).normalized();
+    }
+
+    SQuat androidRawFromHeadToCamera(const SQuat& headToCamera) {
+        // A half turn is its own inverse, so the same flip undoes it.
+        return (headToCamera * X_HALF_TURN).conjugate().normalized();
+    }
+
+    SQuat repairMirroredHeadToCamera(const SQuat& stored) {
+        return (X_HALF_TURN * stored.inverse() * X_HALF_TURN).normalized();
+    }
+
+    double angleBetweenDegrees(const SQuat& a, const SQuat& b) {
+        const double DOT = std::min(1.0, std::abs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w));
+        return 2.0 * std::acos(DOT) * 180.0 / M_PI;
+    }
+
+    double opticalAxisPitchDegrees(const SQuat& q) {
+        const SVec3 AXIS = q.rotate({0.0, 0.0, -1.0});
+        return std::asin(std::clamp(AXIS.y, -1.0, 1.0)) * 180.0 / M_PI;
+    }
+
     SQuat twistAbout(const SQuat& q, const SVec3& axis) {
         const SVec3  A         = axis.normalized();
         const double PROJECTED = q.x * A.x + q.y * A.y + q.z * A.z;

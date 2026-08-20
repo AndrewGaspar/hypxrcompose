@@ -112,6 +112,40 @@ namespace hxc {
     // swing), which is the harmless answer.
     SQuat twistAbout(const SQuat& q, const SVec3& axis);
 
+    // The head-to-camera rotation implied by Android's raw LENS_POSE_ROTATION.
+    //
+    // Two facts, both established from Meta's shipping code rather than guessed:
+    //
+    //  - LENS_POSE on Quest is HEAD-relative in spite of its GYROSCOPE label.
+    //    `LENS_POSE_REFERENCE` reuses that enumerant, and Meta's own samples
+    //    compose the pose directly onto the Head node with nothing but a 180
+    //    degree X flip. The native docs say "relative to the center of the HMD".
+    //    So there is no IMU-to-head constant to wait for.
+    //  - Android documents the raw quaternion as SENSOR TO CAMERA (p' = Rp), so
+    //    getting a head-to-camera out of it needs the conjugate. Omitting it is
+    //    what mirrors the cant: a camera that really points 10.9 degrees DOWN is
+    //    stored as pointing 10.9 degrees UP, a 21.7 degree error.
+    //
+    // The translation needs no conversion at all - the Android sensor frame
+    // shares the OpenXR head axes - so only the rotation is computed here.
+    SQuat headToCameraFromAndroidRaw(const SQuat& rawSensorToCamera);
+
+    // Undoes the mirrored conversion above, for a bundle that stored the buggy
+    // value and carries no raw to recompute from: Rx(180) * q^-1 * Rx(180),
+    // which is the same rotation as negating x. Verified against both cameras of
+    // the reference take.
+    SQuat repairMirroredHeadToCamera(const SQuat& stored);
+
+    // Inverse of headToCameraFromAndroidRaw: the raw sensor-to-camera quaternion
+    // a device would have reported for a given head-to-camera rotation. The
+    // synthetic bundle writes this so a real header's round trip is exercised.
+    SQuat androidRawFromHeadToCamera(const SQuat& headToCamera);
+
+    // Shortest angle between two rotations, in degrees. Diagnostics.
+    double angleBetweenDegrees(const SQuat& a, const SQuat& b);
+    // Elevation of the -Z optical axis after `q`, in degrees; positive is up.
+    double opticalAxisPitchDegrees(const SQuat& q);
+
     struct SPose {
         SVec3 pos;
         SQuat rot;

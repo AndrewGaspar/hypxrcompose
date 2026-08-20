@@ -1049,6 +1049,12 @@ namespace hxc {
                                 entry["intrinsics"] = it.value();
                                 if (const json* EXTRINSICS = member(*EXTRINSICS_MAP, it.key().c_str()))
                                     entry["extrinsics_head_to_camera"] = *EXTRINSICS;
+                                // The raw Android pose is keyed by camera too, and
+                                // it is the authority - see below.
+                                if (const json* RAW_MAP = member(header, "extrinsics_android_raw")) {
+                                    if (const json* RAW = member(*RAW_MAP, it.key().c_str()))
+                                        entry["extrinsics_android_raw"] = *RAW;
+                                }
                                 for (const char* SHARED : {"timestamp_source", "axes", "t_device_ns_domain", "clock_anchor"}) {
                                     if (const json* VALUE = member(header, SHARED))
                                         entry[SHARED] = *VALUE;
@@ -1128,6 +1134,58 @@ namespace hxc {
                             diags.error(ENTRY_WHERE, "missing required object `extrinsics_head_to_camera` {{pos,quat}}");
                         else if (const auto PARSED = parsePose(*EXTRINSICS, ENTRY_WHERE + " /extrinsics_head_to_camera", diags))
                             camera.headToCamera = *PARSED;
+
+                        // THE RAW ANDROID POSE WINS WHENEVER IT IS PRESENT.
+                        //
+                        // `extrinsics_head_to_camera` is a derived field, and the
+                        // derivation that produced the takes recorded so far is
+                        // missing a conjugate: Android documents its raw quaternion
+                        // as sensor-to-camera (p' = Rp), so a head-to-camera needs
+                        // the inverse. Without it the cant is mirrored - cameras
+                        // that really point ~10.9 degrees DOWN were stored pointing
+                        // ~10.9 degrees UP, a 21.7 degree error, which is exactly
+                        // the residue that made the passthrough sit high in the
+                        // frame. Recomputing from the raw is how a bundle recorded
+                        // by the buggy producer still composites correctly, without
+                        // touching the file.
+                        //
+                        // The other half of the finding is that there is nothing to
+                        // wait for: LENS_POSE is head-relative on Quest despite its
+                        // GYROSCOPE label, so no imu_to_head constant is needed.
+                        // In the producer's shape the raw sits in a top-level map
+                        // keyed by camera; in the flattened shapes it may be on the
+                        // entry itself. Look in both, so the policy does not depend
+                        // on which spelling the header happened to use.
+                        const json* RAW = member(*ENTRY, "extrinsics_android_raw");
+                        if (!RAW || !RAW->is_object()) {
+                            if (const json* RAW_MAP = member(header, "extrinsics_android_raw"); RAW_MAP && RAW_MAP->is_object())
+                                RAW = member(*RAW_MAP, RAW_KEY.c_str());
+                        }
+                        if (RAW && RAW->is_object()) {
+                            std::vector<double> translation, rotation;
+                            const std::string   RAW_WHERE = ENTRY_WHERE + " /extrinsics_android_raw";
+                            const bool          HAVE_T    = wantDoubleArray(*RAW, "lens_pose_translation", 3, RAW_WHERE, diags, translation);
+                            const bool          HAVE_R    = wantDoubleArray(*RAW, "lens_pose_rotation", 4, RAW_WHERE, diags, rotation);
+                            if (HAVE_T && HAVE_R) {
+                                const SQuat RAW_ROTATION{rotation[0], rotation[1], rotation[2], rotation[3]};
+                                const SPose STORED = camera.headToCamera;
+                                // The Android sensor frame shares the OpenXR head
+                                // axes, so the translation carries over untouched.
+                                camera.headToCamera.pos = {translation[0], translation[1], translation[2]};
+                                camera.headToCamera.rot = headToCameraFromAndroidRaw(RAW_ROTATION);
+                                camera.extrinsicsFromRaw = true;
+
+                                const double DISAGREEMENT = angleBetweenDegrees(STORED.rot, camera.headToCamera.rot);
+                                camera.extrinsicsDisagreementDegrees = DISAGREEMENT;
+                                if (DISAGREEMENT > 0.5)
+                                    bundle.loaderNotes.push_back(std::format("camera {}: recomputed head_to_camera from `extrinsics_android_raw`; the stored value disagrees by {:.2f} degrees "
+                                                                             "and is a repaired legacy conversion (the mirrored cant - stored optical axis {:+.2f} deg, actual {:+.2f} deg)",
+                                                                             camera.key, DISAGREEMENT, opticalAxisPitchDegrees(STORED.rot), opticalAxisPitchDegrees(camera.headToCamera.rot)));
+                                else
+                                    bundle.loaderNotes.push_back(std::format("camera {}: recomputed head_to_camera from `extrinsics_android_raw`; the stored value agrees to {:.2f} degrees",
+                                                                             camera.key, DISAGREEMENT));
+                            }
+                        }
 
                         int64_t dimension = 0;
                         if (wantInt(*ENTRY, "width", ENTRY_WHERE, diags, dimension, false))

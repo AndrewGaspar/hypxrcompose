@@ -223,6 +223,12 @@ namespace hxc {
         int                       eye = 0;
         SCameraIntrinsics         intrinsics;
         SPose                     headToCamera;
+        // Whether headToCamera was recomputed from `extrinsics_android_raw`
+        // rather than taken from the stored derived field, and by how much the
+        // two disagreed. A disagreement over about half a degree means the
+        // bundle was written by a producer whose conversion mirrored the cant.
+        bool                      extrinsicsFromRaw = false;
+        double                    extrinsicsDisagreementDegrees = 0.0;
         std::string               timestampSource;
         std::string               videoPath;
         SVideoInfo                video;

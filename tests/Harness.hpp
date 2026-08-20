@@ -98,6 +98,9 @@ namespace hxctest {
     // which "reprojected from capture time" and "reprojected from output time"
     // give visibly different answers.
     const SFixture& briskMotionFixture();
+    // A take whose stored head_to_camera carries the producer's mirrored cant,
+    // with a correct `extrinsics_android_raw` beside it.
+    const SFixture& mirroredExtrinsicsFixture();
 
     // The v1 background model, evaluated exactly: where must the output pixel be
     // for its assumed-depth ray to sample the camera pixel that shows `world`?

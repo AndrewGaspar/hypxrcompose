@@ -99,6 +99,11 @@ namespace hxc {
         int     cameraActiveArrayPad = 0;
         // Scales the head's motion rate; see SSynthScene::motionSpeed.
         double  headSpeed        = 1.0;
+        // Write `extrinsics_head_to_camera` the way the buggy producer wrote it -
+        // with the cant mirrored, because its conversion dropped a conjugate -
+        // while still writing a correct `extrinsics_android_raw`. Off by default;
+        // a fixture turns it on so the loader's repair path stays pinned.
+        bool    legacyMirroredExtrinsics = false;
         // Deliberately wider than the IPD: this is the parallax error research 27
         // section 5.1 accepts in v1, and making it real here means the test can
         // measure it.

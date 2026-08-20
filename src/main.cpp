@@ -68,6 +68,10 @@ synth:
                            principal point in that array's coordinates (what
                            Android does)
       --head-speed N       multiply the head's motion rate (default 1.0)
+      --legacy-mirrored-extrinsics
+                           write `extrinsics_head_to_camera` with the cant
+                           mirrored, as the buggy producer wrote it, while still
+                           writing a correct `extrinsics_android_raw`
       --no-distortion      cameras publish no distortion coefficients, so the
                            sidecar carries `"distortion": null` (what the Meta
                            cameras do - they pre-undistort)
@@ -90,14 +94,15 @@ render:
       --bg-depth M         assumed background distance in metres (default 1.0,
                            measured stillest on a seated desk take; raise it for
                            a take shot across a room)
-      --bg-align auto|recorded         (default auto)
+      --bg-align recorded|auto         (default recorded)
+                           recorded: the true geometry. Where the header carries
+                             `extrinsics_android_raw` the extrinsic is recomputed
+                             from it, repairing the mirrored cant that older
+                             producers stored
                            auto: aim each camera's optical axis along the output's
-                             forward, keeping the extrinsic's roll. The recorded
-                             extrinsic is measured against the IMU, not the head,
-                             so applying it verbatim slides the passthrough off
-                             the frame
-                           recorded: use the extrinsic exactly as stamped
-      --fg-depth M|inf     assumed overlay distance (default inf = rotation only)
+                             forward, keeping the extrinsic's roll. A framing
+                             choice that centres the passthrough and re-registers
+                             it against the world - not a correction
       --stabilize-ms N     Gaussian sigma for --framing stabilized (default 200)
       --no-audio           video only
       --mic-gain G         linear gain applied to the mic track (default 1.0)
@@ -268,6 +273,8 @@ int main(int argc, char** argv) {
                 options.noDistortion = true;
             else if (ARG == "--head-speed" && parseDouble(value(COUNT, REST, i), number))
                 options.headSpeed = number;
+            else if (ARG == "--legacy-mirrored-extrinsics")
+                options.legacyMirroredExtrinsics = true;
             else if (ARG == "--camera-active-array-pad" && parseInt(value(COUNT, REST, i), integer))
                 options.cameraActiveArrayPad = static_cast<int>(integer);
             else if (ARG == "--eye-fov") {

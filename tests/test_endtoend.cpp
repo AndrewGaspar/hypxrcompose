@@ -1648,3 +1648,108 @@ TEST(EndToEnd, BgAlignAutoTradesRegistrationForCoverage) {
     std::cout << "[measured] --bg-align auto: optical axis " << AUTO_OFF << " px from centre (recorded " << RECORDED_OFF << "), world feature drifts " << AUTO_DRIFT
               << " px (recorded " << RECORDED_DRIFT << ") - coverage bought, registration spent\n";
 }
+
+// ---------------------------------------------------------------------------
+// 18. The camera extrinsic: what the device meant, not what the producer stored.
+//
+// Two facts, both established from Meta's shipping code rather than inferred
+// from our own output. LENS_POSE is HEAD-relative on Quest despite carrying the
+// GYROSCOPE label - the enumerant is reused, the samples compose it straight
+// onto the Head node, and the native docs say "relative to the center of the
+// HMD". And Android documents its raw quaternion as sensor-to-camera, so
+// deriving a head-to-camera from it needs the conjugate. Every take recorded so
+// far dropped that conjugate, which mirrors the cameras' cant: lenses that
+// really point ~10.9 degrees DOWN were stored pointing ~10.9 degrees UP.
+// ---------------------------------------------------------------------------
+
+TEST(EndToEnd, TheAndroidExtrinsicConversionMatchesTheDeviceGroundTruth) {
+    // The reference take's own raw poses, and the head-to-camera each must yield.
+    struct SCase {
+        const char* name;
+        SQuat       raw;      // lens_pose_rotation, xyzw
+        SQuat       stored;   // what the buggy producer wrote
+        SQuat       expected; // the truth
+    };
+    const std::vector<SCase> CASES{
+        {"L", {-0.99550444, -0.00107147, -0.00340148, 0.09464765}, {0.09464765, -0.00340148, 0.00107147, 0.99550444}, {-0.09464765, -0.00340148, 0.00107147, 0.99550444}},
+        {"R", {-0.99558902, -0.00608580, 0.00218954, 0.09359822}, {0.09359822, 0.00218954, 0.00608580, 0.99558902}, {-0.09359822, 0.00218954, 0.00608580, 0.99558902}},
+    };
+
+    for (const auto& RAW_CASE : CASES) {
+        // The published values are quoted to eight places and so are not exactly
+        // unit; normalize before comparing, or the round-trip check measures the
+        // transcription rather than the arithmetic.
+        const SCase CASE{RAW_CASE.name, RAW_CASE.raw.normalized(), RAW_CASE.stored.normalized(), RAW_CASE.expected.normalized()};
+
+        // Path one: straight from the raw, which is what the loader does whenever
+        // the header carries it.
+        EXPECT_LT(angleBetweenDegrees(headToCameraFromAndroidRaw(CASE.raw), CASE.expected), 0.05) << CASE.name << ": conjugate(raw) * Rx(180) must give the device's actual pose";
+
+        // Path two: repairing a stored value with no raw to fall back on.
+        EXPECT_LT(angleBetweenDegrees(repairMirroredHeadToCamera(CASE.stored), CASE.expected), 0.05) << CASE.name << ": Rx(180) * stored^-1 * Rx(180) must give the same answer";
+
+        // The two paths must agree with each other, not merely with the target.
+        EXPECT_LT(angleBetweenDegrees(headToCameraFromAndroidRaw(CASE.raw), repairMirroredHeadToCamera(CASE.stored)), 0.05) << CASE.name;
+
+        // And the error being repaired is the mirrored cant: same magnitude,
+        // opposite sign, about 21.7 degrees apart.
+        const double STORED_PITCH   = opticalAxisPitchDegrees(CASE.stored);
+        const double CORRECT_PITCH  = opticalAxisPitchDegrees(CASE.expected);
+        EXPECT_GT(STORED_PITCH, 9.0) << CASE.name << ": the stored pose should point up";
+        EXPECT_LT(CORRECT_PITCH, -9.0) << CASE.name << ": the real camera cants down";
+        EXPECT_NEAR(STORED_PITCH, -CORRECT_PITCH, 0.2) << CASE.name << ": the bug is a mirror, so the two pitches are equal and opposite";
+        EXPECT_NEAR(angleBetweenDegrees(CASE.stored, CASE.expected), 21.6, 0.5) << CASE.name;
+
+        // The round trip the synthetic bundle relies on.
+        EXPECT_LT(angleBetweenDegrees(headToCameraFromAndroidRaw(androidRawFromHeadToCamera(CASE.expected)), CASE.expected), 1e-6) << CASE.name << ": raw <-> head_to_camera must round-trip";
+    }
+    std::cout << "[measured] both cameras: raw-derived and repaired extrinsics agree with the device ground truth to under 0.05 deg; the stored values are "
+              << angleBetweenDegrees(CASES[0].stored, CASES[0].expected) << " deg out\n";
+}
+
+// End to end: a bundle carrying the producer's mirrored value must still
+// composite with the true geometry, because the raw beside it is authoritative.
+TEST(EndToEnd, AMirroredStoredExtrinsicIsRepairedFromTheRawPose) {
+    const auto& FIX = mirroredExtrinsicsFixture();
+
+    ASSERT_FALSE(FIX.bundle.cameras.empty());
+    for (const auto& CAM : FIX.bundle.cameras) {
+        EXPECT_TRUE(CAM.extrinsicsFromRaw) << "camera " << CAM.key << ": the raw pose must win when it is present";
+        EXPECT_GT(CAM.extrinsicsDisagreementDegrees, 0.5) << "camera " << CAM.key << ": the fixture stores a mirrored value, so the disagreement should be loud";
+
+        // What matters: the loaded extrinsic is the scene's truth, not the
+        // mirrored value the file carries.
+        const SQuat TRUTH = FIX.camera(CAM.eye).headToCamera.rot;
+        EXPECT_LT(angleBetweenDegrees(CAM.headToCamera.rot, TRUTH), 0.05) << "camera " << CAM.key << ": the repaired extrinsic must be the real one";
+        EXPECT_LT((CAM.headToCamera.pos - FIX.camera(CAM.eye).headToCamera.pos).length(), 1e-9) << "the translation needs no conversion and must survive untouched";
+    }
+
+    // And the composite lands where the true geometry says, not where the
+    // mirrored one would have put it.
+    const double FPS      = FIX.scene.overlayHz;
+    const auto   RENDERED = renderCase(
+        "mirrored-extrinsics", [](SRenderOptions& o) { o.background = eBackgroundChoice::CAMERA; o.backgroundDepth = 2.0; }, FIX, true);
+
+    size_t checked = 0;
+    double worst   = 0.0;
+    for (size_t k : {size_t{10}, size_t{25}}) {
+        const SImage IMAGE  = RENDERED.frame(k);
+        const SPose  EYE    = FIX.outputCamera(static_cast<int>(FIX.outputRecord(k, FPS)), 0);
+        const size_t FRAME  = predictCameraFrame(FIX, 0, k, FPS);
+        const SPose  CAMERA = FIX.scene.headAt(FIX.cameraHostNs(0, FRAME)).compose(FIX.cameraExtrinsic(0, eBackgroundAlign::RECORDED));
+        for (const auto& MARKER : FIX.scene.wallMarkers) {
+            const auto PREDICTED = predictBackgroundPixel(EYE, RENDERED.report.paneFov.at(0), PANE_WIDTH, PANE_HEIGHT, CAMERA, MARKER.world, 2.0);
+            if (!PREDICTED || (*PREDICTED)[0] < 20 || (*PREDICTED)[0] > PANE_WIDTH - 20 || (*PREDICTED)[1] < 20 || (*PREDICTED)[1] > PANE_HEIGHT - 20)
+                continue;
+            const auto MEASURED = findColor(IMAGE, MARKER.color, 60, 0, PANE_WIDTH);
+            if (!MEASURED || MEASURED->count < 30)
+                continue;
+            const double D = std::hypot(MEASURED->x - (*PREDICTED)[0], MEASURED->y - (*PREDICTED)[1]);
+            worst          = std::max(worst, D);
+            ++checked;
+            EXPECT_LT(D, 2.5) << "marker `" << MARKER.name << "` in frame " << k;
+        }
+    }
+    ASSERT_GT(checked, 0u);
+    std::cout << "[measured] a bundle storing the mirrored extrinsic composites within " << worst << " px of the true geometry, repaired from its raw pose\n";
+}

@@ -57,21 +57,32 @@ namespace hxc {
         RECORDED,
     };
 
-    // What to do with the recorded camera extrinsic's rotation.
+    // What to do with the camera extrinsic's rotation.
     enum class eBackgroundAlign {
-        // Point every camera's optical axis along the output's forward direction,
-        // keeping the roll the extrinsic recorded. The recorded rotation carries a
-        // constant off-axis term - on the first real take ~10.9 degrees of pitch
-        // plus a yaw component - which slides the passthrough off the frame: the
-        // camera's 72.9-degree horizontal field is WIDER than the output's 69.8,
-        // so full coverage is available and what costs it is aim, not field. The
-        // term is rigid and constant, so it is removed once from the extrinsic
-        // rather than fitted per frame.
-        AUTO,
-        // Use the extrinsic exactly as recorded. Correct once a real
-        // imu_to_head constant exists to resolve it against - see NEXT-STEPS -
-        // and the right mode for checking what the device actually reported.
+        // Use the extrinsic as the bundle gives it - which, whenever the header
+        // carries `extrinsics_android_raw`, is recomputed from that raw pose
+        // rather than trusted from the stored derived field. This is the
+        // CORRECT geometry and the default.
+        //
+        // It once looked wrong. The takes recorded so far store a head_to_camera
+        // whose conversion dropped a conjugate, mirroring the cameras' cant:
+        // lenses that really point ~10.9 degrees DOWN were stored pointing ~10.9
+        // degrees UP, a 21.7 degree error that pushed the passthrough into the
+        // top of the frame. That was read at the time as an unresolvable
+        // IMU-versus-head frame problem. It was neither unresolvable nor about
+        // the IMU - LENS_POSE is head-relative on Quest despite its GYROSCOPE
+        // label - and the loader now repairs it from the raw.
         RECORDED,
+        // Point every camera's optical axis along the output's forward, keeping
+        // the roll the extrinsic recorded.
+        //
+        // This is a FRAMING choice, not a correction. It centres the passthrough
+        // in the pane, which is worth something when the camera's field is
+        // narrower than the output's and the cant walks it off one edge - but it
+        // re-registers the background against the world by exactly the angle it
+        // discards, so the room no longer sits where the wearer saw it. Use it
+        // to fill a frame, never to fix one.
+        AUTO,
     };
 
     enum class eBackgroundChoice {
@@ -88,7 +99,7 @@ namespace hxc {
         eEyeSelection         eye     = eEyeSelection::LEFT;
         eFraming              framing = eFraming::ASIS;
         eFrustumMode          frustum = eFrustumMode::PRESENTATION;
-        eBackgroundAlign      backgroundAlign = eBackgroundAlign::AUTO;
+        eBackgroundAlign      backgroundAlign = eBackgroundAlign::RECORDED;
         eBackgroundChoice     background = eBackgroundChoice::AUTO;
 
         // Per-eye pane size. Stereo SBS output is therefore 2*width x height, which

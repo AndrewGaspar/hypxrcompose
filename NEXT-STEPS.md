@@ -252,27 +252,40 @@ shows the cost of choosing a near depth (a closer assumed surface means more par
 and the eye, so the image shifts further). The real answer is per-pixel depth from the stereo pair,
 which is gap 3 above.
 
-**Still open: the 10.87° extrinsic pitch.** With both fixes the passthrough still sits high — nothing
-below 76% of the pane — and that residue is entirely the recorded `extrinsics_head_to_camera`
-rotation, 10.87° about +X (camera looking *up* relative to the head). Two things are worth knowing
-before anyone "fixes" it:
+~~**Still open: the 10.87° extrinsic pitch.**~~ — **CLOSED: it was our own conversion bug, not a
+frame problem.** Two things were wrong with the reasoning that left this open, and both are now
+settled from Meta's shipping code rather than from our own output:
 
-- It is not a sign error in this code. Inverting the rotation does not centre the image, it mirrors
-  the bias (measured: coverage moves from y [0%, 76%] to y [24%, 100%]). A sign error would centre it.
-- It is not a double axes conversion either. The producer already converts Android → OpenXR — the
-  raw `lens_pose_rotation` is a 169° rotation about −X, which is that 180° flip composed with ~11° —
-  and applying a second fix-up here would point the camera backwards, giving zero coverage rather
-  than the 59% measured.
+- **`GYROSCOPE` is enum reuse, not a frame.** `LENS_POSE_REFERENCE` reports that enumerant, but on
+  Quest the pose is **head-relative**: Meta's samples compose it directly onto the Head node with
+  nothing but a 180° X flip, unchanged across 15 months of SDK versions, and the native docs say
+  "relative to the center of the HMD". There is no `imu_to_head` constant to wait for and nothing for
+  the producer to add.
+- **Our stored `extrinsics_head_to_camera` is missing a conjugate.** Android documents the raw
+  quaternion as *sensor to camera* (p′ = Rp), so a head-to-camera needs the inverse. Dropping it
+  mirrors the cant: cameras that really point **10.86° DOWN** were stored pointing **10.86° UP**, a
+  **21.7° error** — which is exactly the residue that pushed the passthrough into the top of the
+  frame and was mistaken for an unresolvable frame offset.
 
-What remains is the reference frame. The extrinsic carries `"reference": "GYROSCOPE"`, and Android's
-`LENS_POSE_REFERENCE` says exactly that: `LENS_POSE_ROTATION`/`TRANSLATION` are relative to the
-**gyroscope/IMU** frame, not to the display or head origin that OpenXR head poses use. The rigid
-offset between the two is a device constant this bundle does not carry. Either the producer resolves
-the extrinsic into head/display space before writing it, or the bundle grows an
-`imu_to_head`/`reference_pose` field. Until then the ~11° is being applied as though the IMU and the
-head origin were coincident, which is the most likely remaining cause of the high framing.
+The correct conversion, in OpenXR axes: the translation is `LENS_POSE_TRANSLATION` **unchanged** (the
+Android sensor frame shares the OpenXR head axes — no z-flip), and
+`q_head→camera = conjugate(raw_xyzw) ⊗ Rx(180°)`. For a bundle that stored the mirrored value with no
+raw to fall back on, `q_correct = Rx(180°) ⊗ q_stored⁻¹ ⊗ Rx(180°)` gives the same answer — verified
+identical on both cameras of the reference take, and unit-tested against the device's ground truth.
 
-`--bg-align auto` papers over this term rather than resolving it. A coverage line is printed on every camera render — where the camera's corners project into pane
+**Policy: the raw wins.** Whenever the header carries `extrinsics_android_raw` — which both real
+takes do — the loader recomputes `head_to_camera` from it and uses that, in memory only; the bundle
+is never rewritten. It cross-checks against the stored value and says in `validate` whether the
+stored one was correct or is a *repaired legacy conversion*, with the disagreement angle. On the
+reference take that reads 21.72° (L) and 21.48° (R). When no raw is present the stored value is
+trusted as-is.
+
+**What this means for framing.** With truthful geometry the L camera covers **+18.0° to −39.9°
+vertically** and **±36.4° horizontally** against a pane of ±32.2° by ±40.0°, sitting about 0.4° off
+forward in azimuth. So under the (now default) `--bg-align recorded` there is an **uncovered band at
+the top of the pane** — about 14° of the 64.4° vertical field. That is the real rig: the cameras look
+down, and nothing above +18° was ever photographed. It is not a defect to fight.
+
 coordinates, and the resulting coverage — so this class of problem is visible without a headset.
 
 ---

@@ -111,7 +111,7 @@ namespace hxctest {
     namespace {
 
         SFixture buildFixture(const std::string& name, double clockOffsetMs, const std::string& alpha = "premultiplied", const std::optional<SFov>& eyeFov = std::nullopt,
-                              bool geometryMarkers = false, int cameraActiveArrayPad = 0, double headSpeed = 1.0, double cameraHz = 0.0) {
+                              bool geometryMarkers = false, int cameraActiveArrayPad = 0, double headSpeed = 1.0, double cameraHz = 0.0, bool legacyMirroredExtrinsics = false) {
             SFixture fixture;
             fixture.take = scratchRoot() / (name + ".hypxrtake");
 
@@ -137,6 +137,7 @@ namespace hxctest {
             fixture.options.headSpeed            = headSpeed;
             if (cameraHz > 0.0)
                 fixture.options.cameraHz = cameraHz;
+            fixture.options.legacyMirroredExtrinsics = legacyMirroredExtrinsics;
 
             if (!fs::exists(fixture.take / "manifest.json")) {
                 setLogLevel(eLogLevel::WARN);
@@ -184,6 +185,14 @@ namespace hxctest {
         // enough apart for the two reprojection models to disagree visibly. At
         // rest they agree, and a test that cannot tell them apart is not a test.
         static const SFixture FIXTURE = buildFixture("brisk-motion", 200.0, "premultiplied", std::nullopt, false, 0, 10.0, 5.0);
+        return FIXTURE;
+    }
+
+    const SFixture& mirroredExtrinsicsFixture() {
+        // Stores head_to_camera the way the buggy producer stored it - cant
+        // mirrored - while carrying a correct raw pose beside it, which is
+        // exactly the shape every take recorded so far has.
+        static const SFixture FIXTURE = buildFixture("mirrored-extrinsics", 200.0, "premultiplied", std::nullopt, false, 0, 1.0, 0.0, true);
         return FIXTURE;
     }
 

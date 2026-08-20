@@ -477,14 +477,15 @@ namespace hxc {
 
         // The extrinsic rotation to actually use, per pane, decided once.
         //
-        // `auto` keeps only the roll: the swing - where the lens is pointing
-        // relative to the head - is dropped, so the optical axis ends up along
-        // the output's forward direction and the camera image lands centred.
-        // That is a deliberate lie about the rig, and it is the right one until
-        // the producer can say where the IMU sits relative to the head, because
-        // the recorded swing is measured against the IMU frame and applying it as
-        // though it were head-relative aims the passthrough somewhere the wearer
-        // is not looking.
+        // `recorded` - the default - is the true geometry: the loader has already
+        // recomputed head_to_camera from Android's raw pose wherever the header
+        // carries it, which is what undoes the mirrored cant the producer's
+        // conversion introduced.
+        //
+        // `auto` keeps only the roll, dropping the swing so the optical axis ends
+        // up along the output's forward. That centres the picture and lies about
+        // the rig: the background is re-registered by the angle discarded. It is
+        // for filling a frame, not for fixing one.
         const auto extrinsicFor = [&](const SCamera& meta) {
             if (options.backgroundAlign == eBackgroundAlign::RECORDED)
                 return meta.headToCamera;
