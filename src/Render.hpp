@@ -75,6 +75,25 @@ namespace hxc {
         CAMERA,
     };
 
+    // What decides where the output frames sit in time.
+    enum class eOutputClock {
+        // A constant-rate grid at the overlay's capture rate (or --fps). Every
+        // source is then resampled onto it: the background picks the nearest
+        // camera frame and is reprojected from that frame's pose into the output
+        // pose, which is correct but not free - a 30 Hz camera against a 45 Hz
+        // grid means most output frames reuse a camera frame from up to half a
+        // period ago, and the reprojection has to carry the head motion in
+        // between.
+        OVERLAY,
+        // The output frame sequence IS the camera frame sequence: one output
+        // frame per camera frame, timed at that frame's own capture stamp, with
+        // the output camera at the head pose interpolated to it. The background
+        // then needs no temporal resampling at all - the camera frame and the
+        // output instant are the same instant - and what is left between the
+        // lens and the eye is the constant extrinsic offset.
+        CAMERA,
+    };
+
     // What to do with the camera extrinsic's rotation.
     enum class eBackgroundAlign {
         // Use the extrinsic as the bundle gives it - which, whenever the header
@@ -118,6 +137,7 @@ namespace hxc {
         eFraming              framing = eFraming::ASIS;
         eFrustumMode          frustum = eFrustumMode::PRESENTATION;
         eBackgroundAlign      backgroundAlign = eBackgroundAlign::RECORDED;
+        eOutputClock          clock           = eOutputClock::OVERLAY;
         eBackgroundChoice     background = eBackgroundChoice::AUTO;
 
         // Per-eye pane size. Stereo SBS output is therefore 2*width x height, which

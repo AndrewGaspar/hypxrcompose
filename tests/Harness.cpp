@@ -119,7 +119,7 @@ namespace hxctest {
 
         SFixture buildFixture(const std::string& name, double clockOffsetMs, const std::string& alpha = "premultiplied", const std::optional<SFov>& eyeFov = std::nullopt,
                               bool geometryMarkers = false, int cameraActiveArrayPad = 0, double headSpeed = 1.0, double cameraHz = 0.0, bool legacyMirroredExtrinsics = false,
-                              double cameraFocalScale = 1.0) {
+                              double cameraFocalScale = 1.0, int cameraDropEvery = 0) {
             SFixture fixture;
             fixture.take = scratchRoot() / (name + ".hypxrtake");
 
@@ -147,6 +147,7 @@ namespace hxctest {
                 fixture.options.cameraHz = cameraHz;
             fixture.options.legacyMirroredExtrinsics = legacyMirroredExtrinsics;
             fixture.options.cameraFocalScale         = cameraFocalScale;
+            fixture.options.cameraDropEvery          = cameraDropEvery;
 
             if (!fs::exists(fixture.take / "manifest.json")) {
                 setLogLevel(eLogLevel::WARN);
@@ -202,6 +203,23 @@ namespace hxctest {
         // the eyes' - the real rig's situation, and the only one where clipping
         // the output to camera coverage has anything to do.
         static const SFixture FIXTURE = buildFixture("narrow-camera", 200.0, "premultiplied", std::nullopt, false, 0, 1.0, 0.0, false, 2.0);
+        return FIXTURE;
+    }
+
+    const SFixture& steadyCameraFixture() {
+        // The real rig's rate relationship - a 30 Hz camera against a 45 Hz
+        // overlay - with a head moving briskly enough that resampling one onto
+        // the other has something to get wrong. Comparing the two output clocks
+        // needs both to be plausible; a 5 Hz camera would only prove that fewer
+        // frames means coarser motion.
+        static const SFixture FIXTURE = buildFixture("steady-camera", 200.0, "premultiplied", std::nullopt, false, 0, 4.0);
+        return FIXTURE;
+    }
+
+    const SFixture& droppedCameraFrameFixture() {
+        // Brisk head motion so the timing matters, and every seventh left-camera
+        // frame missing so the two eyes' stamp series are not the same series.
+        static const SFixture FIXTURE = buildFixture("dropped-camera-frame", 200.0, "premultiplied", std::nullopt, false, 0, 4.0, 0.0, false, 1.0, 7);
         return FIXTURE;
     }
 

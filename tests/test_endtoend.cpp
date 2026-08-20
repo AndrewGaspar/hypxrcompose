@@ -1936,3 +1936,165 @@ TEST(EndToEnd, TheCameraClippedFrustumKeepsTheStereoContract) {
     std::cout << "[measured] camera-clipped stereo: both panes share l=" << L.l << " r=" << L.r << " u=" << L.u << " d=" << L.d << " at " << report.paneWidth << "x" << report.paneHeight
               << "; vertical asymmetry " << (L.u + L.d) * 180.0 / M_PI << " deg, horizontal centred to " << (L.l + L.r) * 180.0 / M_PI << " deg\n";
 }
+
+// ---------------------------------------------------------------------------
+// 20. `--clock camera`: one output frame per camera frame.
+//
+// Reported from a viewing of take4: "XR content seems a little jittery relative
+// to background". A 30 Hz camera against a 45 Hz output grid means most output
+// frames reuse a camera frame from up to half a period ago; the reprojection
+// corrects for the head motion in between, but the correction is only as good as
+// the assumed depth, and what is left reads as the room shimmering under the
+// XR content. Timing the output off the camera removes the resampling entirely.
+// ---------------------------------------------------------------------------
+
+TEST(EndToEnd, TheCameraClockRemovesTheBackgroundsResamplingJitter) {
+    const auto& FIX = steadyCameraFixture();
+
+    // How unevenly a world feature moves across the frame. Jitter is not motion -
+    // the head is turning, so the feature is *supposed* to travel - it is motion
+    // that stutters. The second difference of its position is exactly that, and
+    // it is comparable between two runs at different frame rates in a way that
+    // raw frame-to-frame displacement is not.
+    // Normalised by the frame interval squared, because a second difference
+    // scales with it: the camera clock runs at 30 Hz against the overlay grid's
+    // 45, so even perfectly smooth motion would show second differences 2.25
+    // times larger there. What is being compared is acceleration, not travel.
+    const auto roughness = [&](eOutputClock clock, const char* tag) {
+        SRenderOptions options;
+        options.take        = FIX.take;
+        options.outPath     = (scratchRoot() / (std::string("clock-") + tag + ".mkv")).string();
+        options.width       = PANE_WIDTH;
+        options.height      = PANE_HEIGHT;
+        options.background  = eBackgroundChoice::CAMERA;
+        options.clock       = clock;
+        options.noAudio     = true;
+        options.limitFrames = 40;
+        options.framesDir   = (scratchRoot() / (std::string("clock-") + tag)).string();
+        std::error_code ec;
+        fs::remove_all(options.framesDir, ec);
+
+        SRendered rendered;
+        rendered.framesDir = options.framesDir;
+        setLogLevel(eLogLevel::WARN);
+        const int STATUS = runRender(options, &rendered.report);
+        setLogLevel(eLogLevel::INFO);
+        EXPECT_EQ(STATUS, 0) << tag;
+
+        std::vector<double> xs;
+        for (size_t k = 0; k < rendered.report.frames.size(); ++k) {
+            const auto FOUND = findColor(rendered.frame(k), wallMarker(FIX.scene, "green").color, 60, 0, PANE_WIDTH);
+            xs.push_back(FOUND && FOUND->count > 20 ? FOUND->x : std::numeric_limits<double>::quiet_NaN());
+        }
+        fs::remove_all(rendered.framesDir, ec);
+
+        std::vector<double> second;
+        for (size_t k = 2; k < xs.size(); ++k) {
+            if (std::isnan(xs[k]) || std::isnan(xs[k - 1]) || std::isnan(xs[k - 2]))
+                continue;
+            second.push_back(std::abs(xs[k] - 2.0 * xs[k - 1] + xs[k - 2]));
+        }
+        EXPECT_GT(second.size(), 10u) << tag << ": too few sightings to judge";
+        std::sort(second.begin(), second.end());
+        const double INTERVAL = rendered.report.fps > 0.0 ? 1.0 / rendered.report.fps : 1.0;
+        return second.empty() ? 0.0 : second[second.size() / 2] / (INTERVAL * INTERVAL);
+    };
+
+    const double ON_CAMERA_CLOCK  = roughness(eOutputClock::CAMERA, "camera");
+    const double ON_OVERLAY_CLOCK = roughness(eOutputClock::OVERLAY, "overlay");
+
+    EXPECT_LT(ON_CAMERA_CLOCK, ON_OVERLAY_CLOCK) << "timing the output off the camera must make a world feature's travel smoother, not rougher";
+    // And by a margin, or the mode is not worth its complexity.
+    EXPECT_LT(ON_CAMERA_CLOCK, ON_OVERLAY_CLOCK * 0.75);
+    std::cout << "[measured] median normalised roughness of a world feature: " << ON_CAMERA_CLOCK << " px/s^2 under --clock camera against " << ON_OVERLAY_CLOCK << " under --clock overlay\n";
+}
+
+TEST(EndToEnd, TheCameraClockComposesEveryFrameAtItsOwnCaptureStamp) {
+    const auto& FIX = steadyCameraFixture();
+
+    SRenderOptions options;
+    options.take        = FIX.take;
+    options.outPath     = (scratchRoot() / "clock-stamps.mkv").string();
+    options.eye         = eEyeSelection::STEREO_SBS;
+    options.width       = PANE_WIDTH;
+    options.height      = PANE_HEIGHT;
+    options.background  = eBackgroundChoice::CAMERA;
+    options.clock       = eOutputClock::CAMERA;
+    options.noAudio     = true;
+    options.limitFrames = 30;
+
+    SRenderReport report;
+    setLogLevel(eLogLevel::WARN);
+    ASSERT_EQ(runRender(options, &report), 0);
+    setLogLevel(eLogLevel::INFO);
+
+    // The whole claim of the mode: for the pane the sequence is driven off, the
+    // instant being composed and the instant the camera frame was captured are
+    // the same instant. Nothing to reproject across.
+    ASSERT_FALSE(report.frames.empty());
+    size_t exact = 0;
+    for (const auto& FRAME : report.frames) {
+        if (FRAME.cameraFrame[0] < 0)
+            continue;
+        EXPECT_EQ(FRAME.tHostNs, FRAME.cameraHostNs[0]) << "output frame " << FRAME.index << " is composed at an instant its camera frame was not captured at";
+        ++exact;
+    }
+    EXPECT_GT(exact, 20u);
+
+    // One output frame per camera frame, in order, no repeats.
+    for (size_t k = 1; k < report.frames.size(); ++k)
+        EXPECT_EQ(report.frames[k].cameraFrame[0], report.frames[k - 1].cameraFrame[0] + 1) << "frame " << k << ": the camera sequence must advance one for one";
+
+    std::cout << "[measured] " << exact << " frames composed exactly at their driving camera's capture stamp\n";
+}
+
+// A dropped camera frame must not desynchronise the eyes or the overlay.
+TEST(EndToEnd, ADroppedCameraFrameDoesNotDesyncTheEyesOrTheOverlay) {
+    const auto& FIX = droppedCameraFrameFixture();
+
+    // The fixture is supposed to be lopsided.
+    ASSERT_EQ(FIX.bundle.cameras.size(), 2u);
+    const auto& L = *FIX.bundle.cameraForEye(0);
+    const auto& R = *FIX.bundle.cameraForEye(1);
+    ASSERT_LT(L.frames.size(), R.frames.size()) << "the fixture should be dropping left-camera frames";
+
+    SRenderOptions options;
+    options.take        = FIX.take;
+    options.outPath     = (scratchRoot() / "clock-gap.mkv").string();
+    options.eye         = eEyeSelection::STEREO_SBS;
+    options.width       = PANE_WIDTH;
+    options.height      = PANE_HEIGHT;
+    options.background  = eBackgroundChoice::CAMERA;
+    options.clock       = eOutputClock::CAMERA;
+    options.noAudio     = true;
+
+    SRenderReport report;
+    setLogLevel(eLogLevel::WARN);
+    ASSERT_EQ(runRender(options, &report), 0);
+    setLogLevel(eLogLevel::INFO);
+
+    ASSERT_EQ(report.frames.size(), L.frames.size()) << "one output frame per surviving left-camera frame";
+
+    size_t pairedWithin = 0;
+    for (const auto& FRAME : report.frames) {
+        ASSERT_GE(FRAME.cameraFrame[0], 0);
+        ASSERT_GE(FRAME.cameraFrame[1], 0) << "output frame " << FRAME.index << " lost its right eye across the gap";
+
+        // The right eye pairs by nearest stamp, so it may repeat a frame where
+        // the left camera skipped - but it must never be far away in time.
+        const int64_t RIGHT_STAMP = R.hostNs.at(static_cast<size_t>(FRAME.cameraFrame[1]));
+        const double  OFFSET_MS   = std::abs(static_cast<double>(RIGHT_STAMP - FRAME.tHostNs)) * 1e-6;
+        EXPECT_LT(OFFSET_MS, 1000.0 / FIX.scene.cameras.front().hz) << "output frame " << FRAME.index << ": the right eye is " << OFFSET_MS << " ms away from the left";
+        if (OFFSET_MS < 1e-6)
+            ++pairedWithin;
+
+        // The overlay is still chosen by the ordinal rule, so it must name a
+        // record that actually carries pixels.
+        if (FRAME.overlayFrame[0] >= 0) {
+            ASSERT_LT(static_cast<size_t>(FRAME.overlayFrame[0]), FIX.bundle.overlay.frameTelemetryIndex.size());
+            const size_t RECORD = FIX.bundle.overlay.frameTelemetryIndex[static_cast<size_t>(FRAME.overlayFrame[0])];
+            EXPECT_FALSE(FIX.bundle.telemetry[RECORD].dropped) << "the overlay frame chosen for output frame " << FRAME.index << " came from a record with no pixels";
+        }
+    }
+    std::cout << "[measured] across " << report.frames.size() << " frames with a gappy left camera, the right eye paired exactly on " << pairedWithin << " and within one camera period on all\n";
+}

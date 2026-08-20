@@ -373,6 +373,36 @@ frame's own `t_xr_ns` (preferred over `t_device_ns`, whose domain is whatever th
 not at the output instant, which is what stops the room lagging the overlay between a 30 Hz capture
 and a 45 Hz output.
 
+### The output clock
+
+`--clock overlay` (the default) lays a constant-rate grid and resamples every source onto it.
+`--clock camera` instead makes the output frame sequence **be** the camera frame sequence: one output
+frame per camera frame, timed at that frame's own capture stamp, with the output camera at the head
+pose interpolated to it. The background then needs no temporal resampling — the frame being sampled
+and the instant being composed are the same instant — which is what removes the background's share of
+the jitter between the room and the XR content.
+
+The depth plane does not become irrelevant: the lens still sits about 6 cm forward of the eye, so the
+reprojection still has to carry that constant offset, which at 1 m is 3.4° of parallax. What changes
+is that the warp becomes **static** — the same every frame — instead of also having to carry whatever
+the head did between capture and output. Residual depth error stops being a time-varying shimmer and
+becomes a fixed misregistration.
+
+One camera drives the sequence (the left, or whichever sorts first) and the other pane pairs by
+nearest stamp. On the reference take the two sensors fire together — the L-to-nearest-R offset has a
+median of 0.000 ms, reaching 16.67 ms only around a dropped frame. The container is still a
+constant-rate grid, at the camera's *measured average* rate rather than a nominal one, so the total
+duration matches the camera's span and the audio stays in sync end to end; individual frames sit
+within the cadence jitter of their true stamps (15.8 ms worst, 5.4 ms mean on the reference take) and
+the tool prints both. True VFR output would remove even that, and is the honest next step.
+
+The overlay is then the only source still resampled — up to half an overlay period, ~11 ms — so under
+this clock the overlay is reprojected at the **quads' own distance** (taken from the quad records,
+1.92 m on the reference take) rather than at infinity, which removes the head-translation term for
+content at that distance. It is a whole-view warp at one depth, not a per-quad homography: a v1
+bundle's overlay is a single composited eye view with no per-quad masks, so there is no way to tell
+which pixel came from which layer. Exact per-quad work needs the grade-B path in NEXT-STEPS.
+
 What is left is `--bg-depth`: one assumed distance for the whole background, defaulting to 1.0 m
 because that measured stillest on a seated desk take. Raise it for a take shot across a room. Residual
 swim is proportional to the error in it; per-pixel depth is the v2 fix.

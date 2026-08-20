@@ -179,6 +179,14 @@ namespace hxc {
             double            fps        = 0.0;
             int64_t           t0         = 0;
             size_t            frameCount = 0; // the whole timeline, before any segmenting
+            // Under --clock camera, the instant each output frame is composed
+            // at: the driving camera's capture stamps, one per output frame.
+            // Empty means the constant-rate grid below.
+            std::vector<int64_t> outputInstants;
+            // The distance the overlay is reprojected over. Infinity is a
+            // rotation-only warp, exact for content at infinity and wrong by the
+            // head's translation for content at arm's length; see makePlan.
+            double            overlayDepth = std::numeric_limits<double>::infinity();
             eBackgroundChoice background = eBackgroundChoice::CHECKER;
             // The output camera's frustum, one per pane, derived once from the
             // recorded eye frusta and fixed for the whole render. See
@@ -529,8 +537,110 @@ namespace hxc {
             // to the capture rate the span is n-1 frames to within a few nanoseconds
             // of floating-point noise, and a bare truncation drops the last frame.
             out.frameCount = SPAN > 0 ? static_cast<size_t>(std::floor(static_cast<double>(SPAN) * 1e-9 * out.fps + 1e-6)) + 1 : 1;
-            if (options.limitFrames > 0)
+
+            // ---- the camera clock -------------------------------------------------
+            //
+            // One output frame per camera frame, timed at that frame's own capture
+            // stamp. The background then needs no temporal resampling: the frame
+            // being sampled and the instant being composed are the same instant,
+            // so the reprojection carries only the constant lens-to-eye offset
+            // instead of that plus whatever the head did in between.
+            //
+            // ONE camera drives the sequence - the left, or whichever comes first
+            // - and the other pane pairs by nearest stamp, which is what the
+            // background sampler already does. On the reference take the two
+            // sensors fire together: the L-to-nearest-R offset is a median of
+            // 0.000 ms, reaching 16.67 ms only around a dropped frame.
+            if (options.clock == eOutputClock::CAMERA) {
+                const SCamera* driver = nullptr;
+                for (const auto& CAMERA : BUNDLE.cameras) {
+                    if (CAMERA.hostNs.empty())
+                        continue;
+                    if (!driver || CAMERA.key < driver->key)
+                        driver = &CAMERA;
+                }
+                if (!driver)
+                    HXC_WARN("--clock camera was asked for but the take has no camera frames; falling back to the overlay's grid");
+                else {
+                    out.outputInstants = driver->hostNs;
+                    out.t0             = out.outputInstants.front();
+                    const int64_t CAMERA_SPAN = out.outputInstants.back() - out.outputInstants.front();
+                    // The container is still a constant-rate grid, at the camera's
+                    // own MEASURED average rate rather than a nominal one, so the
+                    // output's total duration matches the camera's span exactly and
+                    // the audio stays in sync end to end. Individual frames wobble
+                    // against their true stamps by the cadence jitter, which is
+                    // reported below - a frame shown a few milliseconds early is a
+                    // far milder artifact than the spatial jitter this mode removes,
+                    // but it is not nothing, and true VFR output is the exact fix.
+                    if (CAMERA_SPAN > 0 && out.outputInstants.size() > 1)
+                        out.fps = static_cast<double>(out.outputInstants.size() - 1) * 1e9 / static_cast<double>(CAMERA_SPAN);
+                    out.frameCount = out.outputInstants.size();
+
+                    double worstPhase = 0.0, totalPhase = 0.0;
+                    for (size_t i = 0; i < out.outputInstants.size(); ++i) {
+                        const double SLOT  = static_cast<double>(i) * 1e9 / out.fps;
+                        const double ERROR = std::abs(static_cast<double>(out.outputInstants[i] - out.t0) - SLOT) * 1e-6;
+                        worstPhase         = std::max(worstPhase, ERROR);
+                        totalPhase += ERROR;
+                    }
+                    HXC_INFO("--clock camera: {} output frames driven by camera {} at its measured {:.4f} Hz; the constant-rate container grid sits within {:.2f} ms of each frame's true "
+                             "capture stamp (mean {:.2f} ms). Every frame is composed at its own stamp, so the geometry carries no timing error - only the playback does",
+                             out.frameCount, driver->key, out.fps, worstPhase, totalPhase / static_cast<double>(out.outputInstants.size()));
+                }
+            }
+
+            if (options.limitFrames > 0) {
                 out.frameCount = std::min(out.frameCount, options.limitFrames);
+                if (!out.outputInstants.empty())
+                    out.outputInstants.resize(out.frameCount);
+            }
+
+            // ---- how far away the overlay is --------------------------------------
+            //
+            // The overlay is reprojected from the pose it was rendered at into the
+            // output pose. At infinite depth that is a rotation-only warp: exact
+            // for content at infinity, and wrong by the head's TRANSLATION for
+            // content at arm's length. The XR monitors are at arm's length, and
+            // the quad records say exactly how far - a quad's pose is
+            // head-relative, so its distance from the head is just the length of
+            // that position.
+            //
+            // Under the camera clock the overlay is the only source still being
+            // resampled (up to half an overlay period, ~11 ms at 45 Hz), so this
+            // is where the last of the jitter between the XR content and the room
+            // lives. Reprojecting at the quads' own distance removes the
+            // translation term for content at that distance.
+            //
+            // NOT PER-QUAD, and it is worth being plain about why. A per-quad
+            // homography would be exact for each quad's interior, and the poses
+            // to build one are all recorded - but the overlay in a v1 bundle is a
+            // single composited EYE VIEW, with no per-quad masks and no way to
+            // tell which pixel came from which layer. Warping the whole view at
+            // one depth is the honest fallback, and its residual is the parallax
+            // difference between a quad at that depth and one somewhere else: two
+            // quads 0.5 m apart in depth, seen 11 ms apart with the head moving at
+            // 0.5 m/s, disagree by about 0.3 mrad, well under a pixel here. Exact
+            // per-quad work needs the grade-B path in NEXT-STEPS, which re-renders
+            // the quads instead of resampling a picture of them.
+            out.overlayDepth = options.overlayDepth;
+            if (std::isinf(out.overlayDepth)) {
+                std::vector<double> distances;
+                for (const auto& RECORD : BUNDLE.telemetry) {
+                    for (const auto& QUAD : RECORD.quads) {
+                        const double D = QUAD.pose.pos.length();
+                        if (D > 0.05 && std::isfinite(D))
+                            distances.push_back(D);
+                    }
+                }
+                if (!distances.empty() && options.clock == eOutputClock::CAMERA) {
+                    std::nth_element(distances.begin(), distances.begin() + static_cast<long>(distances.size() / 2), distances.end());
+                    out.overlayDepth = distances[distances.size() / 2];
+                    HXC_INFO("overlay reprojection depth taken from the quad records: {:.2f} m (median over {} layer records). At infinity the warp would be rotation-only, which leaves the "
+                             "head's translation between the overlay's instant and the output's uncorrected - the last of the jitter the camera clock does not already remove",
+                             out.overlayDepth, distances.size());
+                }
+            }
 
             // ---- background choice ------------------------------------------------
             out.background = options.background;
@@ -549,6 +659,8 @@ namespace hxc {
         // starting at k = 1500 lands on exactly the instant the single-job run's
         // 1500th iteration did.
         int64_t outputHostNs(const SRenderPlan& PLAN, size_t k) {
+            if (!PLAN.outputInstants.empty())
+                return PLAN.outputInstants[std::min(k, PLAN.outputInstants.size() - 1)];
             return PLAN.t0 + static_cast<int64_t>(std::llround(static_cast<double>(k) * 1e9 / PLAN.fps));
         }
 
@@ -887,7 +999,7 @@ namespace hxc {
                         draw.hasOverlay                                 = true;
                         draw.overlayPose                                = eyePoses[EYE][SOURCE_RECORD];
                         draw.overlayFov                                 = BUNDLE.telemetry[SOURCE_RECORD].eyes[std::min(EYE, BUNDLE.telemetry[SOURCE_RECORD].eyes.size() - 1)].fov;
-                        draw.overlayDepth                               = options.overlayDepth;
+                        draw.overlayDepth                               = PLAN.overlayDepth;
                         draw.premultipliedAlpha                         = BUNDLE.overlay.alpha == "premultiplied";
                     }
                 }

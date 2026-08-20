@@ -69,6 +69,7 @@ synth:
                            Android does)
       --cam-focal-scale N  multiply the cameras' focal length, narrowing their
                            field (default 1.0, which is wider than the eyes')
+      --cam-drop-every N   drop every Nth frame of camera L, leaving R complete
       --head-speed N       multiply the head's motion rate (default 1.0)
       --legacy-mirrored-extrinsics
                            write `extrinsics_head_to_camera` with the cant
@@ -282,6 +283,8 @@ int main(int argc, char** argv) {
                 options.legacyMirroredExtrinsics = true;
             else if (ARG == "--cam-focal-scale" && parseDouble(value(COUNT, REST, i), number))
                 options.cameraFocalScale = number;
+            else if (ARG == "--cam-drop-every" && parseInt(value(COUNT, REST, i), integer))
+                options.cameraDropEvery = static_cast<int>(integer);
             else if (ARG == "--camera-active-array-pad" && parseInt(value(COUNT, REST, i), integer))
                 options.cameraActiveArrayPad = static_cast<int>(integer);
             else if (ARG == "--eye-fov") {
@@ -365,6 +368,16 @@ int main(int argc, char** argv) {
                     options.frustum = eFrustumMode::CAMERA;
                 else {
                     HXC_ERR("--frustum takes presentation, camera, or recorded");
+                    return 2;
+                }
+            } else if (ARG == "--clock") {
+                const std::string CHOICE = value(COUNT, REST, i) ?: "";
+                if (CHOICE == "overlay")
+                    options.clock = eOutputClock::OVERLAY;
+                else if (CHOICE == "camera")
+                    options.clock = eOutputClock::CAMERA;
+                else {
+                    HXC_ERR("--clock takes overlay or camera");
                     return 2;
                 }
             } else if (ARG == "--bg-align") {

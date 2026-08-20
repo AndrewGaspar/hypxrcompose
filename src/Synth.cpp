@@ -326,8 +326,16 @@ namespace hxc {
                 camera.intrinsics.cy         = static_cast<double>(options.cameraHeight) * 0.5 - 2.5;
                 camera.intrinsics.distortion = options.noDistortion ? std::vector<double>{} : std::vector<double>{-0.06, 0.008, 0.0009, -0.0006, 0.0};
 
-                for (int j = 0; j < COUNT; ++j)
+                for (int j = 0; j < COUNT; ++j) {
+                    // A dropped frame leaves a GAP in the stamp series, not a
+                    // renumbering: the n-th surviving record is the n-th frame of
+                    // the video, which is the ordinal rule the whole format runs
+                    // on. Only the left camera drops, so a test can see whether
+                    // the two eyes stay paired.
+                    if (options.cameraDropEvery > 0 && eye == 0 && j > 0 && j % options.cameraDropEvery == 0)
+                        continue;
                     camera.deviceNs.push_back(FIRST + static_cast<int64_t>(std::llround(static_cast<double>(j) * 1e9 / options.cameraHz)));
+                }
 
                 scene.cameras.push_back(std::move(camera));
             }

@@ -305,6 +305,44 @@ coordinates, and the resulting coverage — so this class of problem is visible 
 
 ---
 
+## The output clock, and what still resamples (2026-08-20)
+
+Reported from a viewing of take4: *"XR content seems a little jittery relative to background"*.
+`--clock camera` addresses the background's half of that by making the output frame sequence the
+camera frame sequence. Measured on take4, background only (overlay switched off in a symlink replica
+so the figure is the background's alone), over 260 frames:
+
+| | source-change pairs | held pairs | excess jump | alternation |
+|---|---|---|---|---|
+| `--clock overlay` (45 Hz grid) | 160 | 99 | **+3.315** | 6.555 |
+| `--clock camera` (29.86 Hz) | 259 | 0 | **0 by construction** | **3.923** |
+
+The excess-jump metric — how much more the image changes when the compositor switches camera source
+frame than when it holds one — goes to zero because there are no held frames left: the mapping is
+1:1. The alternation figure is the like-for-like one, and it falls 40%.
+
+**Take4's real cadence**, which is why the container is what it is: 1111 left-camera frames over
+37.18 s, average **29.8524 Hz**, interval median 33.333 ms, four dropped frames showing as 50.0 ms
+gaps, stdev 1.65 ms. On a constant-rate grid at that measured average the worst frame sits **15.84 ms**
+from its true stamp (mean 5.21 ms). That is accepted rather than fixed: the geometry carries no timing
+error — every frame is *composed* at its own stamp — so what the grid costs is a playback wobble of at
+most half a frame, against the spatial jitter it removes. **True VFR output is the exact fix** and the
+obvious next step; it needs timestamps per frame, which the current rawvideo-over-a-pipe writer cannot
+carry.
+
+**What still resamples: the overlay.** It is chosen by the ordinal rule from the nearest record, up to
+half an overlay period away (~11 ms at 45 Hz). Under the camera clock it is reprojected at the quads'
+own distance — 1.92 m on take4, the median over 14202 layer records — instead of at infinity, which
+removes the head-translation term for content at that distance. This is a whole-view warp at one
+depth, **not** a per-quad homography, and the reason is worth recording: a v1 bundle's overlay is one
+composited eye view with no per-quad masks and no way to attribute a pixel to a layer, so the exact
+per-quad reprojection the geometry would allow has nothing to apply itself to. Its residual is the
+parallax difference between a quad at the chosen depth and one elsewhere: two quads 0.5 m apart in
+depth, seen 11 ms apart with the head at 0.5 m/s, disagree by about 0.3 mrad — well under a pixel at
+these resolutions. Grade-B replay (gap 1) removes the question by re-rendering the quads.
+
+---
+
 ## Throughput — measured on the first real take, and where the ceiling actually is
 
 The reference take: `hypxrtake-20260817-115453-230`, 91.9 s, 4604 telemetry records, 2101 overlay

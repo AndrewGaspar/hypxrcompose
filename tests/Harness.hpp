@@ -104,6 +104,12 @@ namespace hxctest {
     // A take whose cameras see less than its eyes do, so that clipping the
     // output to camera coverage actually clips something.
     const SFixture& narrowCameraFixture();
+    // A take whose left camera drops every seventh frame, so the two eyes'
+    // capture series differ and a naive pairing would desynchronise them.
+    const SFixture& droppedCameraFrameFixture();
+    // Brisk head motion with the real rig's 30 Hz camera against a 45 Hz
+    // overlay: the conditions under which the two output clocks differ.
+    const SFixture& steadyCameraFixture();
 
     // The v1 background model, evaluated exactly: where must the output pixel be
     // for its assumed-depth ray to sample the camera pixel that shows `world`?

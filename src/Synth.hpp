@@ -111,6 +111,10 @@ namespace hxc {
         // which is the real rig's situation and the only one in which clipping
         // the output to camera coverage does anything.
         double  cameraFocalScale = 1.0;
+        // Drop every Nth frame of camera L only, leaving R complete. Real
+        // captures do this - the reference take drops four - and it is the case
+        // where a naive pairing desynchronises the two eyes. 0 drops nothing.
+        int     cameraDropEvery  = 0;
         // Deliberately wider than the IPD: this is the parallax error research 27
         // section 5.1 accepts in v1, and making it real here means the test can
         // measure it.
