@@ -67,6 +67,8 @@ synth:
                            N pixels taller than the image top and bottom, with the
                            principal point in that array's coordinates (what
                            Android does)
+      --cam-focal-scale N  multiply the cameras' focal length, narrowing their
+                           field (default 1.0, which is wider than the eyes')
       --head-speed N       multiply the head's motion rate (default 1.0)
       --legacy-mirrored-extrinsics
                            write `extrinsics_head_to_camera` with the cant
@@ -80,16 +82,19 @@ render:
       --out FILE           output video (required)
       --eye left|right|stereo-sbs      (default left)
       --framing asis|stabilized        (default asis)
-      --frustum presentation|recorded  (default presentation)
+      --frustum presentation|camera|recorded    (default presentation)
                            presentation: one symmetric frustum shared by both
                              eyes, cropped to the pane. Frames line up, stereo
                              fuses, recorded periphery outside it is dropped
+                           camera: presentation, then clipped to what the
+                             passthrough cameras actually photographed. Use it
+                             when the frame should not contain field no camera
+                             saw. The clipped field decides the aspect, so the
+                             pane HEIGHT is derived from --size's width
                            recorded: each eye keeps its own asymmetric frustum,
                              padded. Truer to what each eye saw, and right for
                              analysis or a headset-native player - but on a flat
                              viewer the two frames sit at different angles
-      --size WxH           per-eye pane size; stereo SBS output is 2W x H
-      --fps N              output rate (default: the take's target_hz)
       --background auto|camera|checker|solid
       --bg-depth M         assumed background distance in metres (default 1.0,
                            measured stillest on a seated desk take; raise it for
@@ -275,6 +280,8 @@ int main(int argc, char** argv) {
                 options.headSpeed = number;
             else if (ARG == "--legacy-mirrored-extrinsics")
                 options.legacyMirroredExtrinsics = true;
+            else if (ARG == "--cam-focal-scale" && parseDouble(value(COUNT, REST, i), number))
+                options.cameraFocalScale = number;
             else if (ARG == "--camera-active-array-pad" && parseInt(value(COUNT, REST, i), integer))
                 options.cameraActiveArrayPad = static_cast<int>(integer);
             else if (ARG == "--eye-fov") {
@@ -354,8 +361,10 @@ int main(int argc, char** argv) {
                     options.frustum = eFrustumMode::PRESENTATION;
                 else if (CHOICE == "recorded")
                     options.frustum = eFrustumMode::RECORDED;
+                else if (CHOICE == "camera")
+                    options.frustum = eFrustumMode::CAMERA;
                 else {
-                    HXC_ERR("--frustum takes presentation or recorded");
+                    HXC_ERR("--frustum takes presentation, camera, or recorded");
                     return 2;
                 }
             } else if (ARG == "--bg-align") {

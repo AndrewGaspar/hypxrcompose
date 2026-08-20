@@ -104,6 +104,13 @@ namespace hxc {
         // while still writing a correct `extrinsics_android_raw`. Off by default;
         // a fixture turns it on so the loader's repair path stays pinned.
         bool    legacyMirroredExtrinsics = false;
+        // Multiplies the cameras' focal length, which narrows their field. The
+        // default scene deliberately gives the cameras a wider field than the
+        // eyes, so that the out-of-coverage fallback is only exercised at the
+        // corners; a value above 1 makes the cameras narrower than the eyes,
+        // which is the real rig's situation and the only one in which clipping
+        // the output to camera coverage does anything.
+        double  cameraFocalScale = 1.0;
         // Deliberately wider than the IPD: this is the parallax error research 27
         // section 5.1 accepts in v1, and making it real here means the test can
         // measure it.

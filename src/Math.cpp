@@ -164,6 +164,18 @@ namespace hxc {
         return {-std::atan(HALF_X), std::atan(HALF_X), std::atan(HALF_Y), -std::atan(HALF_Y)};
     }
 
+    SFov cropFovToPaneAsymmetric(const SFov& fov, int width, int height) {
+        if (width <= 0 || height <= 0)
+            return fov;
+        const double PIXEL = std::min(fov.tanWidth() / static_cast<double>(width), fov.tanHeight() / static_cast<double>(height));
+        if (!(PIXEL > 0.0))
+            return fov;
+        const auto   T       = fov.tangents();
+        const double SHRINKX = (fov.tanWidth() - PIXEL * static_cast<double>(width)) * 0.5;
+        const double SHRINKY = (fov.tanHeight() - PIXEL * static_cast<double>(height)) * 0.5;
+        return {std::atan(T[0] + SHRINKX), std::atan(T[1] - SHRINKX), std::atan(T[2] - SHRINKY), std::atan(T[3] + SHRINKY)};
+    }
+
     SVec3 fovRay(const SFov& fov, double px, double py, int width, int height) {
         const auto   T = fov.tangents();
         const double U = (px + 0.5) / static_cast<double>(width);

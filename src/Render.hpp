@@ -55,6 +55,24 @@ namespace hxc {
         // eye - but on a flat viewer the two frames land at different visual
         // angles and the picture reads as floating apart.
         RECORDED,
+        // PRESENTATION, then clipped to what the passthrough cameras actually
+        // photographed - the intersection of both cameras' coverage, computed
+        // from the corrected extrinsics and the rebased intrinsics, including
+        // the lens-to-eye parallax at the assumed background depth.
+        //
+        // The point is to stop showing frame that no camera ever saw. The real
+        // rig cants down: the cameras cover about +18 degrees up to -40 down
+        // against a presentation pane of +-32, so a plain presentation render
+        // leaves a quarter of the frame's height as bare fallback at the top.
+        // This mode gives that height back by narrowing the frame instead of
+        // filling it with nothing.
+        //
+        // The output aspect therefore changes - the clipped field is what it is -
+        // so the pane HEIGHT is derived from the requested width. Both panes
+        // still share one frustum and one orientation, so infinity still has
+        // zero disparity; the clip is vertically asymmetric, because the rig is,
+        // and that is fine as long as both eyes get the same asymmetry.
+        CAMERA,
     };
 
     // What to do with the camera extrinsic's rotation.

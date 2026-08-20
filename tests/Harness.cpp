@@ -17,7 +17,14 @@ namespace hxctest {
         static const fs::path ROOT = [] {
             if (const char* OVERRIDE = std::getenv("HYPXRCOMPOSE_TEST_DIR"))
                 return fs::path(OVERRIDE);
+#ifdef HYPXRCOMPOSE_TEST_SCRATCH_ROOT
+            // Under the build directory by default, so the bundles and frame
+            // dumps a run leaves behind are reclaimed by deleting the build
+            // rather than surviving in /tmp one directory per process id.
+            return fs::path(HYPXRCOMPOSE_TEST_SCRATCH_ROOT) / std::format("run-{}", getpid());
+#else
             return fs::temp_directory_path() / std::format("hypxrcompose-tests-{}", getpid());
+#endif
         }();
         std::error_code ec;
         fs::create_directories(ROOT, ec);
@@ -111,7 +118,8 @@ namespace hxctest {
     namespace {
 
         SFixture buildFixture(const std::string& name, double clockOffsetMs, const std::string& alpha = "premultiplied", const std::optional<SFov>& eyeFov = std::nullopt,
-                              bool geometryMarkers = false, int cameraActiveArrayPad = 0, double headSpeed = 1.0, double cameraHz = 0.0, bool legacyMirroredExtrinsics = false) {
+                              bool geometryMarkers = false, int cameraActiveArrayPad = 0, double headSpeed = 1.0, double cameraHz = 0.0, bool legacyMirroredExtrinsics = false,
+                              double cameraFocalScale = 1.0) {
             SFixture fixture;
             fixture.take = scratchRoot() / (name + ".hypxrtake");
 
@@ -138,6 +146,7 @@ namespace hxctest {
             if (cameraHz > 0.0)
                 fixture.options.cameraHz = cameraHz;
             fixture.options.legacyMirroredExtrinsics = legacyMirroredExtrinsics;
+            fixture.options.cameraFocalScale         = cameraFocalScale;
 
             if (!fs::exists(fixture.take / "manifest.json")) {
                 setLogLevel(eLogLevel::WARN);
@@ -185,6 +194,14 @@ namespace hxctest {
         // enough apart for the two reprojection models to disagree visibly. At
         // rest they agree, and a test that cannot tell them apart is not a test.
         static const SFixture FIXTURE = buildFixture("brisk-motion", 200.0, "premultiplied", std::nullopt, false, 0, 10.0, 5.0);
+        return FIXTURE;
+    }
+
+    const SFixture& narrowCameraFixture() {
+        // Cameras with twice the focal length, so their field is narrower than
+        // the eyes' - the real rig's situation, and the only one where clipping
+        // the output to camera coverage has anything to do.
+        static const SFixture FIXTURE = buildFixture("narrow-camera", 200.0, "premultiplied", std::nullopt, false, 0, 1.0, 0.0, false, 2.0);
         return FIXTURE;
     }
 

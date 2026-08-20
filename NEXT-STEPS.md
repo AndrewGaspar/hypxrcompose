@@ -280,11 +280,26 @@ stored one was correct or is a *repaired legacy conversion*, with the disagreeme
 reference take that reads 21.72° (L) and 21.48° (R). When no raw is present the stored value is
 trusted as-is.
 
-**What this means for framing.** With truthful geometry the L camera covers **+18.0° to −39.9°
+**What this means for framing, and `--frustum camera`.** With truthful geometry the L camera covers **+18.0° to −39.9°
 vertically** and **±36.4° horizontally** against a pane of ±32.2° by ±40.0°, sitting about 0.4° off
 forward in azimuth. So under the (now default) `--bg-align recorded` there is an **uncovered band at
 the top of the pane** — about 14° of the 64.4° vertical field. That is the real rig: the cameras look
-down, and nothing above +18° was ever photographed. It is not a defect to fight.
+down, and nothing above +18° was ever photographed. It is not a defect to fight — but it is a
+defect to *show*, which is what `--frustum camera` is for: it clips the shared frustum to the
+intersection of both cameras' coverage, so no output pixel is frame that no camera photographed.
+Measured on take4 with the overlay switched off, so the number is the background's alone: the
+camera-clipped frame is **99.8–100.0% covered**, against **59.5–60.9%** for the same frames under
+`presentation`. The residual hundredths of a percent are a one-pixel border, from the inscribed
+rectangle being sampled at 64 points per image edge.
+
+Two properties worth stating because they are what make one clip good for a whole take. Coverage is
+**pose-independent**: the camera is rigid to the head and, under presentation framing, so is the
+output camera, so the camera's rotation relative to it is just the extrinsic and the lens-to-eye
+offset is constant in that frame. Nothing depends on where the head is pointing. (Under `--framing
+stabilized` the output rotates against the head by the smoothing residual, so the clip becomes
+approximate near the edges, and the tool warns.) And the clip includes **parallax**, not just angles:
+the lens sits 6 cm forward of the eye, so an angle-only intersection leaves a sliver of uncovered
+frame at the assumed depth.
 
 coordinates, and the resulting coverage — so this class of problem is visible without a headset.
 

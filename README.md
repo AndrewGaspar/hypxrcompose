@@ -334,6 +334,14 @@ The output camera's frustum is **derived from the recorded eye frusta, not copie
   infinity therefore lands at the same pane coordinate in both eyes, vertical disparity is zero, and
   the stereo is carried entirely by the content. This is what a flat side-by-side viewer needs — and
   what a person fusing two panes needs, which is not the same as what is geometrically truest.
+- **`camera`** — `presentation`, then clipped to what the passthrough cameras actually photographed:
+  the intersection of both cameras' coverage, computed from the corrected extrinsics and the rebased
+  intrinsics and including the lens-to-eye parallax at `--bg-depth`. Pick it when the frame should not
+  contain field no camera saw — on the real rig the cameras cant down and see less than the eyes, so a
+  `presentation` render spends about 40% of its area on bare fallback. The clipped field decides the
+  aspect, so **the pane height is derived from `--size`'s width** and the requested height is ignored
+  (the tool says so). Both panes still share one frustum and orientation, so infinity keeps zero
+  disparity; the clip is vertically asymmetric because the rig is.
 - **`recorded`** — each eye keeps its own asymmetric frustum, padded to the pane at a shared scale.
   Truer to what each eye saw, and the right input for analysis or for a headset-native player that
   re-projects per eye. On a flat viewer the two frames sit at different visual angles: on the

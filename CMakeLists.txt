@@ -70,6 +70,11 @@ if(HYPXRCOMPOSE_TESTS)
         # the suite therefore has to be told where the real one is, and to wait
         # for it to be built.
         target_compile_definitions(hypxrcompose_tests PRIVATE HYPXRCOMPOSE_BINARY="$<TARGET_FILE:hypxrcompose>")
+        # The suite writes synthetic bundles and frame dumps, and a run leaves
+        # hundreds of megabytes behind. Rooting that inside the build directory
+        # means `rm -rf build` reclaims it, instead of it accumulating in /tmp
+        # once per process id until the filesystem fills - which it did.
+        target_compile_definitions(hypxrcompose_tests PRIVATE HYPXRCOMPOSE_TEST_SCRATCH_ROOT="${CMAKE_CURRENT_BINARY_DIR}/test-scratch")
         add_dependencies(hypxrcompose_tests hypxrcompose)
         add_test(NAME hypxrcompose_tests COMMAND hypxrcompose_tests)
     else()

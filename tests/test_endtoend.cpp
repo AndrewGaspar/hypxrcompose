@@ -15,6 +15,10 @@
 
 #include <gtest/gtest.h>
 
+#include <fstream>
+#include <nlohmann/json.hpp>
+
+
 #include <cmath>
 #include <iostream>
 #include <format>
@@ -22,6 +26,7 @@
 #include <set>
 #include <tuple>
 
+using json = nlohmann::json;
 using namespace hxc;
 using namespace hxctest;
 namespace fs = std::filesystem;
@@ -1752,4 +1757,182 @@ TEST(EndToEnd, AMirroredStoredExtrinsicIsRepairedFromTheRawPose) {
     }
     ASSERT_GT(checked, 0u);
     std::cout << "[measured] a bundle storing the mirrored extrinsic composites within " << worst << " px of the true geometry, repaired from its raw pose\n";
+}
+
+// ---------------------------------------------------------------------------
+// 19. `--frustum camera`: don't show frame that no camera photographed.
+//
+// The real rig's cameras see less than the eyes do and cant downward, so a
+// presentation render spends a quarter of its height on bare fallback at the
+// top. This mode clips the shared frustum to what both cameras actually cover -
+// including the lens-to-eye parallax at the assumed depth, which a pure angular
+// intersection would leave as a sliver.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+    // The fraction of a pane that fell through to the background fallback,
+    // measured by rendering the same frames over the camera and over a flat
+    // solid: wherever the two agree, no camera pixel was available. The overlay
+    // would confound that - it is identical in both renders - so this is done on
+    // a copy of the take with the overlay switched off in its manifest.
+    struct SCoverage {
+        double uncoveredFraction = 0.0;
+        int    width = 0, height = 0;
+    };
+
+    std::filesystem::path overlayFreeCopy(const SFixture& fix, const std::string& name) {
+        const fs::path ROOT = scratchRoot() / name;
+        std::error_code ec;
+        fs::remove_all(ROOT, ec);
+        fs::copy(fix.take, ROOT, fs::copy_options::recursive, ec);
+        if (ec)
+            return {};
+        json manifest;
+        {
+            std::ifstream stream(ROOT / "manifest.json");
+            stream >> manifest;
+        }
+        manifest["sources"]["overlay"] = false;
+        std::ofstream out(ROOT / "manifest.json", std::ios::trunc);
+        out << manifest.dump(2) << "\n";
+        return ROOT;
+    }
+
+    SCoverage measureUncovered(const fs::path& take, eFrustumMode mode, int paneWidth, int paneHeight, const std::string& tag) {
+        const auto render = [&](eBackgroundChoice background, const std::string& suffix) {
+            SRendered rendered;
+            rendered.framesDir = scratchRoot() / ("cov-" + tag + suffix);
+            rendered.video     = scratchRoot() / ("cov-" + tag + suffix + ".mkv");
+            std::error_code ec;
+            fs::remove_all(rendered.framesDir, ec);
+
+            SRenderOptions options;
+            options.take        = take;
+            options.outPath     = rendered.video.string();
+            options.eye         = eEyeSelection::STEREO_SBS;
+            options.width       = paneWidth;
+            options.height      = paneHeight;
+            options.frustum     = mode;
+            options.background  = background;
+            options.noAudio     = true;
+            options.limitFrames = 6;
+            options.framesDir   = rendered.framesDir.string();
+
+            setLogLevel(eLogLevel::WARN);
+            const int STATUS = runRender(options, &rendered.report);
+            setLogLevel(eLogLevel::INFO);
+            if (STATUS != 0)
+                throw std::runtime_error("coverage render failed");
+            return rendered;
+        };
+
+        const SRendered OVER_CAMERA = render(eBackgroundChoice::CAMERA, "-cam");
+        const SRendered OVER_SOLID  = render(eBackgroundChoice::SOLID, "-solid");
+
+        SCoverage out;
+        out.width  = OVER_CAMERA.report.paneWidth * OVER_CAMERA.report.paneCount;
+        out.height = OVER_CAMERA.report.paneHeight;
+
+        size_t uncovered = 0, total = 0;
+        for (size_t k = 1; k < OVER_CAMERA.report.frames.size(); ++k) {
+            const SImage A = OVER_CAMERA.frame(k);
+            const SImage B = OVER_SOLID.frame(k);
+            if (A.width != B.width || A.height != B.height)
+                throw std::runtime_error("coverage renders disagree on size");
+            for (int y = 0; y < A.height; ++y) {
+                for (int x = 0; x < A.width; ++x) {
+                    const auto P = A.at(x, y);
+                    const auto Q = B.at(x, y);
+                    if (std::abs(P[0] - Q[0]) <= 2 && std::abs(P[1] - Q[1]) <= 2 && std::abs(P[2] - Q[2]) <= 2)
+                        ++uncovered;
+                    ++total;
+                }
+            }
+        }
+        std::error_code ec;
+        fs::remove_all(OVER_CAMERA.framesDir, ec);
+        fs::remove_all(OVER_SOLID.framesDir, ec);
+        out.uncoveredFraction = total ? static_cast<double>(uncovered) / static_cast<double>(total) : 1.0;
+        return out;
+    }
+
+}
+
+TEST(EndToEnd, TheCameraClippedFrustumShowsNoUncoveredFrame) {
+    const auto&    FIX  = narrowCameraFixture();
+    const fs::path TAKE = overlayFreeCopy(FIX, "camera-clip-take");
+    ASSERT_FALSE(TAKE.empty());
+
+    // The clip must actually bite: this fixture's cameras see less than its eyes.
+    const SCoverage CLIPPED = measureUncovered(TAKE, eFrustumMode::CAMERA, PANE_WIDTH, PANE_HEIGHT, "clipped");
+    // The same frames without the clip - the presentation frustum is exactly the
+    // clipped one widened back out to the eyes' field, which is the sabotage this
+    // test needs and does not require a test-only hook to produce.
+    const SCoverage WIDE = measureUncovered(TAKE, eFrustumMode::PRESENTATION, PANE_WIDTH, PANE_HEIGHT, "wide");
+
+    EXPECT_LT(CLIPPED.uncoveredFraction, 0.01) << "the clipped frame is " << 100.0 * CLIPPED.uncoveredFraction << "% frame no camera saw; it should be a sub-pixel edge at most";
+    EXPECT_GT(WIDE.uncoveredFraction, 0.05) << "widening the frustum back to the eyes' field must reintroduce uncovered frame, or this test cannot detect the thing it is for";
+    EXPECT_LT(CLIPPED.uncoveredFraction, WIDE.uncoveredFraction * 0.2);
+
+    // The clip changes the aspect, so the pane height is derived and the output
+    // is not the requested one. The packed frame must still be two equal panes.
+    EXPECT_EQ(CLIPPED.width % 2, 0);
+    EXPECT_EQ(CLIPPED.width, PANE_WIDTH * 2) << "the width is what was asked for; only the height is derived";
+    EXPECT_EQ(CLIPPED.height % 2, 0) << "H.264 wants even dimensions";
+
+    std::cout << "[measured] --frustum camera leaves " << 100.0 * CLIPPED.uncoveredFraction << "% of the frame uncovered at " << CLIPPED.width << "x" << CLIPPED.height << "; the same take under "
+              << "presentation leaves " << 100.0 * WIDE.uncoveredFraction << "% at " << WIDE.width << "x" << WIDE.height << "\n";
+}
+
+TEST(EndToEnd, TheCameraClippedFrustumKeepsTheStereoContract) {
+    const auto& FIX = narrowCameraFixture();
+
+    SRenderOptions options;
+    options.take        = FIX.take;
+    options.outPath     = (scratchRoot() / "camera-clip-stereo.mkv").string();
+    options.eye         = eEyeSelection::STEREO_SBS;
+    options.width       = PANE_WIDTH;
+    options.height      = PANE_HEIGHT;
+    options.frustum     = eFrustumMode::CAMERA;
+    options.background  = eBackgroundChoice::CAMERA;
+    options.noAudio     = true;
+    options.limitFrames = 4;
+
+    SRenderReport report;
+    setLogLevel(eLogLevel::WARN);
+    ASSERT_EQ(runRender(options, &report), 0);
+    setLogLevel(eLogLevel::INFO);
+
+    ASSERT_EQ(report.paneFov.size(), 2u);
+    const SFov& L = report.paneFov[0];
+    const SFov& R = report.paneFov[1];
+
+    // The invariant the whole presentation family rests on: one frustum for both
+    // eyes, so a feature at infinity has zero disparity.
+    EXPECT_NEAR(L.l, R.l, 1e-12) << "the panes must share one frustum";
+    EXPECT_NEAR(L.r, R.r, 1e-12);
+    EXPECT_NEAR(L.u, R.u, 1e-12);
+    EXPECT_NEAR(L.d, R.d, 1e-12);
+
+    // Horizontally centred, because the intersection of two mirrored lenses
+    // allows it; vertically asymmetric is fine and expected, because the rig is.
+    EXPECT_NEAR(L.l, -L.r, 1e-9) << "the clipped field should stay centred on forward horizontally";
+
+    // Square angular pixels: the whole point of deriving the height.
+    EXPECT_NEAR(L.angularAspect(), static_cast<double>(report.paneWidth) / static_cast<double>(report.paneHeight), 1e-9);
+
+    // And it really is narrower than the unclipped frame.
+    SRenderOptions wide = options;
+    wide.frustum        = eFrustumMode::PRESENTATION;
+    wide.outPath        = (scratchRoot() / "camera-clip-stereo-wide.mkv").string();
+    SRenderReport wideReport;
+    setLogLevel(eLogLevel::WARN);
+    ASSERT_EQ(runRender(wide, &wideReport), 0);
+    setLogLevel(eLogLevel::INFO);
+    ASSERT_FALSE(wideReport.paneFov.empty());
+    EXPECT_LT(L.tanWidth(), wideReport.paneFov[0].tanWidth()) << "clipping to camera coverage must narrow the field, or it is doing nothing";
+
+    std::cout << "[measured] camera-clipped stereo: both panes share l=" << L.l << " r=" << L.r << " u=" << L.u << " d=" << L.d << " at " << report.paneWidth << "x" << report.paneHeight
+              << "; vertical asymmetry " << (L.u + L.d) * 180.0 / M_PI << " deg, horizontal centred to " << (L.l + L.r) * 180.0 / M_PI << " deg\n";
 }

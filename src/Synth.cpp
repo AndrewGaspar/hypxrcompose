@@ -320,8 +320,8 @@ namespace hxc {
                 // little to spare for the splay and the head's translation - but only
                 // a little, so the out-of-coverage fallback still gets exercised at
                 // the extreme corners, exactly as a real passthrough camera does.
-                camera.intrinsics.fx         = 190.0;
-                camera.intrinsics.fy         = 190.0;
+                camera.intrinsics.fx         = 190.0 * options.cameraFocalScale;
+                camera.intrinsics.fy         = 190.0 * options.cameraFocalScale;
                 camera.intrinsics.cx         = static_cast<double>(options.cameraWidth) * 0.5 + 3.5;
                 camera.intrinsics.cy         = static_cast<double>(options.cameraHeight) * 0.5 - 2.5;
                 camera.intrinsics.distortion = options.noDistortion ? std::vector<double>{} : std::vector<double>{-0.06, 0.008, 0.0009, -0.0006, 0.0};

@@ -101,6 +101,9 @@ namespace hxctest {
     // A take whose stored head_to_camera carries the producer's mirrored cant,
     // with a correct `extrinsics_android_raw` beside it.
     const SFixture& mirroredExtrinsicsFixture();
+    // A take whose cameras see less than its eyes do, so that clipping the
+    // output to camera coverage actually clips something.
+    const SFixture& narrowCameraFixture();
 
     // The v1 background model, evaluated exactly: where must the output pixel be
     // for its assumed-depth ray to sample the camera pixel that shows `world`?

@@ -209,11 +209,94 @@ namespace hxc {
         // Derived once rather than per frame: the fov is a property of the
         // headset, and rebuilding it from each record's stamp would make the
         // framing breathe if a producer ever varied it.
+        // The extrinsic the compositor will actually use for this camera. Shared
+        // by the plan (which clips against it) and the render loop (which draws
+        // with it), because a clip computed against a different pose than the one
+        // drawn is worse than no clip at all.
+        SPose alignedExtrinsic(const SRenderOptions& options, const SCamera& meta) {
+            if (options.backgroundAlign == eBackgroundAlign::RECORDED)
+                return meta.headToCamera;
+            SPose aligned = meta.headToCamera;
+            aligned.rot   = twistAbout(meta.headToCamera.rot, {0.0, 0.0, 1.0});
+            return aligned;
+        }
+
+        // The largest frustum, in the OUTPUT camera's local frame, every ray of
+        // which lands inside this camera's image.
+        //
+        // Not a pure angular clip. The lens does not sit at the eye - on the real
+        // rig it is 6 cm forward and 2 cm out - so the reprojection onto the
+        // assumed-depth surface shifts the covered region by a parallax term that
+        // a naive angle-only intersection leaves behind as a sliver of
+        // uncovered frame. The camera's image border is therefore walked in pixel
+        // space and pushed through the same solve the shader inverts: the ray from
+        // the lens, intersected with the sphere of radius `depth` about the output
+        // camera, expressed as a tangent in the output's frame.
+        //
+        // COVERAGE IS POSE-INDEPENDENT, which is what makes one clip good for the
+        // whole take. The camera is rigid to the head and, under presentation
+        // framing, so is the output camera: the output looks along the head, so
+        // the camera's rotation relative to it is just the extrinsic, and the
+        // lens-to-eye offset is constant in that frame too. Nothing in the map
+        // below depends on where the head is pointing. (Under `--framing
+        // stabilized` the output rotates against the head by the smoothing
+        // residual, so the guarantee becomes approximate; the caller says so.)
+        std::optional<SFov> cameraCoveredFov(const SCamera& meta, const SPose& extrinsic, const SVec3& eyeOffsetHeadLocal, double depth) {
+            if (meta.video.width <= 0 || meta.video.height <= 0 || !(meta.intrinsics.fx > 0.0) || !(meta.intrinsics.fy > 0.0) || !(depth > 0.0))
+                return std::nullopt;
+
+            // The lens, in the output camera's local frame.
+            const SVec3  LENS  = extrinsic.pos - eyeOffsetHeadLocal;
+            const double LENS2 = LENS.dot(LENS);
+
+            const auto tangentFor = [&](double px, double py) -> std::optional<std::array<double, 2>> {
+                const SVec3 LOCAL{(px - meta.intrinsics.cx) / meta.intrinsics.fx, -(py - meta.intrinsics.cy) / meta.intrinsics.fy, -1.0};
+                const SVec3 RAY = extrinsic.rot.rotate(LOCAL).normalized();
+                // |LENS + t*RAY| = depth, the near-side root.
+                const double ALONG    = LENS.dot(RAY);
+                const double RADICAND = ALONG * ALONG - LENS2 + depth * depth;
+                if (RADICAND < 0.0)
+                    return std::nullopt;
+                const double T = -ALONG + std::sqrt(RADICAND);
+                if (!(T > 0.0))
+                    return std::nullopt;
+                const SVec3 POINT{LENS.x + RAY.x * T, LENS.y + RAY.y * T, LENS.z + RAY.z * T};
+                if (!(POINT.z < -1e-6))
+                    return std::nullopt;
+                return std::array<double, 2>{POINT.x / -POINT.z, POINT.y / -POINT.z};
+            };
+
+            const double W = meta.video.width, H = meta.video.height;
+            constexpr int SAMPLES = 64;
+            // The innermost point of each border is the binding constraint, so the
+            // rectangle these four bounds describe is inscribed in the covered
+            // region however the borders bow.
+            double left = -1e30, right = 1e30, up = 1e30, down = -1e30;
+            bool   any  = false;
+            for (int i = 0; i <= SAMPLES; ++i) {
+                const double F = static_cast<double>(i) / SAMPLES;
+                const auto   L = tangentFor(0.0, F * H);
+                const auto   R = tangentFor(W, F * H);
+                const auto   U = tangentFor(F * W, 0.0);
+                const auto   D = tangentFor(F * W, H);
+                if (!L || !R || !U || !D)
+                    return std::nullopt; // a border that leaves the frustum cannot be clipped to
+                left  = std::max(left, (*L)[0]);
+                right = std::min(right, (*R)[0]);
+                up    = std::min(up, (*U)[1]);
+                down  = std::max(down, (*D)[1]);
+                any   = true;
+            }
+            if (!any || !(right > left) || !(up > down))
+                return std::nullopt;
+            return SFov{std::atan(left), std::atan(right), std::atan(up), std::atan(down)};
+        }
+
         void deriveOutputFrusta(const SRenderOptions& options, const SBundle& BUNDLE, SRenderPlan& plan) {
             const size_t PANES = plan.paneEyes.size();
             plan.paneFov.assign(PANES, SFov{});
 
-            if (options.frustum == eFrustumMode::PRESENTATION) {
+            if (options.frustum == eFrustumMode::PRESENTATION || options.frustum == eFrustumMode::CAMERA) {
                 // ONE frustum, symmetric about forward, shared by every pane.
                 //
                 // A flat side-by-side viewer - or a person fusing two panes on a
@@ -273,6 +356,79 @@ namespace hxc {
                 }
 
                 const SFov SYMMETRIC = symmetrizeFov(*shared);
+
+                if (options.frustum == eFrustumMode::CAMERA) {
+                    // Clip to what the cameras photographed. EVERY camera the take
+                    // holds constrains the frame, not just the panes being
+                    // rendered, so a mono render frames identically to one pane of
+                    // the stereo pair and both eyes of a stereo pair are fully
+                    // covered.
+                    SFov clipped = SYMMETRIC;
+                    bool clippedAny = false;
+                    for (const auto& CAMERA : BUNDLE.cameras) {
+                        // The eye this camera belongs to, so the parallax term uses
+                        // the right lens-to-eye offset.
+                        SVec3 eyeOffset{};
+                        for (const auto& RECORD : BUNDLE.telemetry) {
+                            if (static_cast<size_t>(CAMERA.eye) >= RECORD.eyes.size())
+                                continue;
+                            eyeOffset = RECORD.headPose().inverse().compose(RECORD.eyes[static_cast<size_t>(CAMERA.eye)].pose).pos;
+                            break;
+                        }
+                        const auto COVERED = cameraCoveredFov(CAMERA, alignedExtrinsic(options, CAMERA), eyeOffset, options.backgroundDepth);
+                        if (!COVERED) {
+                            HXC_WARN("camera {}: its coverage could not be resolved into a frustum, so it does not constrain the clip", CAMERA.key);
+                            continue;
+                        }
+                        HXC_INFO("camera {} covers {:+.1f} to {:+.1f} degrees horizontally and {:+.1f} to {:+.1f} vertically, seen from the eye at {:.2f} m", CAMERA.key, COVERED->l * 180.0 / M_PI,
+                                 COVERED->r * 180.0 / M_PI, COVERED->d * 180.0 / M_PI, COVERED->u * 180.0 / M_PI, options.backgroundDepth);
+                        clipped    = intersectFov(clipped, *COVERED);
+                        clippedAny = true;
+                    }
+
+                    if (!clippedAny)
+                        HXC_WARN("--frustum camera was asked for but no camera coverage could be computed; falling back to the presentation frame");
+                    else if (!(clipped.tanWidth() > 0.0) || !(clipped.tanHeight() > 0.0)) {
+                        HXC_ERR("the cameras' coverage and the eyes' field do not overlap; there is no frame to clip to");
+                        clipped    = SYMMETRIC;
+                        clippedAny = false;
+                    }
+
+                    if (clippedAny) {
+                        // Horizontally symmetric if the intersection allows it. The
+                        // two lenses are mirrored, so it very nearly does; keeping
+                        // it exact costs a sliver and keeps the frame centred on
+                        // forward, which is what a viewer expects.
+                        const auto   T          = clipped.tangents();
+                        const double HALF       = std::min(std::abs(T[0]), std::abs(T[1]));
+                        const double LOPSIDED   = std::abs(std::abs(T[0]) - std::abs(T[1]));
+                        if (LOPSIDED > 0.02 * clipped.tanWidth())
+                            HXC_WARN("the clipped field is {:.1f}% lopsided horizontally ({:+.1f} to {:+.1f} degrees); centring it costs {:.1f} degrees on the wider side",
+                                     100.0 * LOPSIDED / clipped.tanWidth(), clipped.l * 180.0 / M_PI, clipped.r * 180.0 / M_PI, (std::max(std::abs(T[0]), std::abs(T[1])) - HALF) * 180.0 / M_PI);
+                        clipped.l = -std::atan(HALF);
+                        clipped.r = std::atan(HALF);
+
+                        // The clip changes the aspect, so the pane height follows
+                        // from the requested width. Even, because H.264 wants it.
+                        const int REQUESTED_HEIGHT = plan.paneHeight;
+                        plan.paneHeight            = std::max(2, static_cast<int>(std::llround(plan.paneWidth * clipped.tanHeight() / clipped.tanWidth())) & ~1);
+                        if (plan.paneHeight != REQUESTED_HEIGHT)
+                            HXC_INFO("--frustum camera: pane height derived as {} from the requested width {} and the clipped aspect {:.4f} (the requested {} would have stretched it)",
+                                     plan.paneHeight, plan.paneWidth, clipped.angularAspect(), REQUESTED_HEIGHT);
+
+                        // Square angular pixels at exactly this aspect.
+                        const SFov FINAL = cropFovToPaneAsymmetric(clipped, plan.paneWidth, plan.paneHeight);
+                        plan.paneFov.assign(PANES, FINAL);
+                        HXC_INFO("output frustum (camera-clipped): both eyes share l={:.4f} r={:.4f} u={:.4f} d={:.4f} = {:+.1f}..{:+.1f} deg horizontal, {:+.1f}..{:+.1f} deg vertical. "
+                                 "Kept {:.0f}% of the presentation frame's horizontal field and {:.0f}% of its vertical; every output pixel is inside both cameras' images",
+                                 FINAL.l, FINAL.r, FINAL.u, FINAL.d, FINAL.l * 180.0 / M_PI, FINAL.r * 180.0 / M_PI, FINAL.d * 180.0 / M_PI, FINAL.u * 180.0 / M_PI,
+                                 100.0 * FINAL.tanWidth() / SYMMETRIC.tanWidth(), 100.0 * FINAL.tanHeight() / SYMMETRIC.tanHeight());
+                        if (options.framing == eFraming::STABILIZED)
+                            HXC_WARN("--framing stabilized rotates the output away from the head, so the clip - which is computed from the head-rigid geometry - is approximate near the edges");
+                        return;
+                    }
+                }
+
                 const SFov FITTED    = cropFovToPane(SYMMETRIC, plan.paneWidth, plan.paneHeight);
                 plan.paneFov.assign(PANES, FITTED);
 
@@ -694,7 +850,7 @@ namespace hxc {
                 } else
                     draw.outputCamera = eyePoses[EYE][*TELEMETRY_INDEX];
 
-                if (options.frustum == eFrustumMode::PRESENTATION) {
+                if (options.frustum == eFrustumMode::PRESENTATION || options.frustum == eFrustumMode::CAMERA) {
                     // A parallel rig: both panes look the same way, and the only
                     // thing that differs between them is where they look *from*.
                     // Keeping each eye's own orientation would toe the cameras in

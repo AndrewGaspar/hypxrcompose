@@ -248,6 +248,12 @@ namespace hxc {
     // this one fills the frame and drops the periphery that does not fit.
     SFov   cropFovToPane(const SFov& fov, int width, int height);
 
+    // As cropFovToPane, but keeping the frustum's own asymmetry instead of
+    // recentring it on forward: the excess is trimmed from both sides in
+    // proportion, so a field that legitimately reaches further down than up -
+    // a downward-canted passthrough camera's, say - stays that way.
+    SFov   cropFovToPaneAsymmetric(const SFov& fov, int width, int height);
+
     // A direction in eye space (z negative, unnormalized) for the centre of pixel
     // (px, py) of a `width` x `height` image rendered with this frustum.
     SVec3 fovRay(const SFov& fov, double px, double py, int width, int height);
